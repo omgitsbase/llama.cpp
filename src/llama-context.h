@@ -71,7 +71,8 @@ struct llama_context {
     // the decode loop on the device: n_max steps from token0 at pos0, each
     // step fed by the last; the ids come back in out. Returns the count, or
     // a negative on failure.
-    int32_t decode_loop(llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out);
+    int32_t decode_loop(llama_token token0, llama_pos pos0, int32_t n_max, llama_token stop, llama_token * out);
+    bool loop_ran_on_device() const { return loop_on_device; }
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -324,6 +325,7 @@ private:
     llama_mtp_round_state mtp_round;
 
     llama_loop_state          loop;
+    bool                      loop_on_device = false; // the last loop ran as one device graph
     const llama_loop_state  * loop_cur = nullptr; // set while a loop graph is built
     ggml_context_ptr          ctx_loop;
     ggml_backend_buffer_ptr   buf_loop;

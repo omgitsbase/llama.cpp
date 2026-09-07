@@ -777,6 +777,10 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    // pinned inputs of a split replayed without the scheduler, see ggml_backend_sched_pin_split_inputs
+    struct ggml_context   * pin_ctx = NULL;
+    ggml_backend_buffer_t   pin_buf = NULL;
+
     int n_backends;
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
@@ -1873,6 +1877,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+    if (sched && sched->pin_buf) {
+        ggml_backend_buffer_free(sched->pin_buf);
+        sched->pin_buf = NULL;
+    }
+    if (sched && sched->pin_ctx) {
+        ggml_free(sched->pin_ctx);
+        sched->pin_ctx = NULL;
+    }
     if (sched == NULL) {
         return;
     }
@@ -2001,6 +2013,73 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+struct ggml_cgraph * ggml_backend_sched_get_split_graph(ggml_backend_sched_t sched, int i) {
+    GGML_ASSERT(sched && sched->is_alloc && i >= 0 && i < sched->n_splits);
+    return &sched->splits[i].graph;
+}
+
+void ggml_backend_sched_copy_split_inputs(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched && sched->is_alloc);
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        const int split_backend_id = split->backend_id;
+        ggml_backend_t split_backend = sched->backends[split_backend_id];
+        ggml_backend_synchronize(split_backend);
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input     = split->inputs[input_id];
+            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            ggml_backend_tensor_copy(input, input_cpy);
+        }
+    }
+}
+
+int ggml_backend_sched_pin_split_inputs(ggml_backend_sched_t sched, int i, ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(sched && sched->is_alloc && i >= 0 && i < sched->n_splits);
+    struct ggml_backend_sched_split * split = &sched->splits[i];
+
+    if (sched->pin_buf) {
+        ggml_backend_buffer_free(sched->pin_buf);
+        sched->pin_buf = NULL;
+    }
+    if (sched->pin_ctx) {
+        ggml_free(sched->pin_ctx);
+        sched->pin_ctx = NULL;
+    }
+    if (split->n_inputs == 0) {
+        return 0;
+    }
+
+    struct ggml_init_params ip = { (size_t) split->n_inputs * ggml_tensor_overhead() + 1024, NULL, true };
+    sched->pin_ctx = ggml_init(ip);
+    GGML_ASSERT(sched->pin_ctx);
+
+    std::vector<struct ggml_tensor *> twins(split->n_inputs);
+    for (int k = 0; k < split->n_inputs; k++) {
+        twins[k] = ggml_dup_tensor(sched->pin_ctx, split->inputs[k]);
+        ggml_format_name(twins[k], "%s (pinned)", split->inputs[k]->name);
+    }
+    sched->pin_buf = ggml_backend_alloc_ctx_tensors_from_buft(sched->pin_ctx, buft);
+    GGML_ASSERT(sched->pin_buf && "failed to allocate the pinned inputs");
+
+    int n = 0;
+    for (int k = 0; k < split->n_inputs; k++) {
+        struct ggml_tensor * input = split->inputs[k];
+        struct ggml_tensor * copy  = tensor_copy(input, split->backend_id, sched->cur_copy);
+        ggml_backend_tensor_copy(input, twins[k]);
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            struct ggml_tensor * node = split->graph.nodes[j];
+            GGML_ASSERT(node->view_src != copy && "a view of a split input cannot be pinned");
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (node->src[s] == copy) {
+                    node->src[s] = twins[k];
+                    n++;
+                }
+            }
+        }
+    }
+    return n;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

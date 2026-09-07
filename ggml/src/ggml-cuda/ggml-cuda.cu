@@ -4476,6 +4476,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (op_stats) { ggml_cuda_op_timer_get().begin(cuda_ctx->stream()); }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                // GGML_CUDA_TRACE_OPS=1: every op before its launch, for a synchronous fault hunt
+                static const bool trace_ops = getenv("GGML_CUDA_TRACE_OPS") != nullptr;
+                if (trace_ops) {
+                    fprintf(stderr, "[op %d] %s %s data=%p src0=%p src1=%p" "\n", i, ggml_op_name(node->op), node->name, node->data,
+                            node->src[0] ? node->src[0]->data : nullptr, node->src[1] ? node->src[1]->data : nullptr);
+                    fflush(stderr);
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -5908,8 +5915,127 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// The decode loop on the device. The body (a ggml graph whose inputs live on
+// the device) is captured and instantiated the way every decode is, by the
+// backend's own graph compute; that captured graph then sits as a child node
+// inside a CUDA-graph while node, followed by a one-thread kernel that keeps
+// the loop going while the counter is below n_iter and the token is not the
+// stop id. The host launches once and waits. Every call of the backend's
+// compute on the way there is a real iteration. Returns 2 when the loop ran
+// on the device, 1 when the host had to step it, 0 on failure.
+static __global__ void ggml_cuda_loop_cond_kernel(cudaGraphConditionalHandle handle, const float * counter, const float n_iter, const int32_t * tok, const int32_t stop) {
+    const unsigned keep = (*counter < n_iter) && (*tok != stop);
+    cudaGraphSetConditional(handle, keep);
+}
+
+static int ggml_backend_cuda_loop(ggml_backend_t backend, ggml_cgraph * cgraph, const ggml_tensor * counter, int n_iter, const ggml_tensor * tok, int32_t stop) {
+#ifndef USE_CUDA_GRAPH
+    GGML_UNUSED(counter); GGML_UNUSED(tok); GGML_UNUSED(stop);
+    for (int i = 0; i < n_iter; ++i) {
+        if (ggml_backend_cuda_graph_compute(backend, cgraph) != GGML_STATUS_SUCCESS) {
+            return 0;
+        }
+    }
+    return 1;
+#else
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream();
+
+    const void * key = ggml_cuda_graph_get_key(cgraph);
+
+    // the first iterations run through the backend until it has the body captured
+    int done = 0;
+    ggml_cuda_graph * g = nullptr;
+    while (done < n_iter) {
+        if (ggml_backend_cuda_graph_compute(backend, cgraph) != GGML_STATUS_SUCCESS) {
+            return 0;
+        }
+        done++;
+        g = cuda_ctx->cuda_graph(key);
+        if (g && g->instance != nullptr && g->graph != nullptr) {
+            break;
+        }
+        if (done >= 4) {
+            break;
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto finish_on_host = [&]() -> int {
+        for (; done < n_iter; ++done) {
+            if (ggml_backend_cuda_graph_compute(backend, cgraph) != GGML_STATUS_SUCCESS) {
+                return 0;
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return 1;
+    };
+
+    if (done >= n_iter) {
+        return 2;
+    }
+    if (!g || g->instance == nullptr || g->graph == nullptr) {
+        GGML_LOG_INFO("%s: the body did not capture, the host steps it\n", __func__);
+        return finish_on_host();
+    }
+
+    // the stop test reads what the last iteration left; a stop already hit
+    // would loop once more, which the caller trims
+    cudaGraph_t parent = nullptr;
+    CUDA_CHECK(cudaGraphCreate(&parent, 0));
+
+    cudaGraphConditionalHandle handle;
+    if (cudaGraphConditionalHandleCreate(&handle, parent, 1, cudaGraphCondAssignDefault) != cudaSuccess) {
+        (void) cudaGetLastError();
+        CUDA_CHECK(cudaGraphDestroy(parent));
+        GGML_LOG_INFO("%s: conditional graph nodes are not available here, the host steps it\n", __func__);
+        return finish_on_host();
+    }
+
+    cudaGraphNodeParams np = {};
+    np.type = cudaGraphNodeTypeConditional;
+    np.conditional.handle = handle;
+    np.conditional.type   = cudaGraphCondTypeWhile;
+    np.conditional.size   = 1;
+    cudaGraphNode_t cnode = nullptr;
+    CUDA_CHECK(cudaGraphAddNode(&cnode, parent, nullptr, nullptr, 0, &np));
+    cudaGraph_t body = np.conditional.phGraph_out[0];
+
+    cudaGraphNode_t child = nullptr;
+    CUDA_CHECK(cudaGraphAddChildGraphNode(&child, body, nullptr, 0, g->graph));
+
+    const float   * counter_ptr = (const float *)   counter->data;
+    const int32_t * tok_ptr     = (const int32_t *) tok->data;
+    const float     n_iter_f    = (float) n_iter;
+    const int32_t   stop_v      = stop;
+    void * args[] = { (void *) &handle, (void *) &counter_ptr, (void *) &n_iter_f, (void *) &tok_ptr, (void *) &stop_v };
+
+    cudaKernelNodeParams kp = {};
+    kp.func           = (void *) ggml_cuda_loop_cond_kernel;
+    kp.gridDim        = dim3(1, 1, 1);
+    kp.blockDim       = dim3(1, 1, 1);
+    kp.sharedMemBytes = 0;
+    kp.kernelParams   = args;
+    kp.extra          = nullptr;
+    cudaGraphNode_t knode = nullptr;
+    CUDA_CHECK(cudaGraphAddKernelNode(&knode, body, &child, 1, &kp));
+
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, parent, 0));
+    CUDA_CHECK(cudaGraphLaunch(exec, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGraphExecDestroy(exec));
+    CUDA_CHECK(cudaGraphDestroy(parent));
+    return 2;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_loop") == 0) {
+        return (void *)ggml_backend_cuda_loop;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

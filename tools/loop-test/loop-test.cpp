@@ -108,12 +108,13 @@ int main(int argc, char ** argv) {
         llama_context * ctx = make_ctx(model, 4096);
         llama_token first = feed_prompt(ctx, toks);
         const double t0 = now_ms();
-        const int32_t n = llama_decode_loop(ctx, first, n_tok, n_gen, dev.data());
+        const int32_t n = llama_decode_loop(ctx, first, n_tok, n_gen, -1, dev.data());
         dev_ms = now_ms() - t0;
         if (n != n_gen) {
             fprintf(stderr, "device loop returned %d\n", n);
             return 1;
         }
+        printf("loop ran %s\n", llama_decode_loop_on_device(ctx) ? "as one device graph" : "stepped by the host");
         llama_free(ctx);
     }
 

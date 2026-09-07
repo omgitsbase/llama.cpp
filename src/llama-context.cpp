@@ -3982,7 +3982,7 @@ llm_graph_result * llama_context::get_gf_res_prev() const {
     return static_cast<llm_graph_result *>(gf_res_prev.get());
 }
 
-int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out) {
+int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n_max, llama_token stop, llama_token * out) {
     if (!memory || n_max <= 0) {
         return -1;
     }
@@ -4086,14 +4086,14 @@ int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n
     }
 
     // the device side of the window
-    {
-        ggml_backend_t dev_backend = backend_cpu;
-        for (auto & b : backends) {
-            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                dev_backend = b.get();
-                break;
-            }
+    ggml_backend_t dev_backend = backend_cpu;
+    for (auto & b : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dev_backend = b.get();
+            break;
         }
+    }
+    {
         ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
         ctx_loop.reset(ggml_init(ip));
         loop.tok      = ggml_new_tensor_1d(ctx_loop.get(), GGML_TYPE_I32, 1);
@@ -4154,31 +4154,69 @@ int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n
     }
     res->set_inputs(&ub1);
 
-    // step 1 of the loop work: the host still launches every step
-    for (int32_t i = 0; i < n_max; ++i) {
-        const auto status = graph_compute(gf, false);
-        if (status != GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: step %d failed: %d\n", __func__, i, (int) status);
-            return -3;
+    // the loop runs on the device where the backend can; otherwise the host steps it
+    typedef int (*loop_fn_t)(ggml_backend_t, ggml_cgraph *, const ggml_tensor *, int, const ggml_tensor *, int32_t);
+    loop_fn_t loop_fn = nullptr;
+    if (dev_backend != backend_cpu && ggml_backend_sched_get_n_splits(sched.get()) == 1) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(dev_backend));
+        loop_fn = (loop_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_loop");
+    }
+
+    bool on_device = false;
+    bool ran = false;
+    if (loop_fn) {
+        // the scheduler's own copy of the body, its host-set inputs pinned on the device
+        // for the whole loop (the scheduler's copies get reused within a graph)
+        ggml_backend_sched_pin_split_inputs(sched.get(), 0, ggml_backend_get_default_buffer_type(dev_backend));
+        ggml_cgraph * body = ggml_backend_sched_get_split_graph(sched.get(), 0);
+        const int rc = loop_fn(dev_backend, body, loop.counter, n_max, loop.tok, stop);
+        ran       = rc > 0;
+        on_device = rc == 2;
+    }
+    if (!ran) {
+        for (int32_t i = 0; i < n_max; ++i) {
+            const auto status = graph_compute(gf, false);
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: step %d failed: %d\n", __func__, i, (int) status);
+                return -3;
+            }
         }
     }
     synchronize();
+    loop_on_device = on_device;
+
+    float steps = 0.0f;
+    ggml_backend_tensor_get(loop.counter, &steps, 0, sizeof(steps));
+    int32_t n_out = std::min<int32_t>(n_max, (int32_t) steps);
 
     std::vector<float> ring(n_max);
     ggml_backend_tensor_get(loop.ring, ring.data(), 0, ggml_nbytes(loop.ring));
-    for (int32_t i = 0; i < n_max; ++i) {
+    for (int32_t i = 0; i < n_out; ++i) {
         out[i] = (llama_token) ring[i];
+        if (stop >= 0 && out[i] == stop) {
+            n_out = i + 1;
+            break;
+        }
+    }
+
+    // cells the loop reserved but did not fill go back
+    if (n_out < n_max) {
+        memory->seq_rm(0, pos0 + n_out, -1);
     }
 
     // the next plain decode must not reuse a graph whose memory the loop took
     gf_res_prev->reset();
     ggml_backend_sched_reset(sched.get());
 
-    return n_max;
+    return n_out;
 }
 
-int32_t llama_decode_loop(llama_context * ctx, llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out) {
-    return ctx->decode_loop(token0, pos0, n_max, out);
+int32_t llama_decode_loop(llama_context * ctx, llama_token token0, llama_pos pos0, int32_t n_max, llama_token stop, llama_token * out) {
+    return ctx->decode_loop(token0, pos0, n_max, stop, out);
+}
+
+bool llama_decode_loop_on_device(const llama_context * ctx) {
+    return ctx->loop_ran_on_device();
 }
 
 void llama_set_mtp_round_host(llama_context * ctx, const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off) {

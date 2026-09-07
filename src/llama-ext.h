@@ -124,7 +124,10 @@ LLAMA_API void llama_set_mtp_round_target(struct llama_context * ctx, struct lla
 // the decode loop on the device: n_max greedy steps from token0 at pos0 into
 // out, each step fed by the last; needs flash attention, n_rs_seq 0 and a
 // backend sampler on sequence 0. Returns the count, or a negative on failure.
-LLAMA_API int32_t llama_decode_loop(struct llama_context * ctx, llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out);
+LLAMA_API int32_t llama_decode_loop(struct llama_context * ctx, llama_token token0, llama_pos pos0, int32_t n_max, llama_token stop, llama_token * out);
+
+// whether the last llama_decode_loop ran as one graph on the device (false: the host stepped it)
+LLAMA_API bool llama_decode_loop_on_device(const struct llama_context * ctx);
 
 // Whether the model's DECODER_MTP graph supports chained drafting.
 LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);

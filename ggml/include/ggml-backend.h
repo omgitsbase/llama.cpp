@@ -328,6 +328,16 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+
+    // the graph of split i as the scheduler runs it, its inputs rewired to their device copies
+    GGML_API struct ggml_cgraph * ggml_backend_sched_get_split_graph(ggml_backend_sched_t sched, int i);
+    // copy every split's inputs from where they were set to where the split reads them
+    GGML_API void                 ggml_backend_sched_copy_split_inputs(ggml_backend_sched_t sched);
+    // give split i's inputs a home of their own in a buffer of buft, copied once, and
+    // rewire the split to read them there: the scheduler's own copies live in memory the
+    // allocator reuses after their last use, so a graph replayed without the scheduler
+    // would read over them. Returns the number of rewired references.
+    GGML_API int                  ggml_backend_sched_pin_split_inputs(ggml_backend_sched_t sched, int i, ggml_backend_buffer_type_t buft);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
