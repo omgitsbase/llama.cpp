@@ -3373,6 +3373,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+static int ggml_cuda_fuse_off_mask() {
+    static const int mask = getenv("GGML_CUDA_FUSE_OFF") ? std::atoi(getenv("GGML_CUDA_FUSE_OFF")) : 0;
+    return mask;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4079,14 +4084,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // rms_norm > scale > mul: a constant between the norm and its weight
-    if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
+    if (!(ggml_cuda_fuse_off_mask() & 8) && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
             ggml_cuda_should_fuse_rms_norm_scale_mul(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
         ggml_cuda_op_rms_norm_fused_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 
     // the expert combine: a chain of ADDs over one tensor's rows, as one sum
-    if (node->op == GGML_OP_ADD) {
+    if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & 4)) {
         const ggml_tensor * experts = nullptr;
         const int n_adds = ggml_cuda_match_expert_sum(cgraph, i, &experts);
         if (n_adds > 0) {
@@ -4097,7 +4102,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // two l2_norms over adjacent views of one tensor (q and k after the
     // conv in a delta-net layer): one launch covering both row ranges
-    if (node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes &&
+    if (node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes && !(ggml_cuda_fuse_off_mask() & 2) &&
             ggml_cuda_should_fuse_l2_norm_pair(node, cgraph->nodes[i + 1])) {
         ggml_cuda_op_l2_norm_pair(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -4275,7 +4280,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // a node with no elements has nothing to compute; recurrent
                 // models emit several per layer when only one sequence is live
-                if (ggml_is_empty(node)) {
+                if (ggml_is_empty(node) && !(ggml_cuda_fuse_off_mask() & 1)) {
                     continue;
                 }
 
