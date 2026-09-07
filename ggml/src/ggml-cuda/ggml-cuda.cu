@@ -4222,15 +4222,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (++acc_graphs % 100 == 0) {
                     std::vector<std::pair<std::string, std::pair<double, int64_t>>> rows(acc.begin(), acc.end());
                     std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.first > y.second.first; });
-                    GGML_LOG_INFO("cuda-profile: %lld graphs, %d nodes in this one, %.2f ms per graph\n",
+                    fprintf(stderr, "cuda-profile: %lld graphs, %d nodes in this one, %.2f ms per graph\n",
                             (long long) acc_graphs, cgraph->n_nodes, acc_total / acc_graphs);
                     for (size_t r = 0; r < rows.size() && r < 14; ++r) {
-                        GGML_LOG_INFO("cuda-profile:   %-26s %7.3f ms/graph  %6.1f%%  %5.1f calls/graph\n",
+                        fprintf(stderr, "cuda-profile:   %-26s %7.3f ms/graph  %6.1f%%  %5.1f calls/graph\n",
                                 rows[r].first.c_str(), rows[r].second.first / acc_graphs,
                                 100.0 * rows[r].second.first / acc_total,
                                 (double) rows[r].second.second / acc_graphs);
                     }
-                    acc.clear(); acc_total = 0.0; acc_graphs = 0;
+                    fflush(stderr); acc.clear(); acc_total = 0.0; acc_graphs = 0;
                 }
             }
         }
