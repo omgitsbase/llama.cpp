@@ -2448,6 +2448,61 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     return cur;
 }
 
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv * inp) {
+    return { inp->mctx, inp->get_k_idxs(), inp->get_v_idxs(), inp->get_kq_mask() };
+}
+
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_k * inp) {
+    return { inp->mctx, inp->get_k_idxs(), nullptr, inp->get_kq_mask() };
+}
+
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv_iswa * inp, bool swa) {
+    const auto * mctx = swa ? inp->mctx->get_swa() : inp->mctx->get_base();
+    return swa
+        ? llm_graph_mtp_attn{ mctx, inp->get_k_idxs_swa(), inp->get_v_idxs_swa(), inp->get_kq_mask_swa() }
+        : llm_graph_mtp_attn{ mctx, inp->get_k_idxs(),     inp->get_v_idxs(),     inp->get_kq_mask()     };
+}
+
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_k_iswa * inp, bool swa) {
+    const auto * mctx = swa ? inp->mctx->get_swa() : inp->mctx->get_base();
+    return swa
+        ? llm_graph_mtp_attn{ mctx, inp->get_k_idxs_swa(), nullptr, inp->get_kq_mask_swa() }
+        : llm_graph_mtp_attn{ mctx, inp->get_k_idxs(),     nullptr, inp->get_kq_mask()     };
+}
+
+ggml_tensor * llm_graph_context::build_attn_mtp(
+        const llm_graph_mtp_attn & attn,
+                     ggml_tensor * q,
+                     ggml_tensor * k,
+                     ggml_tensor * v,
+                           float   kq_scale,
+                             int   il,
+                             int   row,
+                            bool   kv_only,
+                     ggml_tensor * mask_in) {
+    const auto * mctx_cur = attn.mctx;
+    const int64_t n_rows  = q->ne[2];
+
+    ggml_tensor * k_idx = ggml_view_1d(ctx0, attn.k_idxs, n_rows, row*ggml_element_size(attn.k_idxs));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, k_idx, il));
+
+    if (attn.v_idxs) {
+        ggml_tensor * v_idx = ggml_view_1d(ctx0, attn.v_idxs, n_rows, row*ggml_element_size(attn.v_idxs));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v, v_idx, il));
+    }
+
+    if (kv_only) {
+        // a replay only refreshes the cache; nothing reads its output
+        return nullptr;
+    }
+
+    ggml_tensor * mask = mask_in ? mask_in
+        : ggml_view_2d(ctx0, attn.kq_mask, attn.kq_mask->ne[0], n_rows, attn.kq_mask->nb[1], row*attn.kq_mask->nb[1]);
+
+    return build_attn_mha(q, mctx_cur->get_k(ctx0, il), attn.v_idxs ? mctx_cur->get_v(ctx0, il) : nullptr,
+            nullptr, mask, nullptr, nullptr, kq_scale, il);
+}
+
 // A whole speculative round in one graph. Rows 0 .. n_chain replay the verify
 // batch the target just ran: the batch's tokens paired with the target's
 // hidden rows, which come straight from the target's graph. How many of them
@@ -2458,12 +2513,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 // positions follow the accepted rows; the replay rows past them are hidden
 // from it by an additive mask and leave the cache before the next round.
 void llm_graph_context::build_mtp_round(
-        llm_graph_mtp_i & mtp,
-        llm_graph_input_attn_kv * inp_attn,
-                    ggml_tensor * tok_embd,
-                    ggml_tensor * inp_tokens,
-                    ggml_tensor * inp_pos,
-                            int   n_chain) {
+         llm_graph_mtp_i & mtp,
+const llm_graph_mtp_attn & attn,
+             ggml_tensor * tok_embd,
+             ggml_tensor * inp_tokens,
+             ggml_tensor * inp_pos,
+                     int   n_chain) {
     const int K = n_chain;
     const int V = n_chain + 1;
     GGML_ASSERT(n_tokens == V + K && "MTP round: n_chain+1 replay rows and n_chain chain rows");
@@ -2553,8 +2608,8 @@ void llm_graph_context::build_mtp_round(
     // the replay rows past the accepted ones (all of them when the round comes
     // from the host) are hidden from the chain: an additive mask over their
     // cells
-    ggml_tensor * kq_mask = inp_attn->get_kq_mask();
-    ggml_tensor * k_idxs  = inp_attn->get_k_idxs();
+    ggml_tensor * kq_mask = attn.kq_mask;
+    ggml_tensor * k_idxs  = attn.k_idxs;
     const int64_t n_kv    = kq_mask->ne[0];
     ggml_tensor * thr   = ggml_scale_bias(ctx0, ggml_add(ctx0, n_acc, off), 1.0f, -0.5f);
     ggml_tensor * hide  = ggml_scale(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_arange(ctx0, 0.0f, (float) V, 1.0f), thr)), -30000.0f);

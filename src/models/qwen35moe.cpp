@@ -609,7 +609,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     if (cparams.mtp_chain > 0) {
         inp_attn_cur = inp_attn;
-        build_mtp_round(*this, inp_attn, tok_embd, inp_tokens, inp_pos, cparams.mtp_chain);
+        build_mtp_round(*this, llm_graph_mtp_attn_of(inp_attn), tok_embd, inp_tokens, inp_pos, cparams.mtp_chain);
         return;
     }
 
@@ -731,25 +731,10 @@ ggml_tensor * llama_model_qwen35moe::graph_mtp::build_step(
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     } else {
-        const auto * mctx_cur = inp_attn->mctx;
-
-        ggml_tensor * k_idxs  = inp_attn->get_k_idxs();
-        ggml_tensor * v_idxs  = inp_attn->get_v_idxs();
-        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
-
-        ggml_tensor * k_idx = ggml_view_1d(ctx0, k_idxs, n_rows, step*ggml_element_size(k_idxs));
-        ggml_tensor * v_idx = ggml_view_1d(ctx0, v_idxs, n_rows, step*ggml_element_size(v_idxs));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, k_idx, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, v_idx, il));
-        if (kv_only) {
-            // a replay only refreshes the cache; nothing reads its output
+        cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn), Qcur, Kcur, Vcur, kq_scale, il, step, kv_only, mask_in);
+        if (!cur) {
             return nullptr;
         }
-
-        ggml_tensor * mask = mask_in ? mask_in : ggml_view_2d(ctx0, kq_mask, kq_mask->ne[0], n_rows, kq_mask->nb[1], step*kq_mask->nb[1]);
-
-        cur = build_attn_mha(Qcur, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il),
-                nullptr, mask, nullptr, nullptr, kq_scale, il);
     }
     cb(cur, "mtp_attn_out", il);
 

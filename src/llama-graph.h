@@ -593,6 +593,23 @@ public:
     const llama_kv_cache_iswa_context * mctx;
 };
 
+// What a round writes through, whichever cache flavour the architecture's MTP
+// block attends against: the row indices of the K (and V) it writes and the
+// mask it attends with. llm_graph_mtp_attn_of() reads it off an attention
+// input, so a model does not care which flavour it has.
+struct llm_graph_mtp_attn {
+    const llama_kv_cache_context * mctx = nullptr;
+    ggml_tensor * k_idxs  = nullptr;
+    ggml_tensor * v_idxs  = nullptr; // null where the cache holds no separate V
+    ggml_tensor * kq_mask = nullptr;
+};
+
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv      * inp);
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_k       * inp);
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv_iswa * inp, bool swa);
+llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_k_iswa  * inp, bool swa);
+
+
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
 // so raw K can be concatenated with DSV4 compressed K in one attention op.
 class llm_graph_input_dsv4_raw {
@@ -1190,12 +1207,26 @@ struct llm_graph_context {
 
     // a whole speculative round in this graph, see llama_set_mtp_chain
     void build_mtp_round(
-        llm_graph_mtp_i & mtp,
-        llm_graph_input_attn_kv * inp_attn,
-                    ggml_tensor * tok_embd,
-                    ggml_tensor * inp_tokens,
-                    ggml_tensor * inp_pos,
-                            int   n_chain);
+             llm_graph_mtp_i & mtp,
+    const llm_graph_mtp_attn & attn,
+                 ggml_tensor * tok_embd,
+                 ggml_tensor * inp_tokens,
+                 ggml_tensor * inp_pos,
+                         int   n_chain);
+
+    // one row group of a round: write its K/V rows, then attend against the
+    // cache with the round's mask. row is the batch row the group starts at;
+    // a replay (kv_only) refreshes the cache and returns nothing.
+    ggml_tensor * build_attn_mtp(
+    const llm_graph_mtp_attn & attn,
+                 ggml_tensor * q,
+                 ggml_tensor * k,
+                 ggml_tensor * v,
+                       float   kq_scale,
+                         int   il,
+                         int   row,
+                        bool   kv_only,
+                 ggml_tensor * mask_in);
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
