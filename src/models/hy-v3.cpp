@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 
 void llama_model_hy_v3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -241,45 +242,112 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
 //   shared LM head (the main model's lm_head; the checkpoint has no separate
 //   MTP head or MTP embeddings).
 llama_model_hy_v3::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
-    : llm_graph_context(params) {
+    : llm_graph_context(params), model(model), layer(model.layers[hparams.n_layer() + params.cparams.nextn_layer_offset]) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "HY_V3 MTP requires n_layer_nextn > 0");
-
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-    GGML_ASSERT(n_embd_head == n_rot);
-
-    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+    GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+    GGML_ASSERT(hparams.n_embd_head_v() == n_rot);
     GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
                 cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
                 "nextn_layer_offset out of range [0, n_layer_nextn)");
-    const auto & layer = model.layers[il];
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
+
+    head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    head_w      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    head_s      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    GGML_ASSERT(head_norm_w && "HY_V3 MTP: missing both nextn.shared_head_norm and output_norm");
+    GGML_ASSERT(head_w      && "HY_V3 MTP: missing LM head (nextn.shared_head_head or model.output)");
+
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
 
     auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->embd);
-    ggml_set_name(inp->embd, "mtp_h_input");
+    ggml_tensor * h_input = nullptr;
+    if (cparams.mtp_chain == 0) {
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        ggml_set_name(inp->embd, "mtp_h_input");
+        h_input = inp->embd;
+    }
 
-    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-
-    ggml_tensor * h_input  = inp->embd;
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    ggml_tensor * inp_tokens = inp->tokens;
+    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, embd_weights(), inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-    auto * inp_attn           = build_attn_inp_kv();
+    ggml_tensor * inp_pos = build_inp_pos();
 
-    ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    auto * inp_attn = build_attn_inp_kv();
+
+    if (cparams.mtp_chain > 0) {
+        inp_attn_cur = inp_attn;
+        build_mtp_round(*this, llm_graph_mtp_attn_of(inp_attn), tok_embd, inp_tokens, inp_pos, cparams.mtp_chain);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * cur = build_step(inp_attn, tok_embd, h_input, inp_pos, -1, il);
+
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    cb(cur, "mtp_shared_head_norm", -1);
+
+    cur = build_lora_mm(head_w, cur, head_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+bool llama_model_hy_v3::has_mtp_round() const {
+    return hparams.n_layer_nextn == 1;
+}
+
+ggml_tensor * llama_model_hy_v3::graph_mtp::mtp_step(
+        ggml_tensor * tok_embd,
+        ggml_tensor * h,
+        ggml_tensor * pos,
+                int   row,
+               bool   kv_only,
+        ggml_tensor * mask) {
+    return build_step(inp_attn_cur, tok_embd, h, pos, row, hparams.n_layer() + cparams.nextn_layer_offset, kv_only, mask);
+}
+
+ggml_tensor * llama_model_hy_v3::graph_mtp::mtp_embd_weights() const {
+    return embd_weights();
+}
+
+ggml_tensor * llama_model_hy_v3::graph_mtp::mtp_head(ggml_tensor * h) {
+    return build_lora_mm(head_w, h, head_s);
+}
+
+ggml_tensor * llama_model_hy_v3::graph_mtp::embd_weights() const {
+    return layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+}
+
+// the MTP block: a full hy_v3 decoder layer (mirrors the trunk graph)
+ggml_tensor * llama_model_hy_v3::graph_mtp::build_step(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                            int   step,
+                            int   il,
+                           bool   kv_only,
+                    ggml_tensor * mask_in) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_rows      = tok_embd->ne[1];
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
@@ -293,30 +361,32 @@ llama_model_hy_v3::graph_mtp::graph_mtp(const llama_model & model, const llm_gra
 
     ggml_tensor * inpSA = cur;
 
-    // mtp_block: a full hy_v3 decoder layer (mirrors the trunk graph)
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
     {
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
-
-        auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur, n_embd_head, n_head, n_head_kv, il);
-
+        auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur, n_embd_head, n_head, n_head_kv, il, n_rows);
         Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-
         Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors,
                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
         Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, rope_factors,
                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
-
         const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
-
-        cur = build_attn(inp_attn,
-                layer.wo, layer.wo_b, layer.wo_s,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        if (step < 0) {
+            cur = build_attn(inp_attn,
+                    layer.wo, layer.wo_b, layer.wo_s,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        } else {
+            cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn), layer.wo, layer.wo_b, layer.wo_s,
+                    Qcur, Kcur, Vcur, kq_scale, il, step, kv_only, mask_in);
+            if (!cur) {
+                return nullptr;
+            }
+        }
         cb(cur, "mtp_attn_out", il);
     }
 
@@ -371,24 +441,5 @@ llama_model_hy_v3::graph_mtp::graph_mtp(const llama_model & model, const llm_gra
     // final_layernorm applied after the decoder block, before the shared head.
     // The post-norm hidden state seeds the next MTP step (matches vLLM, where
     // HYV3MultiTokenPredictorLayer returns final_layernorm(h)).
-    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
-            ? layer.nextn.shared_head_norm
-            : model.output_norm;
-    GGML_ASSERT(head_norm_w && "HY_V3 MTP: missing both nextn.shared_head_norm and output_norm");
-    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
-
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    cb(cur, "mtp_shared_head_norm", -1);
-
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "HY_V3 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
-    cb(cur, "result_output", -1);
-
-    res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
+    return build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 }
