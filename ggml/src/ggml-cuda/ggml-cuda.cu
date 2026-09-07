@@ -2572,7 +2572,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Graphs of different shape built into the same context start at the same
+    // node address. A context that alternates between two of them (a draft
+    // replay and a chained draft, say) would otherwise share one slot and
+    // reset its warmup on every call, so neither is ever captured. The node
+    // count tells the shapes apart.
+    const uintptr_t base = (uintptr_t) cgraph->nodes[0];
+    const uintptr_t mix  = (uintptr_t) cgraph->n_nodes * (uintptr_t) 0x9E3779B97F4A7C15ULL;
+    return (const void *) (base ^ mix);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

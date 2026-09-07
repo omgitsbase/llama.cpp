@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -603,6 +604,143 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
+
+    // Chained drafting: K single-token steps unrolled into this one graph.
+    // Step 0 starts from the anchor token and the target's hidden state; every
+    // later step takes the argmax of the previous logits, looked up on the
+    // device, and the previous step's hidden state. Each step writes its own
+    // K/V row before reading the cache, so step j attends over step j-1.
+    if (cparams.mtp_chain > 0) {
+        const int K = cparams.mtp_chain;
+        GGML_ASSERT(n_tokens == K && "MTP chain: the batch must hold exactly K positions");
+        GGML_ASSERT(ubatch.token && "MTP chain: needs the anchor token");
+        GGML_ASSERT(cparams.flash_attn && "MTP chain: needs flash attention");
+
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        ggml_tensor * k_idxs  = inp_attn->get_k_idxs();
+        ggml_tensor * v_idxs  = inp_attn->get_v_idxs();
+        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+        const auto  * mctx_cur = inp_attn->mctx;
+
+        const float kq_scale = hparams.f_attention_scale == 0.0f
+                ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+        ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+        ggml_tensor * head_w      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+        ggml_tensor * head_s      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+        GGML_ASSERT(head_norm_w && head_w);
+
+        ggml_tensor * tok_j = ggml_view_2d(ctx0, tok_embd, tok_embd->ne[0], 1, tok_embd->nb[1], 0);
+        ggml_tensor * h_j   = ggml_view_2d(ctx0, h_embd,   h_embd->ne[0],   1, h_embd->nb[1],   0);
+
+        ggml_tensor * logits_all = nullptr;
+        ggml_tensor * h_all      = nullptr;
+
+        for (int j = 0; j < K; ++j) {
+            // positions are section-major, [n_pos_per_embd][n_tokens], so one
+            // token's entries sit K apart
+            const int64_t npe = hparams.n_pos_per_embd();
+            const size_t  pes = ggml_element_size(inp_pos);
+            ggml_tensor * pos_j = ggml_reshape_1d(ctx0,
+                    ggml_cont(ctx0, ggml_view_2d(ctx0, inp_pos, 1, npe, K*pes, j*pes)), npe);
+
+            ggml_tensor * h_norm = build_norm(h_j,   layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * e_norm = build_norm(tok_j, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+            ggml_tensor * inpSA = cur;
+
+            cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+
+            ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+            const size_t es = ggml_element_size(Qcur_full);
+            ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, 1,
+                    es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
+            Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, 1,
+                    es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
+            gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, 1);
+
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, 1);
+            Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, 1);
+
+            Qcur = ggml_rope_multi(ctx0, Qcur, pos_j, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            Kcur = ggml_rope_multi(ctx0, Kcur, pos_j, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+
+            ggml_tensor * k_idx_j = ggml_view_1d(ctx0, k_idxs, 1, j*ggml_element_size(k_idxs));
+            ggml_tensor * v_idx_j = ggml_view_1d(ctx0, v_idxs, 1, j*ggml_element_size(v_idxs));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, k_idx_j, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, v_idx_j, il));
+
+            ggml_tensor * mask_j = ggml_view_2d(ctx0, kq_mask, kq_mask->ne[0], 1, kq_mask->nb[1], j*kq_mask->nb[1]);
+            ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+            ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+            cur = build_attn_mha(Qcur, k, v, nullptr, mask_j, nullptr, nullptr, kq_scale, il);
+
+            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+            cur = ggml_add(ctx0, cur, inpSA);
+
+            ggml_tensor * ffn_residual = cur;
+            cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * moe_out =
+                build_moe_ffn(cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
+                    nullptr,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, true,
+                    hparams.expert_weights_scale,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                    nullptr, layer.ffn_gate_up_exps,
+                    layer.ffn_up_exps_s,
+                    layer.ffn_gate_exps_s,
+                    layer.ffn_down_exps_s);
+            if (layer.ffn_up_shexp != nullptr) {
+                ggml_tensor * ffn_shexp =
+                    build_ffn(cur,
+                        layer.ffn_up_shexp,   nullptr, layer.ffn_up_shexp_s,
+                        layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
+                        layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
+                        nullptr,
+                        LLM_FFN_SILU, LLM_FFN_PAR, il);
+                ggml_tensor * shared_gate = ggml_sigmoid(ctx0, build_lora_mm(layer.ffn_gate_inp_shexp, cur));
+                cur = ggml_add(ctx0, moe_out, ggml_mul(ctx0, ffn_shexp, shared_gate));
+            } else {
+                cur = moe_out;
+            }
+            cur = ggml_add(ctx0, cur, ffn_residual);
+
+            ggml_tensor * h_next   = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+            ggml_tensor * logits_j = build_lora_mm(head_w, h_next, head_s);
+
+            logits_all = logits_all ? ggml_concat(ctx0, logits_all, logits_j, 1) : logits_j;
+            h_all      = h_all      ? ggml_concat(ctx0, h_all,      h_next,   1) : h_next;
+
+            if (j + 1 < K) {
+                ggml_tensor * id_next = ggml_argmax(ctx0, logits_j); // I32 [1], chosen on the device
+                tok_j = ggml_get_rows(ctx0, tok_embd_w, id_next);
+                h_j   = h_next;
+            }
+        }
+
+        cb(h_all, "h_nextn", -1);
+        ggml_build_forward_expand(gf, h_all); // feeds nothing below, so it must be placed explicitly
+        res->t_h_nextn = h_all;
+        logits_all = ggml_get_rows(ctx0, logits_all, inp_out_ids);
+        cb(logits_all, "result_output", -1);
+        res->t_logits = logits_all;
+        ggml_build_forward_expand(gf, logits_all);
+        return;
+    }
 
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
