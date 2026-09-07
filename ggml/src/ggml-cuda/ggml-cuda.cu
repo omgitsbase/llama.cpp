@@ -2771,6 +2771,27 @@ static int ggml_cuda_match_expert_sum(const ggml_cgraph * cgraph, int i, const g
     return last - i + 1;
 }
 
+// rms_norm > scale(const) > mul(weight): the scalar folds into the weight
+// multiply, so the existing fused norm kernel serves with one more factor.
+static bool ggml_cuda_should_fuse_rms_norm_scale_mul(const ggml_tensor * rms_norm, const ggml_tensor * scale, const ggml_tensor * mul) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || scale->op != GGML_OP_SCALE || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (scale->src[0] != rms_norm || (mul->src[0] != scale && mul->src[1] != scale)) {
+        return false;
+    }
+    if (rms_norm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    float bias = 0.0f;
+    memcpy(&bias, (const char *) scale->op_params + sizeof(float), sizeof(float));
+    if (bias != 0.0f) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == scale ? mul->src[1] : mul->src[0];
+    return w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_is_contiguous(rms_norm->src[0]) && ggml_is_contiguous(mul);
+}
+
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                     const ggml_tensor * mul,
                                                     const ggml_tensor * rope) {
@@ -4055,6 +4076,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // rms_norm > scale > mul: a constant between the norm and its weight
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
+            ggml_cuda_should_fuse_rms_norm_scale_mul(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_rms_norm_fused_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     // the expert combine: a chain of ADDs over one tensor's rows, as one sum
