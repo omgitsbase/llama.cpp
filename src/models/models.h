@@ -2249,6 +2249,35 @@ struct llama_model_qwen35moe : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    private:
+        ggml_tensor * embd_weights() const;
+
+        // one pass of the MTP block; step >= 0 selects a position of a chained draft
+        ggml_tensor * build_step(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                            int   step,
+                            int   il);
+
+        // n_chain draft steps unrolled into this graph, see llama_set_mtp_chain
+        void build_chain(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                    ggml_tensor * inp_out_ids,
+                            int   n_chain);
+
+        const llama_model & model;
+        const llama_layer & layer;
+
+        int sections[4];
+
+        ggml_tensor * head_norm_w = nullptr;
+        ggml_tensor * head_w      = nullptr;
+        ggml_tensor * head_s      = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

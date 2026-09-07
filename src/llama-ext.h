@@ -100,14 +100,14 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
-// Unroll k autoregressive draft steps of the DECODER_MTP graph into one
-// graph: each step's token is the argmax of the previous step's logits,
-// selected on the device, so a whole draft round is one decode call. The
-// batch must hold exactly k positions; position 0 carries the anchor token
-// and hidden state, the rest are placeholders. 0 turns it off.
-LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, int32_t k);
+// Chained drafting for the DECODER_MTP graph: the next n draft steps are
+// built into one graph, each step taking the argmax of the previous step's
+// logits on the device, so a draft round costs one decode. The batch must
+// hold exactly n positions, the first carrying the anchor token and hidden
+// state. 0 restores one step per decode.
+LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, int32_t n);
 
-// Whether the model's DECODER_MTP graph supports llama_set_mtp_chain.
+// Whether the model's DECODER_MTP graph supports chained drafting.
 LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);
 
 // mirrors:

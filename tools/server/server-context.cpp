@@ -3583,17 +3583,12 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        static const bool spec_timing = getenv("LLAMA_MTP_CHAIN_TIMING") != nullptr;
-        const int64_t t_dec0 = spec_timing ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
-        if (spec_timing) {
-            SRV_INF("target decode: %d tokens, %.2f ms\n", (int) batch_view.n_tokens, (ggml_time_us() - t_dec0)/1000.0);
-        }
 
         if (ret != 0) {
             {

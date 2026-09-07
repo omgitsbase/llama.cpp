@@ -18,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <set>
 #include <string>
 
 //
@@ -1854,6 +1855,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        // LLAMA_GRAPH_DUMP=<dir>: write the op stream of each new graph shape
+        // once, as one node per line, for reading the graph offline
+        {
+            static const char * dump_dir = getenv("LLAMA_GRAPH_DUMP");
+            static std::set<std::pair<int, int>> dumped;
+            ggml_cgraph * gf = res->get_gf();
+            const std::pair<int, int> shape((int) ubatch.n_tokens, ggml_graph_n_nodes(gf));
+            if (dump_dir && dumped.insert(shape).second) {
+                const std::string path = std::string(dump_dir) + "/graph-t" + std::to_string(shape.first) +
+                                         "-n" + std::to_string(shape.second) + ".txt";
+                if (FILE * f = fopen(path.c_str(), "w")) {
+                    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                        const ggml_tensor * t = ggml_graph_node(gf, i);
+                        fprintf(f, "%d\t%s\t%s\t%s\t%lld,%lld,%lld,%lld\t%s",
+                                i, ggml_op_name(t->op),
+                                t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) :
+                                t->op == GGML_OP_GLU   ? ggml_glu_op_name(ggml_get_glu_op(t)) : "-",
+                                ggml_type_name(t->type),
+                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                                t->name);
+                        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                            fprintf(f, "\t<%s:%s>", t->src[s]->name, ggml_type_name(t->src[s]->type));
+                        }
+                        fputc('\n', f);
+                    }
+                    fclose(f);
+                    LLAMA_LOG_INFO("%s: graph dumped to %s\n", __func__, path.c_str());
+                }
+            }
+        }
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;

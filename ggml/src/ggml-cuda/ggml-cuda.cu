@@ -4101,26 +4101,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            // GGML_CUDA_PROFILE=1 (with graphs disabled): one event per loop
-            // iteration, attributed to the op of the node that starts it, so a
-            // forward can be read as a table of op totals.
-            static const bool prof_on = getenv("GGML_CUDA_PROFILE") != nullptr;
-            static std::vector<cudaEvent_t> prof_ev;
-            static std::vector<int> prof_node;
-            size_t prof_n = 0;
-            auto prof_mark = [&](int node_idx) {
-                if (!prof_on) return;
-                if (prof_ev.size() <= prof_n) {
-                    cudaEvent_t e; CUDA_CHECK(cudaEventCreate(&e)); prof_ev.push_back(e); prof_node.push_back(-1);
-                }
-                prof_node[prof_n] = node_idx;
-                CUDA_CHECK(cudaEventRecord(prof_ev[prof_n], cuda_ctx->stream()));
-                prof_n++;
-            };
-
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                prof_mark(i);
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4199,39 +4181,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
-            }
-            if (prof_on && prof_n > 0) {
-                prof_mark(-1);
-                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-                static std::map<std::string, std::pair<double, int64_t>> acc;
-                static double acc_total = 0.0;
-                static int64_t acc_graphs = 0;
-                for (size_t k = 0; k + 1 < prof_n; ++k) {
-                    float ms = 0.0f;
-                    CUDA_CHECK(cudaEventElapsedTime(&ms, prof_ev[k], prof_ev[k + 1]));
-                    const ggml_tensor * n = cgraph->nodes[prof_node[k]];
-                    std::string key = ggml_op_name(n->op);
-                    if (n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) {
-                        key += std::string(":") + ggml_type_name(n->src[0]->type);
-                    }
-                    auto & a = acc[key];
-                    a.first  += ms;
-                    a.second += 1;
-                    acc_total += ms;
-                }
-                if (++acc_graphs % 100 == 0) {
-                    std::vector<std::pair<std::string, std::pair<double, int64_t>>> rows(acc.begin(), acc.end());
-                    std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.first > y.second.first; });
-                    fprintf(stderr, "cuda-profile: %lld graphs, %d nodes in this one, %.2f ms per graph\n",
-                            (long long) acc_graphs, cgraph->n_nodes, acc_total / acc_graphs);
-                    for (size_t r = 0; r < rows.size() && r < 14; ++r) {
-                        fprintf(stderr, "cuda-profile:   %-26s %7.3f ms/graph  %6.1f%%  %5.1f calls/graph\n",
-                                rows[r].first.c_str(), rows[r].second.first / acc_graphs,
-                                100.0 * rows[r].second.first / acc_total,
-                                (double) rows[r].second.second / acc_graphs);
-                    }
-                    fflush(stderr); acc.clear(); acc_total = 0.0; acc_graphs = 0;
-                }
             }
         }
 

@@ -1290,67 +1290,53 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
-    int32_t chain         = 0;       // >0: every draft step of a round runs in one unrolled graph
+    int32_t n_chain       = 0;       // > 0: the whole draft round runs as one graph, see draft_chained()
 
-    // One decode for the whole round: K positions, the anchor token and the
-    // target's hidden state in position 0, the rest chosen inside the graph.
-    void draft_chain(common_speculative_draft_params_vec & dparams) {
+    // The whole round in one decode: n_chain positions on the draft context,
+    // the anchor token and the target's hidden state in position 0 and the
+    // rest chosen inside the graph. The graph picks every token by argmax, so
+    // reading the logits back is only to learn what it picked.
+    void draft_chained(common_speculative_draft_params_vec & dparams) {
         auto & ctx_dft = params.ctx_dft;
+
         auto & dp = dparams[0];
         if (!dp.drafting) {
             return;
         }
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        auto * smpl = smpls[0].get();
-        common_sampler_reset(smpl);
 
         llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, dp.n_past, -1);
 
         common_batch_clear(batch);
-        for (int j = 0; j < chain; ++j) {
-            common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.n_past + j, { 0 }, true);
-            float * row = batch.embd + (size_t) j * n_embd;
-            if (j == 0) {
+        for (int i = 0; i < n_chain; ++i) {
+            common_batch_add(batch, i == 0 ? dp.id_last : 0, dp.n_past + i, { 0 }, true);
+
+            float * row = batch.embd + (size_t) i * n_embd;
+            if (i == 0) {
                 std::memcpy(row, pending_h[0].data(), row_bytes);
             } else {
                 std::memset(row, 0, row_bytes);
             }
         }
 
-        // The same context also replays the target's accepted tokens between
-        // rounds, and that decode is not K wide, so the chain is switched on
-        // only for this call.
-        static const bool timing = getenv("LLAMA_MTP_CHAIN_TIMING") != nullptr;
-        const int64_t t0 = timing ? ggml_time_us() : 0;
-
-        llama_set_mtp_chain(ctx_dft, chain);
+        // the same context replays the accepted tokens between rounds, and
+        // that batch is not n_chain wide
+        llama_set_mtp_chain(ctx_dft, n_chain);
         const int ret = llama_decode(ctx_dft, batch);
         llama_set_mtp_chain(ctx_dft, 0);
+
         if (ret != 0) {
-            SPC_ERR("llama_decode(chain of %d) returned %d\n", chain, ret);
+            SPC_ERR("llama_decode(chained, n=%d) returned %d\n", n_chain, ret);
             return;
         }
 
-        // The graph already chose every token by argmax; the host only needs
-        // to read the same choice back, so no candidate list is built.
-        const int64_t t1 = timing ? ggml_time_us() : 0;
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+
         auto & result = *dp.result;
-        for (int j = 0; j < chain; ++j) {
-            const float * logits = llama_get_logits_ith(ctx_dft, j);
-            llama_token best = 0;
-            float best_v = logits[0];
-            for (int t = 1; t < n_vocab; ++t) {
-                if (logits[t] > best_v) {
-                    best_v = logits[t];
-                    best   = t;
-                }
-            }
-            result.push_back(best);
-        }
-        if (timing) {
-            const int64_t t2 = ggml_time_us();
-            LOG_INF("mtp chain: decode %.2f ms, readback+argmax %.2f ms\n", (t1 - t0)/1000.0, (t2 - t1)/1000.0);
+        for (int i = 0; i < n_chain; ++i) {
+            const float * logits = llama_get_logits_ith(ctx_dft, i);
+            result.push_back((llama_token) (std::max_element(logits, logits + n_vocab) - logits));
         }
     }
 
@@ -1430,19 +1416,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        // One trained head, one sequence: the round's draft steps can be unrolled
-        // into a single graph, which removes a host round trip per drafted token.
+        // one trained head and one sequence: the round's draft steps can run
+        // as a single graph, which saves a host round trip per drafted token.
+        // backend sampling allows one output per sequence and a chained
+        // round needs n_max, so the draft reads its logits back instead
         if (!chain_heads && n_seq == 1 && this->params.n_max >= 2 &&
                 llama_model_has_mtp_chain(llama_get_model(ctx_dft))) {
-            chain = this->params.n_max;
-            SPC_TRC("- MTP chain: %d draft steps per graph\n", chain);
-            // Backend sampling takes one output per sequence and the chain
-            // needs K, so the draft samples its K logit rows on the host.
+            n_chain = this->params.n_max;
+
             if (!backend_chains.empty() && backend_chains[0]) {
                 llama_set_sampler(ctx_dft, 0, nullptr);
                 llama_sampler_free(backend_chains[0]);
                 backend_chains[0] = nullptr;
             }
+
+            SPC_TRC("- chained drafting, n=%d\n", n_chain);
         }
 
         if (chain_heads) {
@@ -1582,13 +1570,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                static const bool timing = getenv("LLAMA_MTP_CHAIN_TIMING") != nullptr;
-                const int64_t t0 = timing ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch);
-                if (timing) {
-                    llama_synchronize(ctx_dft);
-                    LOG_INF("mtp replay: %d tokens, decode %.2f ms\n", (int) batch.n_tokens, (ggml_time_us() - t0)/1000.0);
-                }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1629,8 +1611,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        if (chain > 0) {
-            draft_chain(dparams);
+        if (n_chain > 0) {
+            draft_chained(dparams);
             return;
         }
 
@@ -2465,7 +2447,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        // a chained draft reads one logit row per drafted token
+        // a chained draft round reads one logit row per drafted token
         cparams.n_outputs_max         = (uint32_t) params.speculative.draft.n_max + 1;
         cparams.n_outputs_max_per_seq = cparams.n_outputs_max;
     }
