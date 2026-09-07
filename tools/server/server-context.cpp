@@ -786,6 +786,21 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+
+// LLAMA_ROUND_TIMING=1: the host side of a speculative round in the server
+struct srv_round_timing {
+    bool   on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+    double draft = 0, decode = 0, accept = 0; int rounds = 0;
+    int64_t t_draft0 = 0, t_dec0 = 0, t_acc0 = 0;
+    void end_round() {
+        rounds++;
+        if (rounds % 100 == 0) {
+            fprintf(stderr, "[round] server n=%d  draft %.3f  decode %.3f  accept %.3f ms per round\n", rounds, draft / rounds, decode / rounds, accept / rounds);
+        }
+    }
+};
+static srv_round_timing & srv_round_timer() { static srv_round_timing t; return t; }
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -2949,7 +2964,12 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
-                common_speculative_draft(spec.get());
+                {
+                    auto & srt = srv_round_timer();
+                    const int64_t t0 = srt.on ? ggml_time_us() : 0;
+                    common_speculative_draft(spec.get());
+                    if (srt.on) { srt.draft += (ggml_time_us() - t0) / 1000.0; }
+                }
             });
         }
 
@@ -3584,7 +3604,12 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            {
+                auto & srt = srv_round_timer();
+                const int64_t t0 = srt.on ? ggml_time_us() : 0;
+                ret = llama_decode(ctx_tgt, batch_view);
+                if (srt.on) { srt.decode += (ggml_time_us() - t0) / 1000.0; }
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -3816,7 +3841,10 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                auto & srt = srv_round_timer();
+                const int64_t t_acc0 = srt.on ? ggml_time_us() : 0;
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                if (srt.on) { srt.accept += (ggml_time_us() - t_acc0) / 1000.0; srt.end_round(); }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

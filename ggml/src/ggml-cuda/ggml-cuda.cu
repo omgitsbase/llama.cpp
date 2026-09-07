@@ -4620,6 +4620,22 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+
+// LLAMA_ROUND_TIMING=1: host time inside the CUDA backend's graph compute
+struct cuda_host_timing {
+    bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+    struct acc { double check = 0, evaluate = 0; int n = 0; int graphs = 0; };
+    std::map<const void *, acc> by_backend;
+    void add(const void * key, double a, double b, bool used_graph) {
+        acc & t = by_backend[key];
+        t.check += a; t.evaluate += b; t.n++; t.graphs += used_graph ? 1 : 0;
+        if (t.n % 100 == 0) {
+            fprintf(stderr, "[round] cuda %p n=%d  check %.3f  evaluate-or-launch %.3f ms per call  cuda-graph %d/%d" + 0, key, t.n, t.check / t.n, t.evaluate / t.n, t.graphs, t.n);
+            fputc(10, stderr);
+        }
+    }
+};
+static cuda_host_timing & cuda_host_timer() { static cuda_host_timing t; return t; }
 static int ggml_cuda_graph_stats() {
     static const int v = [] { const char * e = getenv("GGML_CUDA_GRAPH_STATS"); return e ? atoi(e) : 0; }();
     return v;
@@ -4635,6 +4651,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
     int  stats_why = 0;
     cudaEvent_t stats_e0 = nullptr, stats_e1 = nullptr;
+    auto & cht = cuda_host_timer();
+    const int64_t cht0 = cht.on ? ggml_time_us() : 0;
     if (ggml_cuda_graph_stats()) {
         CUDA_CHECK(cudaEventCreate(&stats_e0));
         CUDA_CHECK(cudaEventCreate(&stats_e1));
@@ -4693,7 +4711,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    const int64_t cht1 = cht.on ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (cht.on) { cht.add(backend, (cht1 - cht0) / 1000.0, (ggml_time_us() - cht1) / 1000.0, use_cuda_graph); }
 
     if (stats_e0) {
         CUDA_CHECK(cudaEventRecord(stats_e1, cuda_ctx->stream()));

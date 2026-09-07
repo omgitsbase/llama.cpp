@@ -2259,13 +2259,15 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * h_embd,
                     ggml_tensor * inp_pos,
                             int   step,
-                            int   il);
+                            int   il,
+                        bool  kv_only = false,
+                    ggml_tensor * mask_in = nullptr);
 
-        // n_chain draft steps unrolled into this graph, see llama_set_mtp_chain
+        // a whole draft round in this graph, see llama_set_mtp_chain
         void build_chain(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * tok_embd,
-                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_tokens,
                     ggml_tensor * inp_pos,
                             int   n_chain);
 

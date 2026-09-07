@@ -16,10 +16,28 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <limits>
 #include <stdexcept>
 #include <set>
 #include <string>
+
+// LLAMA_ROUND_TIMING=1: host-side phase times of every decode, averaged
+// and printed every 100 decodes per token count. What a one-trip round
+// would remove.
+struct llama_round_timing {
+    bool    on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+    struct acc { double prep = 0, graph = 0, inputs = 0, launch = 0, outputs = 0, total = 0, wait = 0; int n = 0; int built = 0; int splits = 0; int copies = 0; };
+    std::map<std::pair<const void *, int>, acc> by_tokens;
+    double wait_pending = 0;
+    void report(const void * ctx, int n_tokens) {
+        acc & a = by_tokens[{ctx, n_tokens}];
+        if (a.n % 100 != 0) return;
+        fprintf(stderr, "[round] decode ctx=%p T=%d n=%d  prep %.3f  graph %.3f (built %d)  inputs %.3f  launch %.3f  outputs %.3f  total %.3f  wait-in-getters %.3f ms  splits %d copies %d\n",
+                ctx, n_tokens, a.n, a.prep / a.n, a.graph / a.n, a.built, a.inputs / a.n, a.launch / a.n, a.outputs / a.n, a.total / a.n, a.wait / a.n, a.splits, a.copies);
+    }
+};
+static llama_round_timing & llama_round_timer() { static llama_round_timing t; return t; }
 
 //
 // llama_context
@@ -704,6 +722,9 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+    auto & rt = llama_round_timer();
+    const int64_t rt0 = rt.on ? ggml_time_us() : 0;
+    struct done { llama_round_timing & rt; int64_t t0; ~done() { if (rt.on) rt.wait_pending += (ggml_time_us() - t0) / 1000.0; } } rt_done{rt, rt0};
     if (!sched) {
         return;
     }
@@ -1327,6 +1348,8 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1336,6 +1359,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
+
+    auto & rt = llama_round_timer();
+    const int64_t rt0 = rt.on ? ggml_time_us() : 0;
+    bool rt_built = false;
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1361,6 +1388,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        rt_built = true;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1382,12 +1410,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        if (rt.on) { rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}].graph += (ggml_time_us() - rt0) / 1000.0; }
+        const int64_t rt1 = rt.on ? ggml_time_us() : 0;
         res->set_inputs(&ubatch);
+        if (rt.on) { rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}].inputs += (ggml_time_us() - rt1) / 1000.0; }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t rt2 = rt.on ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (rt.on) { auto & a = rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}]; a.launch += (ggml_time_us() - rt2) / 1000.0; a.built += rt_built ? 1 : 0; a.splits = ggml_backend_sched_get_n_splits(sched.get()); a.copies = ggml_backend_sched_get_n_copies(sched.get()); }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1642,6 +1675,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    auto & rt = llama_round_timer();
+    const int64_t rt_d0 = rt.on ? ggml_time_us() : 0;
+    int64_t rt_d1 = 0, rt_d2 = 0;
+    int rt_tokens = 0;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1818,7 +1856,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        if (rt.on && rt_d1 == 0) { rt_d1 = ggml_time_us(); rt_tokens = ubatch.n_tokens; }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (rt.on) { rt_d2 = ggml_time_us(); }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1992,13 +2032,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         if (!res->t_mtp_ids.empty()) {
-            mtp_ids.assign(res->t_mtp_ids.size(), LLAMA_TOKEN_NULL);
-            for (size_t j = 0; j < res->t_mtp_ids.size(); ++j) {
-                ggml_tensor * t = res->t_mtp_ids[j];
+            mtp_ids_pending = res->t_mtp_ids;
+            mtp_ids.clear();
+        }
+
+        if (res->t_mtp_hpend) {
+            ggml_tensor * t = res->t_mtp_hpend;
+            if (!mtp_round.hpend_dev) {
                 ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-                GGML_ASSERT(backend_t != nullptr);
-                ggml_backend_tensor_get_async(backend_t, t, &mtp_ids[j], 0, sizeof(llama_token));
+                ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_t);
+                ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+                ctx_mtp_hpend.reset(ggml_init(ip));
+                mtp_round.hpend_dev = ggml_new_tensor_1d(ctx_mtp_hpend.get(), GGML_TYPE_F32, ggml_nelements(t));
+                buf_mtp_hpend.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_mtp_hpend.get(), buft));
+                GGML_ASSERT(buf_mtp_hpend && "failed to allocate the MTP round buffer");
             }
+            ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            if (false) {
+                LLAMA_LOG_ERROR("%s: hpend copy: src %s type %d ne %lld %lld nb %zu %zu %zu, dst type %d ne %lld %lld nb %zu %zu %zu\n", __func__, t->name, (int) t->type,
+                        (long long) t->ne[0], (long long) t->ne[1], t->nb[0], t->nb[1], t->nb[2], (int) mtp_round.hpend_dev->type,
+                        (long long) mtp_round.hpend_dev->ne[0], (long long) mtp_round.hpend_dev->ne[1], mtp_round.hpend_dev->nb[0], mtp_round.hpend_dev->nb[1], mtp_round.hpend_dev->nb[2]);
+            }
+            ggml_backend_tensor_copy_async(backend_t, backend_t, t, mtp_round.hpend_dev);
+            mtp_round.host = false;
+            mtp_round.off  = 1;
         }
 
         if (has_samplers) {
@@ -2014,6 +2071,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (rt.on && rt_d1 != 0) {
+        auto & a = rt.by_tokens[{(const void *) this, rt_tokens}];
+        const int64_t now = ggml_time_us();
+        a.prep    += (rt_d1 - rt_d0) / 1000.0;
+        a.outputs += (now - rt_d2) / 1000.0;
+        a.total   += (now - rt_d0) / 1000.0;
+        a.wait    += rt.wait_pending;
+        rt.wait_pending = 0;
+        a.n++;
+        rt.report((const void *) this, rt_tokens);
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2510,6 +2579,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.mtp_round   =*/ &mtp_round,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3866,9 +3936,51 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 const llama_token * llama_context::get_mtp_chain_ids(int32_t & n) {
+    if (!mtp_ids_pending.empty()) {
+        mtp_ids.assign(mtp_ids_pending.size(), LLAMA_TOKEN_NULL);
+        for (size_t j = 0; j < mtp_ids_pending.size(); ++j) {
+            ggml_tensor * t = mtp_ids_pending[j];
+            ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            GGML_ASSERT(backend_t != nullptr);
+            ggml_backend_tensor_get_async(backend_t, t, &mtp_ids[j], 0, sizeof(llama_token));
+        }
+        mtp_ids_pending.clear();
+    }
     synchronize();
     n = (int32_t) mtp_ids.size();
     return mtp_ids.data();
+}
+
+void llama_context::set_mtp_round_target(llama_context * ctx_tgt) {
+    mtp_round.ctx_tgt = ctx_tgt;
+}
+
+void llama_set_mtp_round_target(llama_context * ctx, llama_context * ctx_tgt) {
+    ctx->set_mtp_round_target(ctx_tgt);
+}
+
+void llama_context::set_mtp_round_host(const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off) {
+    mtp_round.host        = true;
+    mtp_round.c_ids_host  = c_ids;
+    mtp_round.h_tgt_host  = h_tgt;
+    mtp_round.h_pend_host = h_pend;
+    mtp_round.off         = off;
+}
+
+bool llama_context::has_backend_sampler(llama_seq_id seq_id) const {
+    return sampling.samplers.find(seq_id) != sampling.samplers.end();
+}
+
+bool llama_sampler_on_backend(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->has_backend_sampler(seq_id);
+}
+
+llm_graph_result * llama_context::get_gf_res_prev() const {
+    return static_cast<llm_graph_result *>(gf_res_prev.get());
+}
+
+void llama_set_mtp_round_host(llama_context * ctx, const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off) {
+    ctx->set_mtp_round_host(c_ids, h_tgt, h_pend, off);
 }
 
 const llama_token * llama_get_mtp_chain_ids(llama_context * ctx, int32_t * n) {

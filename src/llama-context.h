@@ -59,6 +59,15 @@ struct llama_context {
 
     const llama_token * get_mtp_chain_ids(int32_t & n);
 
+    // a chained MTP round's host-side inputs (the first round of a request);
+    // later rounds read the target context's tensors on the device
+    void set_mtp_round_host(const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off);
+    void set_mtp_round_target(llama_context * ctx_tgt);
+
+    bool has_backend_sampler(llama_seq_id seq_id) const;
+
+    llm_graph_result * get_gf_res_prev() const;
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -303,8 +312,13 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
-    // ids drafted by a chained MTP graph, one per step
+    // ids drafted by a chained MTP graph, one per step, read back on demand
     std::vector<llama_token> mtp_ids;
+    std::vector<ggml_tensor *> mtp_ids_pending;
+
+    llama_mtp_round_state mtp_round;
+    ggml_context_ptr        ctx_mtp_hpend; // holds the tensor's metadata
+    ggml_backend_buffer_ptr buf_mtp_hpend;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

@@ -110,6 +110,17 @@ LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, int32_t n);
 // ids drafted by the last chained MTP decode, n of them
 LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx, int32_t * n);
 
+// the host-side inputs of the first chained round of a request: the target's
+// sampled ids for the verify rows, the anchor's hidden row, and off (0 here,
+// 1 once the rounds read the target's tensors on the device)
+LLAMA_API void llama_set_mtp_round_host(struct llama_context * ctx, const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off);
+
+// whether the sequence's sampler runs on the backend, so its samples are on the device
+LLAMA_API bool llama_sampler_on_backend(struct llama_context * ctx, llama_seq_id seq_id);
+
+// the target context a chained MTP context takes its rounds' inputs from
+LLAMA_API void llama_set_mtp_round_target(struct llama_context * ctx, struct llama_context * ctx_tgt);
+
 // Whether the model's DECODER_MTP graph supports chained drafting.
 LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);
 

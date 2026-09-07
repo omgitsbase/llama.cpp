@@ -154,6 +154,41 @@ public:
     const int64_t n_embd = 0;
 };
 
+// a chained MTP round takes the target's sampled ids and hidden rows for the
+// verify batch straight from the target context's last graph, plus the hidden
+// row the previous round left for the anchor; the first round of a request
+// gets them from the host
+struct llama_mtp_round_state {
+    llama_context * ctx_tgt   = nullptr;
+    ggml_tensor   * hpend_dev = nullptr;  // F32 [n_embd], written after every chained decode
+    bool            host       = true;    // the first round: the fields below are the inputs
+    const int32_t * c_ids_host  = nullptr; // [n_verify]
+    const float   * h_tgt_host  = nullptr; // [n_embd, n_verify], the target's hidden rows
+    const float   * h_pend_host = nullptr; // [n_embd], the anchor's hidden row of the previous round
+    int32_t         off        = 0;       // 1 in a normal round, 0 in the first one
+};
+
+class llm_graph_input_mtp_round : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_round(const llama_mtp_round_state * state, ggml_backend_sched_t sched, int64_t n_embd, int64_t n_verify)
+        : state(state), sched(sched), n_embd(n_embd), n_verify(n_verify) {}
+    virtual ~llm_graph_input_mtp_round() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * c_ids  = nullptr; // I32 [n_verify]
+    ggml_tensor * h_tgt  = nullptr; // F32 [n_embd, n_verify]
+    ggml_tensor * h_pend = nullptr; // F32 [n_embd, 1]
+    ggml_tensor * off    = nullptr; // F32 [1]
+
+    const llama_mtp_round_state * state;
+    ggml_backend_sched_t sched;
+    const int64_t n_embd;
+    const int64_t n_verify;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -753,6 +788,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    const llama_mtp_round_state  * mtp_round;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -913,7 +950,8 @@ public:
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
-    std::vector<ggml_tensor *> t_mtp_ids; // I32 [1], one per chained draft step
+    std::vector<ggml_tensor *> t_mtp_ids; // I32 [1], one per chained draft step, then the accepted count
+    ggml_tensor * t_mtp_hpend = nullptr;  // F32 [n_embd], the anchor's hidden row for the next round
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -997,6 +1035,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    const llama_mtp_round_state  * mtp_round;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-context.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -106,7 +107,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    if (ubatch->embd && h) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
@@ -118,8 +119,82 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || !h || (h->ne[1] == params.ubatch.n_tokens);
 
+    return res;
+}
+
+// copies n elements from the front of src into dst, on the device, ordered
+// after the graph that wrote src
+static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t sched_dst, ggml_tensor * src, ggml_tensor * dst, size_t nbytes, size_t dst_offset) {
+    ggml_tensor s = *src;
+    ggml_tensor d = *dst;
+    s.ne[0] = (int64_t) (nbytes / ggml_type_size(src->type)); s.ne[1] = 1; s.ne[2] = 1; s.ne[3] = 1;
+    s.nb[1] = nbytes; s.nb[2] = nbytes; s.nb[3] = nbytes;
+    d.ne[0] = s.ne[0]; d.ne[1] = 1; d.ne[2] = 1; d.ne[3] = 1;
+    d.nb[1] = nbytes; d.nb[2] = nbytes; d.nb[3] = nbytes;
+    d.data = (char *) dst->data + dst_offset;
+    d.view_src = nullptr;
+    s.view_src = nullptr;
+    ggml_backend_t b_src = ggml_backend_sched_get_tensor_backend(sched_src, src);
+    ggml_backend_t b_dst = ggml_backend_sched_get_tensor_backend(sched_dst, dst);
+    // a persistent tensor outside any graph shares its peer's backend
+    if (!b_src) b_src = b_dst;
+    if (!b_dst) b_dst = b_src;
+    GGML_ASSERT(b_src && b_dst);
+    bool same = s.type == d.type;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        same = same && s.ne[i] == d.ne[i] && s.nb[i] == d.nb[i];
+    }
+    if (!same) {
+        LLAMA_LOG_ERROR("%s: copy (same %d) src %s type %d ne %lld %lld %lld %lld nb %zu %zu %zu %zu | dst %s type %d ne %lld %lld %lld %lld nb %zu %zu %zu %zu\n", __func__, (int) same,
+                src->name, (int) s.type, (long long) s.ne[0], (long long) s.ne[1], (long long) s.ne[2], (long long) s.ne[3], s.nb[0], s.nb[1], s.nb[2], s.nb[3],
+                dst->name, (int) d.type, (long long) d.ne[0], (long long) d.ne[1], (long long) d.ne[2], (long long) d.ne[3], d.nb[0], d.nb[1], d.nb[2], d.nb[3]);
+    }
+    ggml_backend_tensor_copy_async(b_src, b_dst, &s, &d);
+}
+
+void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    const auto * st = state;
+    const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+    if (st->host) {
+        GGML_ASSERT(st->c_ids_host && st->h_tgt_host && st->h_pend_host);
+        ggml_backend_tensor_set(h_tgt,  st->h_tgt_host,  0, row_bytes * n_verify);
+        ggml_backend_tensor_set(h_pend, st->h_pend_host, 0, row_bytes);
+        ggml_backend_tensor_set(c_ids,  st->c_ids_host,  0, ggml_nbytes(c_ids));
+    } else {
+        GGML_ASSERT(st->ctx_tgt && st->hpend_dev);
+        auto * res_tgt = st->ctx_tgt->get_gf_res_prev();
+        ggml_backend_sched_t sched_tgt = st->ctx_tgt->get_sched();
+
+        ggml_tensor * src_h = res_tgt->get_h_nextn();
+        GGML_ASSERT(src_h && src_h->ne[0] == n_embd && src_h->ne[1] >= n_verify && ggml_is_contiguous(src_h));
+        mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, 0);
+
+        LLAMA_LOG_ERROR("%s: device route: t_sampled %zu candidates %zu h_nextn %s n_verify %d\n", __func__, res_tgt->t_sampled.size(), res_tgt->t_candidates.size(), src_h ? src_h->name : "-", (int) n_verify);
+        GGML_ASSERT((int64_t) res_tgt->t_sampled.size() >= n_verify);
+        for (int64_t i = 0; i < n_verify; ++i) {
+            ggml_tensor * src_c = res_tgt->t_sampled[i];
+            if (src_c == nullptr && i < (int64_t) res_tgt->t_candidates.size()) {
+                src_c = res_tgt->t_candidates[i]; // the greedy sampler leaves one candidate
+            }
+            GGML_ASSERT(src_c && src_c->type == GGML_TYPE_I32 && "MTP round: the target must sample on the backend");
+            mtp_round_copy(sched_tgt, sched, src_c, c_ids, sizeof(int32_t), i * sizeof(int32_t));
+        }
+
+        mtp_round_copy(sched, sched, st->hpend_dev, h_pend, row_bytes, 0);
+    }
+
+    const float o = (float) st->off;
+    ggml_backend_tensor_set(off, &o, 0, sizeof(o));
+}
+
+bool llm_graph_input_mtp_round::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+    res &= params.mtp_round == state;
+    res &= c_ids && c_ids->ne[0] == n_verify;
     return res;
 }
 
@@ -1308,6 +1383,7 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
     t_mtp_ids.clear();
+    t_mtp_hpend = nullptr;
 
     params = {};
 
@@ -1463,6 +1539,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_round        (params.mtp_round),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

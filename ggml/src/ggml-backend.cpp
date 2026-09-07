@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <map>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1591,6 +1592,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+
+// LLAMA_ROUND_TIMING=1: host time inside the scheduler's compute, per phase
+struct sched_host_timing {
+    bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+    struct acc { double sync = 0, copy = 0, compute = 0; int n = 0; int n_inputs = 0; };
+    std::map<const void *, acc> by_sched;
+    void add(const void * key, double a, double b, double c, int inputs) {
+        acc & t = by_sched[key];
+        t.sync += a; t.copy += b; t.compute += c; t.n_inputs += inputs; t.n++;
+        if (t.n % 100 == 0) {
+            fprintf(stderr, "[round] sched %p n=%d  input-sync %.3f  input-copy %.3f  backend-compute %.3f ms per call  inputs/call %.1f\n", key, t.n, t.sync / t.n, t.copy / t.n, t.compute / t.n, (double) t.n_inputs / t.n);
+        }
+    }
+};
+static sched_host_timing & sched_host_timer() { static sched_host_timing t; return t; }
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1604,6 +1620,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        auto & sht = sched_host_timer();
+        double t_sync = 0, t_copy = 0;
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1612,12 +1630,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                const int64_t ts0 = sht.on ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                const int64_t ts1 = sht.on ? ggml_time_us() : 0;
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (sht.on) { t_sync += (ts1 - ts0) / 1000.0; t_copy += (ggml_time_us() - ts1) / 1000.0; }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1728,7 +1749,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const int64_t tc0 = sht.on ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sht.on) { sht.add(sched, t_sync, t_copy, (ggml_time_us() - tc0) / 1000.0, split->n_inputs); }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
