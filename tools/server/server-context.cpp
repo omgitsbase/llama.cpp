@@ -972,10 +972,10 @@ private:
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                  params_base.speculative.types.end(),
+                                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1121,6 +1121,16 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        // a model that carries a trained MTP head drafts for itself, so a run
+        // with no speculative flags still gets the one-trip round
+        if (!has_spec && !params_base.speculative.types_set && llama_model_n_layer_nextn(model_tgt) > 0) {
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            spec_mtp = true;
+            has_spec = true;
+
+            SRV_INF("%s", "the model carries an MTP head, drafting with it (pass --spec-type none to turn this off)\n");
+        }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
