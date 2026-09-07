@@ -4092,7 +4092,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // rms_norm > scale > mul: a constant between the norm and its weight
-    if (!(ggml_cuda_fuse_off_mask() & 8) && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
+    if (!((ggml_cuda_fuse_off_mask() & 8) || getenv("GGML_CUDA_FUSE_NSCALE") == nullptr) && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
             ggml_cuda_should_fuse_rms_norm_scale_mul(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
         ggml_cuda_op_rms_norm_fused_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
