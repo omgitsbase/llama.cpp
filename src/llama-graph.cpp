@@ -2472,8 +2472,8 @@ llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv_iswa * inp, boo
 llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_k_iswa * inp, bool swa) {
     const auto * mctx = swa ? inp->mctx->get_swa() : inp->mctx->get_base();
     return swa
-        ? llm_graph_mtp_attn{ mctx, inp->get_k_idxs_swa(), nullptr, inp->get_kq_mask_swa() }
-        : llm_graph_mtp_attn{ mctx, inp->get_k_idxs(),     nullptr, inp->get_kq_mask()     };
+        ? llm_graph_mtp_attn{ mctx, inp->get_k_idxs_swa(), nullptr, inp->get_kq_mask_swa(), inp->self_k_rot_swa }
+        : llm_graph_mtp_attn{ mctx, inp->get_k_idxs(),     nullptr, inp->get_kq_mask(),     inp->self_k_rot     };
 }
 
 ggml_tensor * llm_graph_context::build_attn_mtp(
@@ -2484,14 +2484,20 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
                      ggml_tensor * q,
                      ggml_tensor * k,
                      ggml_tensor * v,
+                     ggml_tensor * sinks,
                      ggml_tensor * v_mla,
                            float   kq_scale,
                              int   il,
                              int   row,
                             bool   kv_only,
-                     ggml_tensor * mask_in) {
+                     ggml_tensor * mask_in) const {
     const auto * mctx_cur = attn.mctx;
     const int64_t n_rows  = q->ne[2];
+
+    if (attn.k_rot) {
+        q = llama_mul_mat_hadamard(ctx0, q, attn.k_rot);
+        k = llama_mul_mat_hadamard(ctx0, k, attn.k_rot);
+    }
 
     ggml_tensor * k_idx = ggml_view_1d(ctx0, attn.k_idxs, n_rows, row*ggml_element_size(attn.k_idxs));
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, k_idx, il));
@@ -2512,13 +2518,20 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
     ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
 
     // a cache that holds no separate V reads it out of the K rows, as build_attn does
-    ggml_tensor * v_all = attn.v_idxs
-        ? mctx_cur->get_v(ctx0, il)
-        : ggml_view_4d(ctx0, k_all, v->ne[0], k_all->ne[1], k_all->ne[2], k_all->ne[3], k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
+    ggml_tensor * v_all = k_all;
+    if (attn.v_idxs) {
+        v_all = mctx_cur->get_v(ctx0, il);
+    } else if (v) {
+        v_all = ggml_view_4d(ctx0, k_all, v->ne[0], k_all->ne[1], k_all->ne[2], k_all->ne[3], k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k_all, v_all,
-            nullptr, mask, nullptr, v_mla, kq_scale, il);
+            nullptr, mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    if (attn.k_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, attn.k_rot);
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
@@ -2546,18 +2559,22 @@ const llm_graph_mtp_attn & attn,
              ggml_tensor * tok_embd,
              ggml_tensor * inp_tokens,
              ggml_tensor * inp_pos,
-                     int   n_chain) {
+                     int   n_chain,
+                 int64_t   n_embd_h) {
     const int K = n_chain;
+    if (n_embd_h == 0) {
+        n_embd_h = n_embd;
+    }
     const int V = n_chain + 1;
     GGML_ASSERT(n_tokens == V + K && "MTP round: n_chain+1 replay rows and n_chain chain rows");
     GGML_ASSERT(inp_tokens && "MTP round: needs the verify tokens");
     GGML_ASSERT(cparams.flash_attn && "MTP round: needs flash attention");
     GGML_ASSERT(mtp_round && "MTP round: needs the round state");
 
-    auto rinp = std::make_unique<llm_graph_input_mtp_round>(mtp_round, sched, n_embd, V);
+    auto rinp = std::make_unique<llm_graph_input_mtp_round>(mtp_round, sched, n_embd_h, V);
     rinp->c_ids  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, V);
-    rinp->h_tgt  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, V);
-    rinp->h_pend = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, 1);
+    rinp->h_tgt  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, V);
+    rinp->h_pend = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, 1);
     rinp->off    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
     ggml_set_input(rinp->c_ids);  ggml_set_name(rinp->c_ids,  "mtp_round_c");
     ggml_set_input(rinp->h_tgt);  ggml_set_name(rinp->h_tgt,  "mtp_round_h");

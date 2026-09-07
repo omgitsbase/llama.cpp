@@ -379,7 +379,7 @@ ggml_tensor * llama_model_deepseek2::graph_mtp::build_step(
         } else {
             cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn),
                     layer.wo, NULL, layer.wo_s,
-                    Qcur, Kcur, Vcur, layer.wv_b, kq_scale, il, step, kv_only, mask_in);
+                    Qcur, Kcur, Vcur, nullptr, layer.wv_b, kq_scale, il, step, kv_only, mask_in);
             if (!cur) {
                 return nullptr;
             }

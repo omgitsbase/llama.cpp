@@ -382,7 +382,7 @@ ggml_tensor * llama_model_hy_v3::graph_mtp::build_step(
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         } else {
             cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn), layer.wo, layer.wo_b, layer.wo_s,
-                    Qcur, Kcur, Vcur, nullptr, kq_scale, il, step, kv_only, mask_in);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il, step, kv_only, mask_in);
             if (!cur) {
                 return nullptr;
             }

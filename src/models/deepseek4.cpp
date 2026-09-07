@@ -897,8 +897,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         llm_graph_input_attn_k_iswa * inp_mtp,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
-    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il);
+        int il,
+        int step,
+        bool kv_only,
+        ggml_tensor * mask_in) const {
+    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il, step, kv_only, mask_in);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
@@ -907,7 +910,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         llm_graph_input_attn_k_iswa * inp_mtp,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
+        int il,
+        int step,
+        bool kv_only,
+        ggml_tensor * mask_in) const {
     GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
 
     const auto & layer = model.layers[il];
@@ -1222,7 +1228,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     }
 
     ggml_tensor * out = nullptr;
-    if (inp_mtp) {
+    if (inp_mtp && step >= 0) {
+        out = build_attn_mtp(llm_graph_mtp_attn_of(inp_mtp, hparams.is_swa(il)),
+                nullptr, nullptr, nullptr,
+                q, kv, nullptr, layer.attn_sinks, nullptr,
+                1.0f/sqrtf(float(n_embd_head)), il, step, kv_only, mask_in);
+        if (!out) {
+            return nullptr;
+        }
+        cb(out, "attn_raw", il);
+    } else if (inp_mtp) {
         out = build_attn(inp_mtp,
                 nullptr, nullptr, nullptr,
                 q, kv, nullptr,
@@ -1405,7 +1420,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
 
 llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
-    graph(params) {
+    graph(params), model_ref(model), layer(model.layers[hparams.n_layer() + params.cparams.nextn_layer_offset]) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "DEEPSEEK4 MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "DEEPSEEK4 MTP currently only supports a single MTP block");
     GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
@@ -1417,7 +1432,6 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "DEEPSEEK4 MTP hidden width mismatch");
 
     const int il = hparams.n_layer() + cparams.nextn_layer_offset;
-    const auto & layer = model.layers[il];
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
@@ -1431,30 +1445,106 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
     ggml_set_input(inp->embd);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    ggml_tensor * h_flat = nullptr;
+    if (cparams.mtp_chain == 0) {
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+        h_flat = inp->h;
+    }
 
-    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
-    cb(tok_embd, "mtp_tok_embd", il);
-
-    ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
-    cb(h_state, "mtp_h_state", il);
+    ggml_tensor * inp_tokens = inp->tokens;
+    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, embd_weights(), inp->tokens);
 
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
+
+    if (cparams.mtp_chain > 0) {
+        inp_attn_cur = inp_attn;
+        build_mtp_round(*this, llm_graph_mtp_attn_of(inp_attn, hparams.is_swa(il)), tok_embd, inp_tokens, inp_pos,
+                cparams.mtp_chain, hparams.n_embd_out());
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * flat = build_step(inp_attn, tok_embd, h_flat, inp_pos, -1, il);
+
+    ggml_tensor * h_nextn = ggml_get_rows(ctx0, flat, inp_out_ids);
+    res->t_h_nextn = h_nextn;
+
+    ggml_tensor * cur = mtp_head(h_nextn);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+bool llama_model_deepseek4::has_mtp_round() const {
+    return hparams.n_layer_nextn == 1;
+}
+
+ggml_tensor * llama_model_deepseek4::graph_mtp::mtp_step(
+        ggml_tensor * tok_embd,
+        ggml_tensor * h,
+        ggml_tensor * pos,
+                int   row,
+               bool   kv_only,
+        ggml_tensor * mask) {
+    return build_step(inp_attn_cur, tok_embd, h, pos, row, hparams.n_layer() + cparams.nextn_layer_offset, kv_only, mask);
+}
+
+ggml_tensor * llama_model_deepseek4::graph_mtp::mtp_embd_weights() const {
+    return embd_weights();
+}
+
+// the head folds the hyper-connection streams back together first
+ggml_tensor * llama_model_deepseek4::graph_mtp::mtp_head(ggml_tensor * h) {
+    const int64_t hc = hparams.dsv4_hc_mult;
+
+    ggml_tensor * cur = ggml_reshape_3d(ctx0, h, n_embd, hc, h->ne[1]);
+    cur = build_hc_head(cur, model_ref.hc_head_fn, model_ref.hc_head_scale, model_ref.hc_head_base);
+
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model_ref.output_norm;
+    GGML_ASSERT(head_norm_w && "DEEPSEEK4 MTP missing shared head norm");
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    res->t_embd = cur;
+
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model_ref.output;
+    GGML_ASSERT(head_w && "DEEPSEEK4 MTP missing LM head");
+    return ggml_mul_mat(ctx0, head_w, cur);
+}
+
+ggml_tensor * llama_model_deepseek4::graph_mtp::embd_weights() const {
+    return layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model_ref.tok_embd;
+}
+
+// the MTP block: hyper-connected attention and MoE FFN, as in the trunk. The
+// hidden state travels flat, hc streams wide.
+ggml_tensor * llama_model_deepseek4::graph_mtp::build_step(
+    llm_graph_input_attn_k_iswa * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                            int   step,
+                            int   il,
+                           bool   kv_only,
+                    ggml_tensor * mask_in) {
+    const int64_t hc     = hparams.dsv4_hc_mult;
+    const int64_t n_rows = tok_embd->ne[1];
+
+    ggml_tensor * h_state = ggml_reshape_3d(ctx0, h_embd, n_embd, hc, n_rows);
 
     ggml_tensor * h_norm = build_norm(h_state, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    e_norm = ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens);
-    e_norm = ggml_repeat_4d(ctx0, e_norm, n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
+
+    e_norm = ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_rows);
+    e_norm = ggml_repeat_4d(ctx0, e_norm, n_embd, hc, n_rows, 1);
 
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, 0);
     cb(concat, "mtp_concat", il);
@@ -1471,15 +1561,16 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.hc_attn_scale,
             layer.hc_attn_base,
             &post, &comb, il);
-    cb(cur, "mtp_hc_attn_pre", il);
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
-    cur = build_attention(model, inp_attn, cur, inp_pos, il);
+    cur = build_attention(model_ref, inp_attn, cur, inp_pos, il, step, kv_only, mask_in);
+    if (!cur) {
+        return nullptr;
+    }
 
     inpL = build_hc_post(cur, residual, post, comb, il);
-    cb(inpL, "mtp_hc_attn_post", il);
 
     residual = inpL;
     cur = build_hc_pre(inpL,
@@ -1487,12 +1578,12 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.hc_ffn_scale,
             layer.hc_ffn_base,
             &post, &comb, il);
-    cb(cur, "mtp_hc_ffn_pre", il);
 
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_ffn_norm", il);
 
     GGML_ASSERT((uint32_t) il >= hparams.dsv4_hash_layer_count && "DEEPSEEK4 MTP does not support hash-routed MTP blocks");
+
     ggml_tensor * moe_out = build_moe_ffn(cur,
             layer.ffn_gate_inp,
             layer.ffn_up_exps,
@@ -1514,33 +1605,10 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(ffn_shexp, "mtp_ffn_shexp", il);
 
     cur = ggml_add(ctx0, moe_out, ffn_shexp);
-    cb(cur, "mtp_ffn_out", il);
 
     inpL = build_hc_post(cur, residual, post, comb, il);
     inpL = build_cvec(inpL, il);
-    cb(inpL, "mtp_l_out", il);
+    cb(inpL, "mtp_post_ffn", il);
 
-    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
-    ggml_tensor * h_nextn = ggml_get_rows(ctx0, flat, inp_out_ids);
-    cb(h_nextn, "h_nextn", -1);
-    res->t_h_nextn = h_nextn;
-
-    inpL = ggml_reshape_3d(ctx0, h_nextn, n_embd, hc, n_outputs);
-
-    cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
-    cb(cur, "mtp_hc_head", -1);
-
-    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
-    GGML_ASSERT(head_norm_w && "DEEPSEEK4 MTP missing shared head norm");
-    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
-    cb(cur, "mtp_shared_head_norm", -1);
-    res->t_embd = cur;
-
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    GGML_ASSERT(head_w && "DEEPSEEK4 MTP missing LM head");
-    cur = ggml_mul_mat(ctx0, head_w, cur);
-    cb(cur, "result_output", -1);
-
-    res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
+    return ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_rows);
 }

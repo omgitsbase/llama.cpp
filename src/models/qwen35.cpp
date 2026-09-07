@@ -660,7 +660,7 @@ ggml_tensor * llama_model_qwen35::graph_mtp::build_step(
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     } else {
-        cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn), nullptr, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, kq_scale, il, step, kv_only, mask_in);
+        cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn), nullptr, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il, step, kv_only, mask_in);
         if (!cur) {
             return nullptr;
         }

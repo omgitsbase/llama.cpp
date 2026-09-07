@@ -1288,7 +1288,10 @@ struct llama_model_deepseek4 : public llama_model_base {
                 llm_graph_input_attn_k_iswa * inp_mtp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                int step = -1,
+                bool kv_only = false,
+                ggml_tensor * mask_in = nullptr) const;
 
         ggml_tensor * build_attention_impl(
                 const llama_model & model,
@@ -1296,7 +1299,10 @@ struct llama_model_deepseek4 : public llama_model_base {
                 llm_graph_input_attn_k_iswa * inp_mtp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                int step = -1,
+                bool kv_only = false,
+                ggml_tensor * mask_in = nullptr) const;
 
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1373,11 +1379,36 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int il) const;
     };
 
-    struct graph_mtp : public graph {
+    struct graph_mtp : public graph, public llm_graph_mtp_i {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+
+        // the one-trip round's hooks, see llm_graph_context::build_mtp_round
+        ggml_tensor * mtp_step(ggml_tensor * tok_embd, ggml_tensor * h, ggml_tensor * pos, int row, bool kv_only, ggml_tensor * mask) override;
+        ggml_tensor * mtp_embd_weights() const override;
+        ggml_tensor * mtp_head(ggml_tensor * h) override;
+    private:
+        // one pass of the MTP block; step >= 0 selects a position of a round
+        ggml_tensor * build_step(
+    llm_graph_input_attn_k_iswa * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                            int   step,
+                            int   il,
+                        bool  kv_only = false,
+                    ggml_tensor * mask_in = nullptr);
+
+        ggml_tensor * embd_weights() const;
+
+        llm_graph_input_attn_k_iswa * inp_attn_cur = nullptr;
+
+        const llama_model & model_ref;
+        const llama_layer & layer;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    bool has_mtp_round() const override;
 };
 
 

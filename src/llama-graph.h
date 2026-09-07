@@ -602,6 +602,7 @@ struct llm_graph_mtp_attn {
     ggml_tensor * k_idxs  = nullptr;
     ggml_tensor * v_idxs  = nullptr; // null where the cache holds no separate V
     ggml_tensor * kq_mask = nullptr;
+    ggml_tensor * k_rot   = nullptr; // the rotation a Hadamard-rotated cache applies
 };
 
 llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv      * inp);
@@ -1213,7 +1214,8 @@ struct llm_graph_context {
                  ggml_tensor * tok_embd,
                  ggml_tensor * inp_tokens,
                  ggml_tensor * inp_pos,
-                         int   n_chain);
+                         int   n_chain,
+                     int64_t   n_embd_h = 0);
 
     // one row group of a round: write its K/V rows, then attend against the
     // cache with the round's mask. row is the batch row the group starts at;
@@ -1226,12 +1228,13 @@ struct llm_graph_context {
                  ggml_tensor * q,
                  ggml_tensor * k,
                  ggml_tensor * v,
+                 ggml_tensor * sinks,
                  ggml_tensor * v_mla,
                        float   kq_scale,
                          int   il,
                          int   row,
                         bool   kv_only,
-                 ggml_tensor * mask_in);
+                 ggml_tensor * mask_in) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
