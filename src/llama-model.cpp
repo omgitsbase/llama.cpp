@@ -2540,7 +2540,7 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
 }
 
 bool llama_model_has_mtp_chain(const llama_model * model) {
-    return model->arch == LLM_ARCH_QWEN35MOE && model->hparams.n_layer_nextn == 1;
+    return model->has_mtp_round();
 }
 
 int32_t llama_model_n_head(const llama_model * model) {

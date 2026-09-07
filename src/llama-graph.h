@@ -168,6 +168,32 @@ struct llama_mtp_round_state {
     int32_t         off        = 0;       // 1 in a normal round, 0 in the first one
 };
 
+// A model joins the one-trip speculative round by implementing these three
+// hooks over its own MTP block; llm_graph_context::build_mtp_round does the
+// rest, and it is the same for every architecture.
+class llm_graph_mtp_i {
+public:
+    virtual ~llm_graph_mtp_i() = default;
+
+    // one pass of the MTP block over the rows of tok_embd/h, starting at row
+    // `row` of the batch; it writes those K/V rows before attending. When
+    // kv_only nothing reads the result, so only the cache is refreshed. When
+    // mask is set it replaces the batch's own mask row.
+    virtual ggml_tensor * mtp_step(
+            ggml_tensor * tok_embd,
+            ggml_tensor * h,
+            ggml_tensor * pos,
+                    int   row,
+                   bool   kv_only,
+            ggml_tensor * mask) = 0;
+
+    // the embedding matrix a drafted token id goes through
+    virtual ggml_tensor * mtp_embd_weights() const = 0;
+
+    // the MTP head: hidden state to logits
+    virtual ggml_tensor * mtp_head(ggml_tensor * h) = 0;
+};
+
 class llm_graph_input_mtp_round : public llm_graph_input_i {
 public:
     llm_graph_input_mtp_round(const llama_mtp_round_state * state, ggml_backend_sched_t sched, int64_t n_embd, int64_t n_verify)
@@ -1161,6 +1187,15 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+
+    // a whole speculative round in this graph, see llama_set_mtp_chain
+    void build_mtp_round(
+        llm_graph_mtp_i & mtp,
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * inp_tokens,
+                    ggml_tensor * inp_pos,
+                            int   n_chain);
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

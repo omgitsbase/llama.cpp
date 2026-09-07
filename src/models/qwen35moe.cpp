@@ -608,7 +608,8 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     auto * inp_attn = build_attn_inp_kv();
 
     if (cparams.mtp_chain > 0) {
-        build_chain(inp_attn, tok_embd, inp_tokens, inp_pos, cparams.mtp_chain);
+        inp_attn_cur = inp_attn;
+        build_mtp_round(*this, inp_attn, tok_embd, inp_tokens, inp_pos, cparams.mtp_chain);
         return;
     }
 
@@ -627,6 +628,28 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+bool llama_model_qwen35moe::has_mtp_round() const {
+    return hparams.n_layer_nextn == 1;
+}
+
+ggml_tensor * llama_model_qwen35moe::graph_mtp::mtp_step(
+        ggml_tensor * tok_embd,
+        ggml_tensor * h,
+        ggml_tensor * pos,
+                int   row,
+               bool   kv_only,
+        ggml_tensor * mask) {
+    return build_step(inp_attn_cur, tok_embd, h, pos, row, hparams.n_layer(), kv_only, mask);
+}
+
+ggml_tensor * llama_model_qwen35moe::graph_mtp::mtp_embd_weights() const {
+    return embd_weights();
+}
+
+ggml_tensor * llama_model_qwen35moe::graph_mtp::mtp_head(ggml_tensor * h) {
+    return build_lora_mm(head_w, h, head_s);
 }
 
 ggml_tensor * llama_model_qwen35moe::graph_mtp::embd_weights() const {
@@ -791,151 +814,3 @@ ggml_tensor * llama_model_qwen35moe::graph_mtp::build_step(
     return build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 }
 
-// A whole draft round in one graph. Rows 0 .. n_chain replay the verify batch
-// the target just ran: the batch's tokens paired with the target's hidden
-// rows, which come straight from the target's graph. How many of them the
-// target accepted is decided here, on the device, by comparing its samples
-// with the batch's tokens. The rows after them are the chain: the anchor, the
-// target's sample after the last accepted row, then one row per draft, each
-// taking the argmax of the previous logits and the previous hidden state. The
-// chain's positions follow the accepted rows; the replay rows past them are
-// hidden from it by an additive mask and leave the cache before the next
-// round.
-void llama_model_qwen35moe::graph_mtp::build_chain(
-        llm_graph_input_attn_kv * inp_attn,
-                    ggml_tensor * tok_embd,
-                    ggml_tensor * inp_tokens,
-                    ggml_tensor * inp_pos,
-                            int   n_chain) {
-    const int K = n_chain;
-    const int V = n_chain + 1;
-    GGML_ASSERT(n_tokens == V + K && "MTP chain: n_chain+1 replay rows and n_chain chain rows");
-    GGML_ASSERT(inp_tokens && "MTP chain: needs the verify tokens");
-    GGML_ASSERT(cparams.flash_attn && "MTP chain: needs flash attention");
-    GGML_ASSERT(mtp_round && "MTP chain: needs the round state");
-
-    const int il = hparams.n_layer();
-
-    auto rinp = std::make_unique<llm_graph_input_mtp_round>(mtp_round, sched, n_embd, V);
-    rinp->c_ids  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, V);
-    rinp->h_tgt  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, V);
-    rinp->h_pend = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, 1);
-    rinp->off    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-    ggml_set_input(rinp->c_ids);  ggml_set_name(rinp->c_ids,  "mtp_round_c");
-    ggml_set_input(rinp->h_tgt);  ggml_set_name(rinp->h_tgt,  "mtp_round_h");
-    ggml_set_input(rinp->h_pend); ggml_set_name(rinp->h_pend, "mtp_round_hpend");
-    ggml_set_input(rinp->off);    ggml_set_name(rinp->off,    "mtp_round_off");
-    ggml_tensor * c_ids  = rinp->c_ids;
-    ggml_tensor * h_tgt  = rinp->h_tgt;
-    ggml_tensor * h_pend = rinp->h_pend;
-    ggml_tensor * off    = rinp->off;
-    res->add_input(std::move(rinp));
-
-    // M-RoPE positions are section-major, [n_pos_per_embd][n]: the entries
-    // for one row sit n apart
-    const int64_t n_pos = hparams.n_pos_per_embd();
-    const size_t  ps    = ggml_element_size(inp_pos);
-    auto pos_rows = [&](int first, int n) {
-        ggml_tensor * p = ggml_view_2d(ctx0, inp_pos, n, n_pos, n_tokens*ps, first*ps);
-        return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n*n_pos);
-    };
-    auto rows = [&](ggml_tensor * t, int first, int n) {
-        return ggml_view_2d(ctx0, t, t->ne[0], n, t->nb[1], first*t->nb[1]);
-    };
-
-    // the replay: verify token k with hidden row k-1; row 0 pairs with the
-    // hidden row the previous round left
-    ggml_tensor * h_replay = ggml_concat(ctx0, h_pend, rows(h_tgt, 0, K), 1);
-    cb(h_replay, "mtp_replay_h", -1);
-    build_step(inp_attn, rows(tok_embd, 0, V), h_replay, pos_rows(0, V), 0, il, true, nullptr);
-
-    // accepted rows: the leading verify rows whose target sample equals the
-    // next verify token
-    const size_t is = ggml_element_size(inp_tokens);
-    ggml_tensor * c_f = ggml_cast(ctx0, ggml_view_1d(ctx0, c_ids, K, 0), GGML_TYPE_F32);
-    ggml_tensor * x_f = ggml_cast(ctx0, ggml_view_1d(ctx0, inp_tokens, K, is), GGML_TYPE_F32);
-    ggml_tensor * eq  = ggml_scale_bias(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, c_f, x_f)), 0.0f, 1.0f), -1.0f, 1.0f);
-    cb(eq, "mtp_round_eq", -1);
-    ggml_tensor * n_acc = nullptr;
-    ggml_tensor * run   = nullptr;
-    for (int i = 0; i < K; ++i) {
-        ggml_tensor * e = ggml_view_1d(ctx0, eq, 1, i*ggml_element_size(eq));
-        run   = run   ? ggml_mul(ctx0, run, e)   : e;
-        n_acc = n_acc ? ggml_add(ctx0, n_acc, run) : run;
-    }
-    cb(n_acc, "mtp_round_nacc", -1);
-    ggml_tensor * n_acc_i = ggml_cast(ctx0, n_acc, GGML_TYPE_I32);
-    ggml_set_output(n_acc_i);
-
-    // the anchor: the target's sample after the last accepted row, with that
-    // row's hidden state, which the next round starts from too
-    ggml_tensor * anchor_id = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, c_ids, 1, V), n_acc_i);
-    ggml_tensor * anchor_h  = ggml_get_rows(ctx0, h_tgt, n_acc_i);
-    cb(anchor_h, "mtp_round_anchor_h", -1);
-    ggml_set_output(anchor_h);
-    res->t_mtp_hpend = anchor_h;
-
-    ggml_tensor * tok = ggml_get_rows(ctx0, embd_weights(), ggml_reshape_1d(ctx0, anchor_id, 1));
-    ggml_tensor * h   = anchor_h;
-
-    // the chain's positions: the replay's first position + n_acc + off, one
-    // further per draft
-    ggml_tensor * base_f  = ggml_cast(ctx0, ggml_view_1d(ctx0, inp_pos, 1, 0), GGML_TYPE_F32);
-    ggml_tensor * start   = ggml_add(ctx0, ggml_add(ctx0, base_f, n_acc), off);
-    ggml_tensor * pos_f   = ggml_add(ctx0, ggml_arange(ctx0, 0.0f, (float) K, 1.0f), start);
-    ggml_tensor * pos_all = pos_f;
-    for (int s = 1; s < n_pos; ++s) {
-        // text rows: every section but the last takes the position, the last is 0
-        pos_all = ggml_concat(ctx0, pos_all, s + 1 == n_pos ? ggml_scale(ctx0, pos_f, 0.0f) : pos_f, 0);
-    }
-    ggml_tensor * pos_i = ggml_cast(ctx0, pos_all, GGML_TYPE_I32);
-    const size_t pis = ggml_element_size(pos_i);
-    auto pos_chain = [&](int j) {
-        ggml_tensor * p = ggml_view_2d(ctx0, pos_i, 1, n_pos, K*pis, j*pis);
-        return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n_pos);
-    };
-
-    // the replay rows past the accepted ones (all of them when the round comes
-    // from the host) are hidden from the chain: an additive mask over their
-    // cells
-    ggml_tensor * kq_mask = inp_attn->get_kq_mask();
-    ggml_tensor * k_idxs  = inp_attn->get_k_idxs();
-    const int64_t n_kv    = kq_mask->ne[0];
-    ggml_tensor * thr   = ggml_scale_bias(ctx0, ggml_add(ctx0, n_acc, off), 1.0f, -0.5f);
-    ggml_tensor * hide  = ggml_scale(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_arange(ctx0, 0.0f, (float) V, 1.0f), thr)), -30000.0f);
-    ggml_tensor * extra = ggml_scale(ctx0, ggml_arange(ctx0, 0.0f, (float) n_kv, 1.0f), 0.0f);
-    extra = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, extra, 1, n_kv), ggml_reshape_2d(ctx0, hide, 1, V), ggml_view_1d(ctx0, k_idxs, V, 0));
-    extra = ggml_cast(ctx0, ggml_reshape_2d(ctx0, extra, n_kv, 1), GGML_TYPE_F16);
-    cb(extra, "mtp_round_mask", -1);
-    auto mask_chain = [&](int j) {
-        ggml_tensor * m = ggml_view_2d(ctx0, kq_mask, n_kv, 1, kq_mask->nb[1], (size_t) (V + j)*kq_mask->nb[1]);
-        return ggml_add(ctx0, m, extra);
-    };
-
-    for (int j = 0; j < K; ++j) {
-        const int row = V + j;
-
-        ggml_tensor * h_next = build_step(inp_attn, tok, h, pos_chain(j), row, il, false, mask_chain(j));
-        cb(h_next, "mtp_chain_h", j);
-
-        ggml_tensor * logits_j = build_lora_mm(head_w, h_next, head_s);
-        cb(logits_j, "mtp_chain_logits", j);
-
-        // the drafted token leaves the graph as an id; nothing else is read back
-        ggml_tensor * next = ggml_argmax(ctx0, logits_j);
-        cb(next, "mtp_chain_next", j);
-        ggml_set_output(next);
-        ggml_build_forward_expand(gf, next);
-        res->t_mtp_ids.push_back(next);
-
-        if (j + 1 < K) {
-            tok = ggml_get_rows(ctx0, embd_weights(), next);
-            h   = h_next;
-        }
-    }
-
-    // the accepted count leaves with the ids
-    ggml_build_forward_expand(gf, n_acc_i);
-    ggml_build_forward_expand(gf, anchor_h);
-    res->t_mtp_ids.push_back(n_acc_i);
-}

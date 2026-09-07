@@ -2201,11 +2201,42 @@ struct llama_model_qwen35 : public llama_model_base {
         const llama_model & model;
     };
 
-    struct graph_mtp : public llm_graph_context {
+    struct graph_mtp : public llm_graph_context, public llm_graph_mtp_i {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+
+        // the one-trip round's hooks, see llm_graph_context::build_mtp_round
+        ggml_tensor * mtp_step(ggml_tensor * tok_embd, ggml_tensor * h, ggml_tensor * pos, int row, bool kv_only, ggml_tensor * mask) override;
+        ggml_tensor * mtp_embd_weights() const override;
+        ggml_tensor * mtp_head(ggml_tensor * h) override;
+    private:
+        // one pass of the MTP block; step >= 0 selects a position of a round
+        ggml_tensor * build_step(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                            int   step,
+                            int   il,
+                        bool  kv_only = false,
+                    ggml_tensor * mask_in = nullptr);
+
+        ggml_tensor * embd_weights() const;
+
+        llm_graph_input_attn_kv * inp_attn_cur = nullptr;
+
+        const llama_model & model;
+        const llama_layer & layer;
+
+        int sections[4];
+
+        ggml_tensor * head_norm_w = nullptr;
+        ggml_tensor * head_w      = nullptr;
+        ggml_tensor * head_s      = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    bool has_mtp_round() const override;
 };
 
 
@@ -2247,12 +2278,15 @@ struct llama_model_qwen35moe : public llama_model_base {
         const llama_model & model;
     };
 
-    struct graph_mtp : public llm_graph_context {
+    struct graph_mtp : public llm_graph_context, public llm_graph_mtp_i {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
-    private:
-        ggml_tensor * embd_weights() const;
 
-        // one pass of the MTP block; step >= 0 selects a position of a chained draft
+        // the one-trip round's hooks, see llm_graph_context::build_mtp_round
+        ggml_tensor * mtp_step(ggml_tensor * tok_embd, ggml_tensor * h, ggml_tensor * pos, int row, bool kv_only, ggml_tensor * mask) override;
+        ggml_tensor * mtp_embd_weights() const override;
+        ggml_tensor * mtp_head(ggml_tensor * h) override;
+    private:
+        // one pass of the MTP block; step >= 0 selects a position of a round
         ggml_tensor * build_step(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * tok_embd,
@@ -2263,13 +2297,9 @@ struct llama_model_qwen35moe : public llama_model_base {
                         bool  kv_only = false,
                     ggml_tensor * mask_in = nullptr);
 
-        // a whole draft round in this graph, see llama_set_mtp_chain
-        void build_chain(
-        llm_graph_input_attn_kv * inp_attn,
-                    ggml_tensor * tok_embd,
-                    ggml_tensor * inp_tokens,
-                    ggml_tensor * inp_pos,
-                            int   n_chain);
+        ggml_tensor * embd_weights() const;
+
+        llm_graph_input_attn_kv * inp_attn_cur = nullptr;
 
         const llama_model & model;
         const llama_layer & layer;
@@ -2282,6 +2312,8 @@ struct llama_model_qwen35moe : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    bool has_mtp_round() const override;
 };
 
 
