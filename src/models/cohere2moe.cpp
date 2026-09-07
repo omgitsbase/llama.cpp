@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache-iswa.h"
 
 void llama_model_cohere2moe::load_arch_hparams(llama_model_loader & ml) {
     const bool found_norm     = ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps,     false);
@@ -296,22 +297,26 @@ llama_model_cohere2moe::graph::graph(const llama_model & model, const llm_graph_
     ggml_build_forward_expand(gf, cur);
 }
 
-llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params), model(model), layer(model.layers[hparams.n_layer()]) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "COHERE2MOE MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "COHERE2MOE MTP currently only supports a single MTP block");
+    GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+    GGML_ASSERT(hparams.n_embd_head_v() == n_rot);
 
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-    GGML_ASSERT(n_embd_head == n_rot);
-
-    const int il = hparams.n_layer();
-    const auto & layer = model.layers[il];
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
     GGML_ASSERT(layer.ffn_gate_inp  && "MTP block missing ffn_gate_inp");
 
-    const llm_norm_type cohere2moe_norm_type = hparams.f_norm_rms_eps == 0.0f ? LLM_NORM : LLM_NORM_RMS;
+    norm_type   = hparams.f_norm_rms_eps == 0.0f ? LLM_NORM : LLM_NORM_RMS;
+    head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    head_w      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    head_s      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : nullptr;
+    GGML_ASSERT(head_norm_w && "COHERE2MOE MTP: missing both nextn.shared_head_norm and output_norm");
+    GGML_ASSERT(head_w      && "COHERE2MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+
+    const int il = hparams.n_layer();
 
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
@@ -326,29 +331,93 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
     //       see llm_graph_context::build_inp_embd() for reference
     ggml_tensor * tok_embd;
     if (ubatch.token) {
-        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = ggml_get_rows(ctx0, embd_weights(), inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
-    cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
-
-    ggml_tensor * h_embd = inp->h;
+    ggml_tensor * h_embd = nullptr;
+    if (cparams.mtp_chain == 0) {
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+        h_embd = inp->h;
+    }
+    ggml_tensor * inp_tokens = ubatch.token ? inp->tokens : nullptr;
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-    auto * inp_attn = build_attn_inp_kv_iswa();
+    ggml_tensor * inp_pos  = build_inp_pos();
+    auto        * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, cohere2moe_norm_type, il);
+    if (cparams.mtp_chain > 0) {
+        inp_attn_cur = inp_attn;
+        build_mtp_round(*this, llm_graph_mtp_attn_of(inp_attn, hparams.is_swa(il)), tok_embd, inp_tokens, inp_pos, cparams.mtp_chain);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * cur = build_step(inp_attn, tok_embd, h_embd, inp_pos, -1, il);
+
+    res->t_h_nextn = cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+
+    cur = mtp_head(cur);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+bool llama_model_cohere2moe::has_mtp_round() const {
+    return hparams.n_layer_nextn == 1;
+}
+
+ggml_tensor * llama_model_cohere2moe::graph_mtp::mtp_step(
+        ggml_tensor * tok_embd,
+        ggml_tensor * h,
+        ggml_tensor * pos,
+                int   row,
+               bool   kv_only,
+        ggml_tensor * mask) {
+    return build_step(inp_attn_cur, tok_embd, h, pos, row, hparams.n_layer(), kv_only, mask);
+}
+
+ggml_tensor * llama_model_cohere2moe::graph_mtp::mtp_embd_weights() const {
+    return embd_weights();
+}
+
+ggml_tensor * llama_model_cohere2moe::graph_mtp::mtp_head(ggml_tensor * h) {
+    ggml_tensor * cur = build_lora_mm(head_w, h, head_s);
+    if (hparams.f_logit_scale) {
+        cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
+    }
+    return cur;
+}
+
+ggml_tensor * llama_model_cohere2moe::graph_mtp::embd_weights() const {
+    return layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+}
+
+// the MTP block: attention and the MoE FFN run in parallel off one norm, as in
+// the trunk, and their outputs meet at the residual
+ggml_tensor * llama_model_cohere2moe::graph_mtp::build_step(
+   llm_graph_input_attn_kv_iswa * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                            int   step,
+                            int   il,
+                           bool   kv_only,
+                    ggml_tensor * mask_in) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_rows      = tok_embd->ne[1];
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, norm_type, il);
     cb(h_norm, "mtp_hnorm", il);
 
-    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, cohere2moe_norm_type, il);
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, norm_type, il);
     cb(e_norm, "mtp_enorm", il);
 
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
@@ -359,11 +428,13 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
 
     ggml_tensor * inpL = cur;
 
-    cur = build_norm(cur, layer.attn_norm, nullptr, cohere2moe_norm_type, il);
+    cur = build_norm(cur, layer.attn_norm, nullptr, norm_type, il);
     cb(cur, "mtp_attn_norm", il);
+
     ggml_tensor * ffn_inp = cur;
 
-    auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur, n_embd_head, n_head, n_head_kv, il);
+    auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur, n_embd_head, n_head, n_head_kv, il, n_rows);
+
     ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
     Qcur = ggml_rope_ext(
             ctx0, Qcur, inp_pos, rope_factors,
@@ -374,14 +445,20 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
             n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
 
-    cb(Qcur, "mtp_Qcur", il);
-    cb(Kcur, "mtp_Kcur", il);
-    cb(Vcur, "mtp_Vcur", il);
+    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
-    cur = build_attn(inp_attn,
-            layer.wo, layer.wo_b, layer.wo_s,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
-            1.0f / sqrtf(float(n_embd_head)), il);
+    if (step < 0) {
+        cur = build_attn(inp_attn,
+                layer.wo, layer.wo_b, layer.wo_s,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    } else {
+        cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn, hparams.is_swa(il)),
+                layer.wo, layer.wo_b, layer.wo_s,
+                Qcur, Kcur, Vcur, kq_scale, il, step, kv_only, mask_in);
+        if (!cur) {
+            return nullptr;
+        }
+    }
     cb(cur, "mtp_attn_out", il);
 
     ggml_tensor * attn_out = cur;
@@ -413,35 +490,11 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
 
         cur = ggml_add(ctx0, cur, ffn_shexp);
         cur = ggml_scale(ctx0, cur, 0.5f);
-        cb(cur, "mtp_ffn_out", il);
     }
 
     cur = ggml_add(ctx0, cur, inpL);
     cur = ggml_add(ctx0, cur, attn_out);
     cb(cur, "mtp_post_ffn", il);
 
-    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
-            ? layer.nextn.shared_head_norm
-            : model.output_norm;
-    GGML_ASSERT(head_norm_w && "COHERE2MOE MTP: missing both nextn.shared_head_norm and output_norm");
-    cur = build_norm(cur, head_norm_w, nullptr, cohere2moe_norm_type, -1);
-
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    cb(cur, "mtp_shared_head_norm", -1);
-
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    GGML_ASSERT(head_w && "COHERE2MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : nullptr);
-
-    if (hparams.f_logit_scale) {
-        cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
-    }
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
+    return build_norm(cur, head_norm_w, nullptr, norm_type, -1);
 }
