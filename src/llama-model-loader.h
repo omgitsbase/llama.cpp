@@ -159,10 +159,11 @@ struct llama_model_loader {
     bool get_key(enum llm_kv kid, T & result, bool required = true);
 
     template<typename T, size_t N_MAX>
-    bool get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required = true);
+    // allow_short: a shorter array than n is accepted, leaving the tail as the caller set it
+    bool get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required = true, bool allow_short = false);
 
     template<typename T>
-    bool get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required = true);
+    bool get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required = true, bool allow_short = false);
 
     bool get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required = true);
 

@@ -451,7 +451,7 @@ namespace GGUFMeta {
 
     // get array of n <= N_MAX elements, or a single element repeated n times
     template<typename T, size_t N_MAX>
-    bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required) {
+    bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required, bool allow_short) {
         const int kid = gguf_find_key(metadata, key.c_str());
 
         if (kid < 0) {
@@ -470,6 +470,11 @@ namespace GGUFMeta {
                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
 
             if (n != arr_info.length) {
+                if (arr_info.length < n && allow_short) {
+                    // the entries past the end keep the value the caller left
+                    // there, which for the rope sections is zero
+                    return get_arr(key, result, required);
+                }
                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
             }
 
@@ -491,8 +496,8 @@ namespace GGUFMeta {
     }
 
     template<typename T>
-    bool llama_model_loader::get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required) {
-        return get_key_or_arr(llm_kv(kid), result, n, required);
+    bool llama_model_loader::get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required, bool allow_short) {
+        return get_key_or_arr(llm_kv(kid), result, n, required, allow_short);
     }
 
     bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
@@ -519,9 +524,9 @@ namespace GGUFMeta {
     }
 
     // TODO: this is not very clever - figure out something better
-    template bool llama_model_loader::get_key_or_arr<std::array<int,      4>>  (enum llm_kv kid, std::array<int,      4>   & result, uint32_t n, bool required);
-    template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
-    template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<int,      4>>  (enum llm_kv kid, std::array<int,      4>   & result, uint32_t n, bool required, bool allow_short);
+    template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required, bool allow_short);
+    template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required, bool allow_short);
 
 
 llama_model_loader::llama_model_loader(
