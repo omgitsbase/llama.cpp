@@ -1132,7 +1132,8 @@ struct llm_graph_context {
                   int64_t   n_embd_head,
                   int64_t   n_head,
                   int64_t   n_head_kv,
-                      int   il) const;
+                      int   il,
+                  int64_t   n_rows = 0) const;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,
@@ -1219,6 +1220,9 @@ struct llm_graph_context {
     // a replay (kv_only) refreshes the cache and returns nothing.
     ggml_tensor * build_attn_mtp(
     const llm_graph_mtp_attn & attn,
+                 ggml_tensor * wo,
+                 ggml_tensor * wo_b,
+                 ggml_tensor * wo_s,
                  ggml_tensor * q,
                  ggml_tensor * k,
                  ggml_tensor * v,

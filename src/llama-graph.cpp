@@ -1673,9 +1673,15 @@ llm_graph_qkv llm_graph_context::build_qkv(
                   int64_t   n_embd_head,
                   int64_t   n_head,
                   int64_t   n_head_kv,
-                      int   il) const {
+                      int   il,
+                  int64_t   n_rows) const {
     const int64_t n_embd_q  = n_embd_head * n_head;
     const int64_t n_embd_kv = n_embd_head * n_head_kv;
+
+    // a round's step covers only its own rows
+    if (n_rows == 0) {
+        n_rows = n_tokens;
+    }
 
     ggml_tensor * Qcur, * Kcur, * Vcur;
 
@@ -1691,12 +1697,12 @@ llm_graph_qkv llm_graph_context::build_qkv(
             qkv = ggml_clamp(ctx0, qkv, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(qkv, "wqkv_clamped", il);
         }
-        Qcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head,    n_tokens,
+        Qcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head,    n_rows,
             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1], 0);
-        Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
+        Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_rows,
             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
             ggml_row_size(qkv->type, n_embd_q));
-        Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
+        Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_rows,
             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
@@ -1731,9 +1737,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Vcur, "Vcur_clamped", il);
         }
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_rows);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_rows);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_rows);
     }
 
     cb(Qcur, "Qcur", il);
@@ -2472,6 +2478,9 @@ llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_k_iswa * inp, bool
 
 ggml_tensor * llm_graph_context::build_attn_mtp(
         const llm_graph_mtp_attn & attn,
+                     ggml_tensor * wo,
+                     ggml_tensor * wo_b,
+                     ggml_tensor * wo_s,
                      ggml_tensor * q,
                      ggml_tensor * k,
                      ggml_tensor * v,
@@ -2499,8 +2508,19 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
     ggml_tensor * mask = mask_in ? mask_in
         : ggml_view_2d(ctx0, attn.kq_mask, attn.kq_mask->ne[0], n_rows, attn.kq_mask->nb[1], row*attn.kq_mask->nb[1]);
 
-    return build_attn_mha(q, mctx_cur->get_k(ctx0, il), attn.v_idxs ? mctx_cur->get_v(ctx0, il) : nullptr,
+    ggml_tensor * cur = build_attn_mha(q, mctx_cur->get_k(ctx0, il), attn.v_idxs ? mctx_cur->get_v(ctx0, il) : nullptr,
             nullptr, mask, nullptr, nullptr, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
 }
 
 // A whole speculative round in one graph. Rows 0 .. n_chain replay the verify
@@ -2544,8 +2564,11 @@ const llm_graph_mtp_attn & attn,
     // M-RoPE positions are section-major, [n_pos_per_embd][n]: the entries
     // for one row sit n apart
     const int64_t n_pos = hparams.n_pos_per_embd();
-    const size_t  ps    = ggml_element_size(inp_pos);
-    auto pos_rows = [&](int first, int n) {
+    const size_t  ps    = inp_pos ? ggml_element_size(inp_pos) : 0;
+    auto pos_rows = [&](int first, int n) -> ggml_tensor * {
+        if (!inp_pos) {
+            return nullptr;
+        }
         ggml_tensor * p = ggml_view_2d(ctx0, inp_pos, n, n_pos, n_tokens*ps, first*ps);
         return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n*n_pos);
     };
@@ -2590,17 +2613,23 @@ const llm_graph_mtp_attn & attn,
 
     // the chain's positions: the replay's first position + n_acc + off, one
     // further per draft
-    ggml_tensor * base_f  = ggml_cast(ctx0, ggml_view_1d(ctx0, inp_pos, 1, 0), GGML_TYPE_F32);
-    ggml_tensor * start   = ggml_add(ctx0, ggml_add(ctx0, base_f, n_acc), off);
-    ggml_tensor * pos_f   = ggml_add(ctx0, ggml_arange(ctx0, 0.0f, (float) K, 1.0f), start);
-    ggml_tensor * pos_all = pos_f;
-    for (int s = 1; s < n_pos; ++s) {
-        // text rows: every section but the last takes the position, the last is 0
-        pos_all = ggml_concat(ctx0, pos_all, s + 1 == n_pos ? ggml_scale(ctx0, pos_f, 0.0f) : pos_f, 0);
+    ggml_tensor * pos_i = nullptr;
+    if (inp_pos) {
+        ggml_tensor * base_f  = ggml_cast(ctx0, ggml_view_1d(ctx0, inp_pos, 1, 0), GGML_TYPE_F32);
+        ggml_tensor * start   = ggml_add(ctx0, ggml_add(ctx0, base_f, n_acc), off);
+        ggml_tensor * pos_f   = ggml_add(ctx0, ggml_arange(ctx0, 0.0f, (float) K, 1.0f), start);
+        ggml_tensor * pos_all = pos_f;
+        for (int s = 1; s < n_pos; ++s) {
+            // text rows: every section but the last takes the position, the last is 0
+            pos_all = ggml_concat(ctx0, pos_all, s + 1 == n_pos ? ggml_scale(ctx0, pos_f, 0.0f) : pos_f, 0);
+        }
+        pos_i = ggml_cast(ctx0, pos_all, GGML_TYPE_I32);
     }
-    ggml_tensor * pos_i = ggml_cast(ctx0, pos_all, GGML_TYPE_I32);
-    const size_t pis = ggml_element_size(pos_i);
-    auto pos_chain = [&](int j) {
+    auto pos_chain = [&](int j) -> ggml_tensor * {
+        if (!pos_i) {
+            return nullptr;
+        }
+        const size_t pis = ggml_element_size(pos_i);
         ggml_tensor * p = ggml_view_2d(ctx0, pos_i, 1, n_pos, K*pis, j*pis);
         return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n_pos);
     };
