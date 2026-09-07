@@ -1244,6 +1244,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    int  n_seen = 0;  // calls with this shape, see ggml_cuda_graph_get_key
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1416,6 +1417,13 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // see ggml_backend_cuda_order_after: the next graph on this context waits
+    // for pending_order, and order_event is what this context offers others
+    cudaEvent_t order_event   = nullptr;
+    cudaEvent_t pending_order = nullptr;
+
+
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

@@ -624,6 +624,15 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    // An MTP context's graph is queued behind the target's and its caller reads
+    // the ids it drafts before feeding it again, so its inputs need not be
+    // copied under a wait. Copying them synchronously costs the whole of the
+    // target's forward pass, every round, because that is what the device is
+    // busy with when the draft is queued.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        ggml_backend_sched_set_async_inputs(sched.get(), true);
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -1391,6 +1400,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf = model.build_graph(gparams);
         rt_built = true;
+        if (rt.on) {
+            const llama_kv_cache_context * mkv = nullptr;
+            if (!llama_model_is_recurrent(&model)) {
+                mkv = llama_model_is_hybrid(&model)
+                    ? static_cast<const llama_memory_hybrid_context *>(mctx)->get_attn()
+                    : dynamic_cast<const llama_kv_cache_context *>(mctx);
+            }
+            fprintf(stderr, "[round] rebuild ctx=%p T=%d n_outputs=%d n_kv=%d because %s\n",
+                    (const void *) this, (int) ubatch.n_tokens, (int) n_outputs,
+                    mkv ? (int) mkv->get_n_kv() : -1,
+                    res->reuse_blocker ? res->reuse_blocker : "(first)");
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2581,7 +2602,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.mtp_round   =*/ &mtp_round,
+        /*.mtp_round   =*/ const_cast<llama_mtp_round_state *>(&mtp_round), // the round allocates its device inputs on first build
         /*.loop        =*/ loop_cur,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -4104,6 +4125,8 @@ int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n
         loop.vidx_win = ggml_new_tensor_2d(ctx_loop.get(), GGML_TYPE_I32, 1, n_max);
         loop.mask_win = ggml_new_tensor_2d(ctx_loop.get(), GGML_TYPE_F16, n_kv, n_max);
         loop.n_max    = n_max;
+        loop.n_tok    = 1;
+        loop.n_rows   = n_max;
         ggml_set_name(loop.tok,      "loop_tok");
         ggml_set_name(loop.counter,  "loop_counter");
         ggml_set_name(loop.ring,     "loop_ring");

@@ -796,12 +796,24 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // LLAMA_ROUND_TIMING=1: the host side of a speculative round in the server
 struct srv_round_timing {
     bool   on = getenv("LLAMA_ROUND_TIMING") != nullptr;
-    double draft = 0, decode = 0, accept = 0; int rounds = 0;
+    double draft = 0, decode = 0, accept = 0, process = 0, batch = 0, ckpt = 0, tokens = 0, slots = 0, sync = 0; int rounds = 0, total = 0;
     int64_t t_draft0 = 0, t_dec0 = 0, t_acc0 = 0;
+    int64_t t_round0 = 0; double round_total = 0;
     void end_round() {
         rounds++;
+        const int64_t now = ggml_time_us();
+        if (t_round0) { round_total += (now - t_round0) / 1000.0; }
+        t_round0 = now;
         if (rounds % 100 == 0) {
-            fprintf(stderr, "[round] server n=%d  draft %.3f  decode %.3f  accept %.3f ms per round\n", rounds, draft / rounds, decode / rounds, accept / rounds);
+            const double acc_phases = slots / rounds;
+            fprintf(stderr, "[round] server rounds %d-%d  decode %.3f  sync %.3f  process %.3f  draft %.3f  accept %.3f  ckpt %.3f  batch %.3f  tokens %.3f | in update_slots %.3f, round %.3f, untimed inside %.3f\n",
+                    total, total + rounds, decode / rounds, sync / rounds, process / rounds, draft / rounds, accept / rounds,
+                    ckpt / rounds, batch / rounds, tokens / rounds, slots / rounds,
+                    round_total / rounds,
+                    (slots - decode - sync - process - draft - accept - ckpt - batch - tokens) / rounds);
+            total += rounds;
+            rounds = 0;
+            draft = decode = accept = process = batch = ckpt = tokens = slots = sync = round_total = 0;
         }
     }
 };
@@ -1391,7 +1403,10 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
+            auto & srt = srv_round_timer();
+            const int64_t t0 = srt.on ? ggml_time_us() : 0;
             update_slots();
+            if (srt.on) { srt.slots += (ggml_time_us() - t0) / 1000.0; }
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2990,6 +3005,7 @@ private:
         }
 
         // make checkpoints if needed
+        const int64_t t_ckpt0 = srv_round_timer().on ? ggml_time_us() : 0;
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3037,10 +3053,20 @@ private:
             }
         });
 
+        {
+            auto & srt = srv_round_timer();
+            if (srt.on) { srt.ckpt += (ggml_time_us() - t_ckpt0) / 1000.0; }
+        }
+
         // update the batch with the sampled/drafted tokens
+        const int64_t t_batch0 = srv_round_timer().on ? ggml_time_us() : 0;
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        {
+            auto & srt = srv_round_timer();
+            if (srt.on) { srt.batch += (ggml_time_us() - t_batch0) / 1000.0; }
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3626,8 +3652,11 @@ private:
                 ret = llama_decode(ctx_tgt, batch_view);
                 if (srt.on) { srt.decode += (ggml_time_us() - t0) / 1000.0; }
             }
-            if (ret == 0 && has_output) {
+            if (ret == 0 && has_output && !spec) {
+                auto & srt = srv_round_timer();
+                const int64_t t0 = srt.on ? ggml_time_us() : 0;
                 llama_synchronize(ctx_tgt);
+                if (srt.on) { srt.sync += (ggml_time_us() - t0) / 1000.0; }
             }
         });
 
@@ -3690,7 +3719,10 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                auto & srt = srv_round_timer();
+                const int64_t t0 = srt.on ? ggml_time_us() : 0;
                 ok = common_speculative_process(spec.get(), batch_view);
+                if (srt.on) { srt.process += (ggml_time_us() - t0) / 1000.0; }
             });
 
             if (!ok) {
@@ -3941,6 +3973,7 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            const int64_t t_tok0 = srv_round_timer().on ? ggml_time_us() : 0;
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -3959,6 +3992,10 @@ private:
 
                     return;
                 }
+            }
+            {
+                auto & srt = srv_round_timer();
+                if (srt.on) { srt.tokens += (ggml_time_us() - t_tok0) / 1000.0; }
             }
 
             slot.print_timings_tg();

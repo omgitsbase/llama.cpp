@@ -161,14 +161,16 @@ public:
 // body picks its step's row with a counter it advances itself, feeds the
 // token it sampled back into its own input, and appends it to a ring.
 struct llama_loop_state {
-    ggml_tensor * tok      = nullptr; // I32 [1]            the token this step reads
-    ggml_tensor * counter  = nullptr; // F32 [1]            the step, advanced by the body
-    ggml_tensor * ring     = nullptr; // F32 [n_max]        the ids sampled so far
-    ggml_tensor * pos_win  = nullptr; // I32 [n_pos, n_max] positions of every step
-    ggml_tensor * kidx_win = nullptr; // I32 [1, n_max]     cache row every step writes
-    ggml_tensor * vidx_win = nullptr; // I32 [1, n_max]
-    ggml_tensor * mask_win = nullptr; // F16 [n_kv, n_max]  mask row of every step
-    int32_t       n_max    = 0;
+    ggml_tensor * tok      = nullptr; // I32 [n_tok]         the tokens this step reads
+    ggml_tensor * counter  = nullptr; // F32 [1]             the window row of the step's first token, advanced by the body
+    ggml_tensor * ring     = nullptr; // F32 [n_ring]        the ids sampled so far
+    ggml_tensor * pos_win  = nullptr; // I32 [n_pos, n_rows] positions of every window row
+    ggml_tensor * kidx_win = nullptr; // I32 [1, n_rows]     cache row every window row writes
+    ggml_tensor * vidx_win = nullptr; // I32 [1, n_rows]
+    ggml_tensor * mask_win = nullptr; // F16 [n_kv, n_rows]  mask row of every window row
+    int32_t       n_max    = 0;       // steps
+    int32_t       n_tok    = 0;       // tokens a step reads
+    int32_t       n_rows   = 0;       // window rows
 };
 
 // a chained MTP round takes the target's sampled ids and hidden rows for the
@@ -178,6 +180,25 @@ struct llama_loop_state {
 struct llama_mtp_round_state {
     llama_context * ctx_tgt   = nullptr;
     ggml_tensor   * hpend_dev = nullptr;  // F32 [n_embd], written after every chained decode
+
+    // The round's inputs live on the device for the life of the context. As
+    // graph inputs they would sit in a host buffer, and a copy into a host
+    // buffer is not one ggml can do asynchronously: it synchronizes the source
+    // backend first, so every round waited for the target's whole forward pass
+    // before the draft graph could even be queued. On the device the same copy
+    // is ordered by an event and the host waits for nothing.
+    ggml_context          * ctx_dev      = nullptr;
+    ggml_backend_buffer_t   buf_dev      = nullptr;
+    ggml_tensor           * c_ids_dev    = nullptr; // I32 [n_verify]
+    ggml_tensor           * h_tgt_dev    = nullptr; // F32 [n_embd, n_verify]
+    ggml_tensor           * h_pend_dev   = nullptr; // F32 [n_embd, 1]
+    int64_t                 n_embd_dev   = 0;
+    int64_t                 n_verify_dev = 0;
+
+    ~llama_mtp_round_state() {
+        if (buf_dev) { ggml_backend_buffer_free(buf_dev); }
+        if (ctx_dev) { ggml_free(ctx_dev); }
+    }
     bool            host       = true;    // the first round: the fields below are the inputs
     const int32_t * c_ids_host  = nullptr; // [n_verify]
     const float   * h_tgt_host  = nullptr; // [n_embd, n_verify], the target's hidden rows
@@ -213,7 +234,7 @@ public:
 
 class llm_graph_input_mtp_round : public llm_graph_input_i {
 public:
-    llm_graph_input_mtp_round(const llama_mtp_round_state * state, ggml_backend_sched_t sched, int64_t n_embd, int64_t n_verify)
+    llm_graph_input_mtp_round(llama_mtp_round_state * state, ggml_backend_sched_t sched, int64_t n_embd, int64_t n_verify)
         : state(state), sched(sched), n_embd(n_embd), n_verify(n_verify) {}
     virtual ~llm_graph_input_mtp_round() = default;
 
@@ -226,7 +247,7 @@ public:
     ggml_tensor * h_pend = nullptr; // F32 [n_embd, 1]
     ggml_tensor * off    = nullptr; // F32 [1]
 
-    const llama_mtp_round_state * state;
+    llama_mtp_round_state * state;
     ggml_backend_sched_t sched;
     const int64_t n_embd;
     const int64_t n_verify;
@@ -853,7 +874,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
-    const llama_mtp_round_state  * mtp_round;
+    llama_mtp_round_state  * mtp_round;
     const llama_loop_state       * loop;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1010,6 +1031,9 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
+    // what stopped the last can_reuse, for LLAMA_ROUND_TIMING
+    const char * reuse_blocker = nullptr;
+
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_sampled;
@@ -1102,7 +1126,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
-    const llama_mtp_round_state  * mtp_round;
+    llama_mtp_round_state  * mtp_round;
     const llama_loop_state       * loop;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1231,7 +1255,8 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
 
     // the loop body's step, as an index
-    ggml_tensor * loop_step() const;
+    // the window rows of this step's tokens: counter + 0 .. n_tokens-1, I32 [n_tokens]
+    ggml_tensor * loop_rows() const;
 
     // after sampling: the id joins the ring, feeds the next step, the step advances
     void build_loop_tail() const;

@@ -323,6 +323,14 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
+    // Copy this scheduler's graph inputs to the device without waiting for them.
+    // ggml copies a user input synchronously so the caller cannot overwrite it
+    // while the copy is in flight; that wait costs whatever the device is busy
+    // with, which for a second graph queued behind a first is the whole of the
+    // first. Only set this when the caller is known to read a result of the
+    // graph before writing its inputs again, which orders the two anyway.
+    GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs);
+
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 

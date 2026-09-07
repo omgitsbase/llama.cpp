@@ -1,4 +1,6 @@
 #include "llama-graph.h"
+
+#include <typeinfo>
 #include "llama-context.h"
 
 #include "llama-impl.h"
@@ -127,6 +129,31 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+// the round's inputs, on the device, for as long as the context lives
+static void mtp_round_ensure_dev(llama_mtp_round_state * st, ggml_backend_buffer_type_t buft, int64_t n_embd, int64_t n_verify) {
+    if (st->ctx_dev && st->n_embd_dev == n_embd && st->n_verify_dev == n_verify) {
+        return;
+    }
+    if (st->buf_dev) { ggml_backend_buffer_free(st->buf_dev); st->buf_dev = nullptr; }
+    if (st->ctx_dev) { ggml_free(st->ctx_dev); st->ctx_dev = nullptr; }
+
+    ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+    st->ctx_dev = ggml_init(ip);
+    GGML_ASSERT(st->ctx_dev);
+
+    st->c_ids_dev  = ggml_new_tensor_1d(st->ctx_dev, GGML_TYPE_I32, n_verify);
+    st->h_tgt_dev  = ggml_new_tensor_2d(st->ctx_dev, GGML_TYPE_F32, n_embd, n_verify);
+    st->h_pend_dev = ggml_new_tensor_2d(st->ctx_dev, GGML_TYPE_F32, n_embd, 1);
+    ggml_set_name(st->c_ids_dev,  "mtp_round_c");
+    ggml_set_name(st->h_tgt_dev,  "mtp_round_h");
+    ggml_set_name(st->h_pend_dev, "mtp_round_hpend");
+
+    st->buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(st->ctx_dev, buft);
+    GGML_ASSERT(st->buf_dev && "failed to allocate the MTP round inputs");
+    st->n_embd_dev   = n_embd;
+    st->n_verify_dev = n_verify;
+}
+
 // copies n elements from the front of src into dst, on the device, ordered
 // after the graph that wrote src
 static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t sched_dst, ggml_tensor * src, ggml_tensor * dst, size_t nbytes, size_t dst_offset) {
@@ -154,13 +181,68 @@ static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t 
                 src->name, (int) s.type, (long long) s.ne[0], (long long) s.ne[1], (long long) s.ne[2], (long long) s.ne[3], s.nb[0], s.nb[1], s.nb[2], s.nb[3],
                 dst->name, (int) d.type, (long long) d.ne[0], (long long) d.ne[1], (long long) d.ne[2], (long long) d.ne[3], d.nb[0], d.nb[1], d.nb[2], d.nb[3]);
     }
-    ggml_backend_tensor_copy_async(b_src, b_dst, &s, &d);
+    // say once what these are: ggml_backend_tensor_copy_async falls back to
+    // synchronizing both backends when either side is not a CUDA buffer, and
+    // that fallback waits for the target's whole forward pass
+    static int said = 0;
+    if (said < 4 && getenv("LLAMA_ROUND_TIMING") != nullptr) {
+        said++;
+        fprintf(stderr, "[round] round copy: src %s buffer '%s' backend '%s' | dst %s buffer '%s' backend '%s'\n",
+                src->name,
+                src->buffer ? ggml_backend_buffer_name(src->buffer) : "(none)",
+                b_src ? ggml_backend_name(b_src) : "(none)",
+                dst->name,
+                dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "(none)",
+                b_dst ? ggml_backend_name(b_dst) : "(none)");
+    }
+    // both sides on one stream: the source's. A copy issued across streams
+    // would make the destination's stream wait here, and the scheduler
+    // synchronizes that stream before every graph, so the host would wait too.
+    ggml_backend_tensor_copy_async(b_src, b_src, &s, &d);
 }
+
+// the destination's next graph waits for the source's work, on the device
+static void mtp_round_order(ggml_backend_sched_t sched_dst, ggml_backend_t b_src) {
+    ggml_backend_t b_dst = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched_dst); ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched_dst, i);
+        if (ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            b_dst = b;
+            break;
+        }
+    }
+    if (!b_dst || !b_src || b_dst == b_src) {
+        return;
+    }
+    typedef void (*order_fn_t)(ggml_backend_t, ggml_backend_t);
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(b_dst));
+    auto order = (order_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_order_after");
+    if (order) {
+        order(b_dst, b_src);
+    }
+}
+
+struct mtp_round_input_timing {
+    bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+    double total = 0, copies = 0; int n = 0, host = 0;
+    void add(double t, double c, bool is_host) {
+        total += t; copies += c; n++; host += is_host ? 1 : 0;
+        if (n % 100 == 0) {
+            fprintf(stderr, "[round] mtp inputs calls %d-%d  set_input %.3f  of which device copies %.3f ms per call, host route %d/100\n",
+                    n - 100, n, total / 100, copies / 100, host);
+            total = copies = 0; host = 0;
+        }
+    }
+};
+static mtp_round_input_timing & mtp_round_input_timer() { static mtp_round_input_timing t; return t; }
 
 void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
     const auto * st = state;
     const size_t row_bytes = (size_t) n_embd * sizeof(float);
+    auto & rit = mtp_round_input_timer();
+    const int64_t rit0 = rit.on ? ggml_time_us() : 0;
+    double rit_copies = 0;
 
     if (st->host) {
         GGML_ASSERT(st->c_ids_host && st->h_tgt_host && st->h_pend_host);
@@ -174,6 +256,7 @@ void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
 
         ggml_tensor * src_h = res_tgt->get_h_nextn();
         GGML_ASSERT(src_h && src_h->ne[0] == n_embd && src_h->ne[1] >= n_verify && ggml_is_contiguous(src_h));
+        const int64_t rit_c0 = rit.on ? ggml_time_us() : 0;
         mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, 0);
 
         GGML_ASSERT((int64_t) res_tgt->t_sampled.size() >= n_verify);
@@ -187,10 +270,13 @@ void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
         }
 
         mtp_round_copy(sched, sched, st->hpend_dev, h_pend, row_bytes, 0);
+        mtp_round_order(sched, ggml_backend_sched_get_tensor_backend(sched_tgt, src_h));
+        if (rit.on) { rit_copies = (ggml_time_us() - rit_c0) / 1000.0; }
     }
 
     const float o = (float) st->off;
     ggml_backend_tensor_set(off, &o, 0, sizeof(o));
+    if (rit.on) { rit.add((ggml_time_us() - rit0) / 1000.0, rit_copies, st->host); }
 }
 
 bool llm_graph_input_mtp_round::can_reuse(const llm_graph_params & params) {
@@ -1465,7 +1551,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    reuse_blocker = nullptr;
     if (!this->params.allow_reuse(params)) {
+        reuse_blocker = "graph parameters";
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1482,8 +1570,12 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
 
+        if (!cur) {
+            reuse_blocker = typeid(*input).name();
+        }
+
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", typeid(*input).name(), cur);
         }
 
         res = res && cur;
@@ -2386,10 +2478,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
     if (loop) {
-        // the loop body reads the id its previous step sampled
-        GGML_ASSERT(ubatch.n_tokens == 1 && ubatch.token && "loop body: one token");
+        // the loop body reads the ids its previous step left
+        GGML_ASSERT(ubatch.token && ubatch.n_tokens <= loop->n_tok && "loop body: more tokens than the loop holds");
         inp->device = true;
-        inp->tokens = loop->tok;
+        inp->tokens = ggml_view_1d(ctx0, loop->tok, ubatch.n_tokens, 0);
     } else {
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         cb(inp->tokens, "inp_tokens", -1);
@@ -2563,9 +2655,10 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
     return cur;
 }
 
-ggml_tensor * llm_graph_context::loop_step() const {
+ggml_tensor * llm_graph_context::loop_rows() const {
     GGML_ASSERT(loop);
-    return ggml_cast(ctx0, loop->counter, GGML_TYPE_I32);
+    ggml_tensor * r = ggml_add(ctx0, ggml_arange(ctx0, 0.0f, (float) n_tokens, 1.0f), loop->counter);
+    return ggml_cast(ctx0, r, GGML_TYPE_I32);
 }
 
 void llm_graph_context::build_loop_tail() const {
@@ -2573,7 +2666,7 @@ void llm_graph_context::build_loop_tail() const {
     GGML_ASSERT(res->t_sampled.size() == 1 && res->t_sampled[0] && "loop body: the row must be sampled on the device");
 
     ggml_tensor * sampled = res->t_sampled[0]; // I32 [1]
-    ggml_tensor * step    = loop_step();
+    ggml_tensor * step    = loop_rows();
 
     // the id joins the ring (kept as floats: set_rows writes floats)
     ggml_tensor * ring = ggml_set_rows(ctx0,
@@ -2614,14 +2707,13 @@ const llm_graph_mtp_attn & attn,
     GGML_ASSERT(cparams.flash_attn && "MTP round: needs flash attention");
     GGML_ASSERT(mtp_round && "MTP round: needs the round state");
 
+    mtp_round_ensure_dev(mtp_round, ggml_backend_buffer_get_type(mtp.mtp_embd_weights()->buffer), n_embd_h, V);
+
     auto rinp = std::make_unique<llm_graph_input_mtp_round>(mtp_round, sched, n_embd_h, V);
-    rinp->c_ids  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, V);
-    rinp->h_tgt  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, V);
-    rinp->h_pend = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, 1);
+    rinp->c_ids  = mtp_round->c_ids_dev;
+    rinp->h_tgt  = mtp_round->h_tgt_dev;
+    rinp->h_pend = mtp_round->h_pend_dev;
     rinp->off    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-    ggml_set_input(rinp->c_ids);  ggml_set_name(rinp->c_ids,  "mtp_round_c");
-    ggml_set_input(rinp->h_tgt);  ggml_set_name(rinp->h_tgt,  "mtp_round_h");
-    ggml_set_input(rinp->h_pend); ggml_set_name(rinp->h_pend, "mtp_round_hpend");
     ggml_set_input(rinp->off);    ggml_set_name(rinp->off,    "mtp_round_off");
     ggml_tensor * c_ids  = rinp->c_ids;
     ggml_tensor * h_tgt  = rinp->h_tgt;
@@ -2754,7 +2846,11 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
         // the loop body picks its step's row of the window's positions
         const int64_t n_pos = hparams.n_pos_per_embd();
         inp->device = true;
-        cur = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->pos_win, loop_step()), n_pos);
+        ggml_tensor * p = ggml_get_rows(ctx0, loop->pos_win, loop_rows()); // I32 [n_pos, n_tokens]
+        if (n_pos > 1 && n_tokens > 1) {
+            p = ggml_cont(ctx0, ggml_transpose(ctx0, p)); // section-major, as the host lays it out
+        }
+        cur = ggml_reshape_1d(ctx0, p, n_pos*n_tokens);
     } else {
         cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
         ggml_set_input(cur);
@@ -3115,7 +3211,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const llama_cparams & cparams,
     const llama_kv_cache_context * mctx_cur,
     const llama_loop_state * loop = nullptr,
-    ggml_tensor * loop_step = nullptr) {
+    ggml_tensor * loop_rows = nullptr) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3123,9 +3219,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         // the loop body picks its step's cache row and mask row from the window
         GGML_ASSERT(cparams.flash_attn && "loop body: needs flash attention");
         inp->device = true;
-        inp->self_k_idxs = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->kidx_win, loop_step), 1);
-        inp->self_v_idxs = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->vidx_win, loop_step), 1);
-        ggml_tensor * mask = ggml_get_rows(ctx0, loop->mask_win, loop_step); // F32 [n_kv, 1]
+        const int64_t n_tokens = ubatch.n_tokens;
+        inp->self_k_idxs = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->kidx_win, loop_rows), n_tokens);
+        inp->self_v_idxs = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->vidx_win, loop_rows), n_tokens);
+        ggml_tensor * mask = ggml_get_rows(ctx0, loop->mask_win, loop_rows); // F32 [n_kv, n_tokens]
         inp->self_kq_mask     = ggml_cast(ctx0, mask, GGML_TYPE_F16);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     } else {
@@ -3147,7 +3244,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, loop, loop ? loop_step() : nullptr);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, loop, loop ? loop_rows() : nullptr);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3875,7 +3972,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), loop, loop ? loop_step() : nullptr);
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), loop, loop ? loop_rows() : nullptr);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

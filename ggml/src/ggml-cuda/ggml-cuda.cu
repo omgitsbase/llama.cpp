@@ -2576,14 +2576,26 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    // Graphs of different shape built into the same context start at the same
-    // node address. A context that alternates between two of them (a draft
-    // replay and a chained draft, say) would otherwise share one slot and
-    // reset its warmup on every call, so neither is ever captured. The node
-    // count tells the shapes apart.
-    const uintptr_t base = (uintptr_t) cgraph->nodes[0];
-    const uintptr_t mix  = (uintptr_t) cgraph->n_nodes * (uintptr_t) 0x9E3779B97F4A7C15ULL;
-    return (const void *) (base ^ mix);
+    // The shape of the graph is its key, and nothing about where it was built.
+    // Two shapes in one context (a draft replay and a chained draft, say) must
+    // not share a slot, or neither is ever captured; but the same shape built
+    // again must land on the slot it had before. A caller that rebuilds its
+    // graph into fresh memory - llama does, whenever its inputs stop matching -
+    // would otherwise mint a new key every time, and a new key has to warm up
+    // by evaluating the graph node by node: 31 ms on a 35B MoE here, against 6
+    // to capture it again. A collision between two shapes costs a re-capture
+    // and nothing else, because the node properties are compared before replay.
+    uint64_t h = 0xcbf29ce484222325ULL ^ (uint64_t) cgraph->n_nodes;
+    auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001b3ULL; };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        mix((uint64_t) node->op);
+        mix((uint64_t) node->type);
+        for (int j = 0; j < GGML_MAX_DIMS; j++) {
+            mix((uint64_t) node->ne[j]);
+        }
+    }
+    return (const void *) (uintptr_t) (h | 1);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -4628,17 +4640,79 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 #endif // USE_CUDA_GRAPH
 
 
+// Order the next graph on backend_dst after everything queued on backend_src,
+// without the host waiting for either. Both graphs keep their own stream; the
+// dependency is an event, and it is applied when the destination's graph is
+// about to run, not when the caller asks for it. Asking earlier would put the
+// wait on the stream before the scheduler synchronizes it to copy the graph's
+// inputs, and that synchronize would then wait for the source's whole graph.
+static void ggml_backend_cuda_order_after(ggml_backend_t backend_dst, ggml_backend_t backend_src) {
+    if (!ggml_backend_is_cuda(backend_dst) || !ggml_backend_is_cuda(backend_src) || backend_dst == backend_src) {
+        return;
+    }
+    ggml_backend_cuda_context * dst = (ggml_backend_cuda_context *) backend_dst->context;
+    ggml_backend_cuda_context * src = (ggml_backend_cuda_context *) backend_src->context;
+
+    if (!src->order_event) {
+        ggml_cuda_set_device(src->device);
+        CUDA_CHECK(cudaEventCreateWithFlags(&src->order_event, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(src->order_event, src->stream()));
+    dst->pending_order = src->order_event;
+}
+
+
+
 // LLAMA_ROUND_TIMING=1: host time inside the CUDA backend's graph compute
 struct cuda_host_timing {
     bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
-    struct acc { double check = 0, evaluate = 0; int n = 0; int graphs = 0; };
+    struct acc { double check = 0, evaluate = 0; int n = 0; int graphs = 0;
+                 double t_launch = 0, t_capture = 0, t_eager = 0; int n_capture = 0; int total = 0; };
     std::map<const void *, acc> by_backend;
-    void add(const void * key, double a, double b, bool used_graph) {
+    // why a call went eager: 1 disabled, 2 an op the capture cannot take,
+    // 3 warming up a new key, 4 properties changed
+    std::map<std::pair<const void *, int>, std::pair<int, double>> eager_why;
+    std::map<std::pair<const void *, int>, int> eager_nodes;
+    std::map<std::pair<const void *, int>, int> eager_seen;
+    void add_eager(const void * key, int why, int n_nodes, double ms, int n_seen) {
+        auto & e = eager_why[{key, why}];
+        e.first++; e.second += ms;
+        eager_nodes[{key, why}] = n_nodes;
+        eager_seen[{key, why}]  = n_seen;
+    }
+    void report_eager(const void * key) {
+        for (const auto & [k, v] : eager_why) {
+            if (k.first != key) continue;
+            fprintf(stderr, "[round] cuda %p   eager reason %d: %d calls, %.3f ms each, %d nodes, shape seen %d times" + 0,
+                    key, k.second, v.first, v.second / v.first, eager_nodes[k], eager_seen[k]);
+            fputc(10, stderr);
+        }
+    }
+    void add(const void * key, double a, double b, bool used_graph, bool captured) {
         acc & t = by_backend[key];
         t.check += a; t.evaluate += b; t.n++; t.graphs += used_graph ? 1 : 0;
+        if (captured) { t.t_capture += b; t.n_capture++; }
+        else if (used_graph) { t.t_launch += b; }
+        else { t.t_eager += b; }
         if (t.n % 100 == 0) {
-            fprintf(stderr, "[round] cuda %p n=%d  check %.3f  evaluate-or-launch %.3f ms per call  cuda-graph %d/%d" + 0, key, t.n, t.check / t.n, t.evaluate / t.n, t.graphs, t.n);
+            const int n_launch = t.graphs - t.n_capture;
+            const int n_eager  = t.n - t.graphs;
+            fprintf(stderr, "[round] cuda %p calls %d-%d  check %.3f  evaluate-or-launch %.3f ms per call  cuda-graph %d/%d" + 0, key, t.total, t.total + t.n, t.check / t.n, t.evaluate / t.n, t.graphs, t.n);
             fputc(10, stderr);
+            fprintf(stderr, "[round] cuda %p   launch  %d calls %.3f ms each | capture+instantiate %d calls %.3f ms each | eager %d calls %.3f ms each | per-call share: launch %.3f capture %.3f eager %.3f" + 0,
+                    key,
+                    n_launch,   n_launch   ? t.t_launch  / n_launch   : 0.0,
+                    t.n_capture, t.n_capture ? t.t_capture / t.n_capture : 0.0,
+                    n_eager,    n_eager    ? t.t_eager   / n_eager    : 0.0,
+                    t.t_launch / t.n, t.t_capture / t.n, t.t_eager / t.n);
+            fputc(10, stderr);
+            report_eager(key);
+            const int total = t.total + t.n;
+            t = acc{};
+            t.total = total;
+            for (auto it = eager_why.begin(); it != eager_why.end(); ) {
+                it = it->first.first == key ? eager_why.erase(it) : std::next(it);
+            }
         }
     }
 };
@@ -4652,6 +4726,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // a dependency another context asked for, applied before anything is
+    // captured or launched, and after the scheduler's own input copies
+    if (cuda_ctx->pending_order) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->pending_order, 0));
+        cuda_ctx->pending_order = nullptr;
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4672,14 +4753,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    graph->n_seen++;
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
+            // Warming up by evaluating the graph node by node costs far more
+            // than capturing it does: 31 ms against 6 on a 35B MoE here. The
+            // old rule wanted two consecutive calls of a shape to agree before
+            // capturing it, which a shape that recurs only now and then never
+            // manages - its properties have always moved since it last ran, so
+            // it is evaluated eagerly every single time. One eager call is
+            // enough to know a shape is capturable; from its second call on,
+            // capture it and let the capture absorb whatever changed.
+            const bool seen_before = graph->n_seen > 1;  // n_seen counts this call
+
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                if (!properties_changed || seen_before) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
@@ -4687,16 +4778,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 } else {
                     stats_why = 3;
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+                // else: the first calls of a new key - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
+                use_cuda_graph = true;
                 if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
+                    // Properties changed - capture again over the new ones
+                    cuda_graph_update_required = true;
                     stats_why = 4;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    GGML_LOG_DEBUG("%s: CUDA graph re-capture\n", __func__);
                 } else {
-                    use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
@@ -4720,7 +4811,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     const int64_t cht1 = cht.on ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-    if (cht.on) { cht.add(backend, (cht1 - cht0) / 1000.0, (ggml_time_us() - cht1) / 1000.0, use_cuda_graph); }
+    if (cht.on) {
+        const double ev_ms = (ggml_time_us() - cht1) / 1000.0;
+        if (!use_cuda_graph) {
+            int n_seen = 0;
+#ifdef USE_CUDA_GRAPH
+            if (graph_key) { n_seen = cuda_ctx->cuda_graph(graph_key)->n_seen; }
+#endif
+            cht.add_eager(backend, stats_why, cgraph->n_nodes, ev_ms, n_seen);
+        }
+        cht.add(backend, (cht1 - cht0) / 1000.0, ev_ms, use_cuda_graph, use_cuda_graph && cuda_graph_update_required);
+    }
 
     if (stats_e0) {
         CUDA_CHECK(cudaEventRecord(stats_e1, cuda_ctx->stream()));
@@ -6040,6 +6141,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_loop") == 0) {
         return (void *)ggml_backend_cuda_loop;
+    }
+    if (strcmp(name, "ggml_backend_cuda_order_after") == 0) {
+        return (void *) ggml_backend_cuda_order_after;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
