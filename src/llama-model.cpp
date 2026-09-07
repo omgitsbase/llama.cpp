@@ -1362,8 +1362,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // there is very little benefit to offloading the input layer, so always keep it on the CPU,
+    // unless a chained MTP draft runs on this model: its graph looks tokens up from ids produced
+    // on the device, and a host-side table would split that graph at every step
+    const char * input_env = getenv("LLAMA_INPUT_ON_DEVICE");
+    const bool input_on_device = (input_env ? atoi(input_env) != 0 : llama_model_has_mtp_chain(this)) && n_gpu_layers > n_layer_all;
+    if (input_on_device) {
+        pimpl->dev_input = get_layer_buft_list(0);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

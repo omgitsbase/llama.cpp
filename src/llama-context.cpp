@@ -1991,6 +1991,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (!res->t_mtp_ids.empty()) {
+            mtp_ids.assign(res->t_mtp_ids.size(), LLAMA_TOKEN_NULL);
+            for (size_t j = 0; j < res->t_mtp_ids.size(); ++j) {
+                ggml_tensor * t = res->t_mtp_ids[j];
+                ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                GGML_ASSERT(backend_t != nullptr);
+                ggml_backend_tensor_get_async(backend_t, t, &mtp_ids[j], 0, sizeof(llama_token));
+            }
+        }
+
         if (has_samplers) {
             const auto stride = n_vocab;
 
@@ -3853,6 +3863,16 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+const llama_token * llama_context::get_mtp_chain_ids(int32_t & n) {
+    synchronize();
+    n = (int32_t) mtp_ids.size();
+    return mtp_ids.data();
+}
+
+const llama_token * llama_get_mtp_chain_ids(llama_context * ctx, int32_t * n) {
+    return ctx->get_mtp_chain_ids(*n);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

@@ -107,6 +107,9 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // state. 0 restores one step per decode.
 LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, int32_t n);
 
+// ids drafted by the last chained MTP decode, n of them
+LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx, int32_t * n);
+
 // Whether the model's DECODER_MTP graph supports chained drafting.
 LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);
 

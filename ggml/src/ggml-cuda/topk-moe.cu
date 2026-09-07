@@ -97,10 +97,11 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                                                                   const float           clamp_val,
                                                                   const float           scale_val,
                                                                   const topk_moe_config config) {
-    const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= n_rows) {
-        return;
-    }
+    // a warp past the last row reads row 0 and writes nothing: every warp
+    // reaches the barrier below
+    const int  row_raw = blockIdx.x * blockDim.y + threadIdx.y;
+    const bool active  = row_raw < n_rows;
+    const int  row     = active ? row_raw : 0;
 
     logits += n_experts * row;
     weights += n_expert_used * row;
@@ -160,6 +161,13 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
             selection_wt[i / WARP_SIZE] =
                 (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
         }
+    }
+
+    // every row of the block is in registers; from here the outputs may sit
+    // where the logits were, as long as the block is the whole launch
+    __syncthreads();
+    if (!active) {
+        return;
     }
 
     //at this point, each thread holds either a portion of the softmax distribution
@@ -282,7 +290,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const topk_moe_config       config) {
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
-    const int    rows_per_block = 4;
+    const int    rows_per_block = GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK;
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(WARP_SIZE, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();

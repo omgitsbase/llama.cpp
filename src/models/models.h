@@ -2267,7 +2267,6 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * tok_embd,
                     ggml_tensor * h_embd,
                     ggml_tensor * inp_pos,
-                    ggml_tensor * inp_out_ids,
                             int   n_chain);
 
         const llama_model & model;

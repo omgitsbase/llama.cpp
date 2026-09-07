@@ -1785,6 +1785,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (src0->buffer == nullptr || src1->buffer == nullptr) {
+        return false;
+    }
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -1797,12 +1800,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // the vector kernel carries the fusion for every batch it serves; the
+    // expert kernel for several tokens does not
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > MMVQ_MAX_BATCH_SIZE) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
         return false;
     }
 
@@ -3078,8 +3082,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     };
 
     bool is_ok = true;
-    // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+    // exception for topk-moe: one block reads every row before any is written
+    if (is_topk_moe && ggml_nrows(cgraph->nodes[node_idx]) <= GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK) {
         return true;
     }
 
@@ -3400,6 +3404,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return nodes_to_skip;
         }
     }
+
+
+
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
@@ -3806,7 +3813,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
 
-        if (ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {})) {
+        if ((op != GGML_OP_MUL_MAT_ID || cgraph->nodes[i]->ne[2] == 1) &&
+            ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {})) {
             ggml_tensor * glu         = cgraph->nodes[i + 4];
             ggml_tensor * gate_bias_n = glu->src[0];
             ggml_tensor * up_bias_n   = glu->src[1];
@@ -4138,6 +4146,81 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+
+struct ggml_cuda_op_stat {
+    double  ms = 0.0;
+    int64_t n  = 0;
+};
+
+static int ggml_cuda_op_stats() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_OP_STATS"); return e ? atoi(e) : 0; }();
+    return v;
+}
+
+struct ggml_cuda_op_timer {
+    std::vector<cudaEvent_t> events;
+    std::vector<std::pair<std::string, int>> marks;
+    int k = 0;
+
+    void begin(cudaStream_t stream) {
+        marks.clear();
+        k = 0;
+        record(stream);
+    }
+    void record(cudaStream_t stream) {
+        if ((int) events.size() <= k) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            events.push_back(e);
+        }
+        CUDA_CHECK(cudaEventRecord(events[k], stream));
+        k++;
+    }
+    void mark(cudaStream_t stream, const ggml_tensor * node, int fused) {
+        char key[320];
+        const ggml_tensor * s0 = node->src[0];
+        const ggml_tensor * s1 = node->src[1];
+        snprintf(key, sizeof(key), "%s%s%d dst[%lld,%lld,%lld] s0:%s[%lld,%lld,%lld] s1:%s[%lld,%lld,%lld]",
+                 fused ? "F" : "", ggml_op_desc(node), fused,
+                 (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                 s0 ? ggml_type_name(s0->type) : "-", s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
+                 s1 ? ggml_type_name(s1->type) : "-", s1 ? (long long) s1->ne[0] : 0, s1 ? (long long) s1->ne[1] : 0, s1 ? (long long) s1->ne[2] : 0);
+        record(stream);
+        marks.emplace_back(key, k - 1);
+    }
+    void flush(cudaStream_t stream, int bucket) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        static std::map<int, std::map<std::string, ggml_cuda_op_stat>> acc;
+        static std::map<int, int> calls;
+        auto & a = acc[bucket];
+        for (const auto & [key, idx] : marks) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, events[idx - 1], events[idx]));
+            a[key].ms += ms;
+            a[key].n  += 1;
+        }
+        const int c = ++calls[bucket];
+        if (c % 50 != 0) {
+            return;
+        }
+        std::vector<std::pair<std::string, ggml_cuda_op_stat>> rows(a.begin(), a.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.ms > y.second.ms; });
+        double total = 0.0;
+        for (const auto & r : rows) total += r.second.ms;
+        fprintf(stderr, "[opstat] bucket=%d calls=%d total_ms_per_call=%.3f distinct=%zu" "\n", bucket, c, total / c, rows.size());
+        for (size_t i = 0; i < rows.size() && i < 60; i++) {
+            fprintf(stderr, "[opstat]   %8.3f ms/call %6.1f/call %6.2f us/op  %s" "\n",
+                    rows[i].second.ms / c, (double) rows[i].second.n / c, 1000.0 * rows[i].second.ms / rows[i].second.n, rows[i].first.c_str());
+        }
+        a.clear();
+    }
+};
+
+static ggml_cuda_op_timer & ggml_cuda_op_timer_get() {
+    static ggml_cuda_op_timer t;
+    return t;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4236,6 +4319,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            const bool op_stats = ggml_cuda_op_stats() && !use_cuda_graph;
+            if (op_stats) { ggml_cuda_op_timer_get().begin(cuda_ctx->stream()); }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4293,6 +4378,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (op_stats) { ggml_cuda_op_timer_get().mark(cuda_ctx->stream(), node, nodes_to_skip + 1); }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4318,11 +4404,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (op_stats) { ggml_cuda_op_timer_get().mark(cuda_ctx->stream(), node, 0); }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
+            if (op_stats) { ggml_cuda_op_timer_get().flush(cuda_ctx->stream(), cgraph->n_nodes); }
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -4379,6 +4467,11 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static int ggml_cuda_graph_stats() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_GRAPH_STATS"); return e ? atoi(e) : 0; }();
+    return v;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4387,6 +4480,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+    int  stats_why = 0;
+    cudaEvent_t stats_e0 = nullptr, stats_e1 = nullptr;
+    if (ggml_cuda_graph_stats()) {
+        CUDA_CHECK(cudaEventCreate(&stats_e0));
+        CUDA_CHECK(cudaEventCreate(&stats_e1));
+        CUDA_CHECK(cudaEventRecord(stats_e0, cuda_ctx->stream()));
+    }
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4406,6 +4506,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                } else {
+                    stats_why = 3;
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -4413,13 +4515,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    stats_why = 4;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+        } else {
+            stats_why = 2;
         }
+    } else {
+        stats_why = 1;
     }
 #endif // USE_CUDA_GRAPH
 
@@ -4434,6 +4541,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (stats_e0) {
+        CUDA_CHECK(cudaEventRecord(stats_e1, cuda_ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(stats_e1));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, stats_e0, stats_e1));
+        size_t gnodes = 0;
+        int ops = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (!ggml_cuda_is_view_or_noop(cgraph->nodes[i])) ops++;
+        }
+#ifdef USE_CUDA_GRAPH
+        if (use_cuda_graph) {
+            ggml_cuda_graph * g = cuda_ctx->cuda_graph(graph_key);
+            if (g->graph) { CUDA_CHECK(cudaGraphGetNodes(g->graph, nullptr, &gnodes)); }
+        }
+#endif
+        fprintf(stderr, "[cgstat] nodes=%d ops=%d cuda_graph=%d update=%d why=%d gnodes=%zu ms=%.3f\n",
+                cgraph->n_nodes, ops, (int) use_cuda_graph, (int) cuda_graph_update_required, stats_why, gnodes, ms);
+        CUDA_CHECK(cudaEventDestroy(stats_e0));
+        CUDA_CHECK(cudaEventDestroy(stats_e1));
+    }
 
     return GGML_STATUS_SUCCESS;
 }

@@ -1310,7 +1310,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         common_batch_clear(batch);
         for (int i = 0; i < n_chain; ++i) {
-            common_batch_add(batch, i == 0 ? dp.id_last : 0, dp.n_past + i, { 0 }, true);
+            common_batch_add(batch, i == 0 ? dp.id_last : 0, dp.n_past + i, { 0 }, false);
 
             float * row = batch.embd + (size_t) i * n_embd;
             if (i == 0) {
@@ -1331,13 +1331,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-
+        int32_t n_ids = 0;
+        const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft, &n_ids);
+        GGML_ASSERT(n_ids == n_chain);
         auto & result = *dp.result;
-        for (int i = 0; i < n_chain; ++i) {
-            const float * logits = llama_get_logits_ith(ctx_dft, i);
-            result.push_back((llama_token) (std::max_element(logits, logits + n_vocab) - logits));
-        }
+        result.insert(result.end(), ids, ids + n_chain);
     }
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.

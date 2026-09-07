@@ -599,15 +599,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
     if (cparams.mtp_chain > 0) {
-        build_chain(inp_attn, tok_embd, h_embd, inp_pos, inp_out_ids, cparams.mtp_chain);
+        build_chain(inp_attn, tok_embd, h_embd, inp_pos, cparams.mtp_chain);
         return;
     }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     ggml_tensor * cur = build_step(inp_attn, tok_embd, h_embd, inp_pos, -1, il);
 
@@ -790,7 +791,6 @@ void llama_model_qwen35moe::graph_mtp::build_chain(
                     ggml_tensor * tok_embd,
                     ggml_tensor * h_embd,
                     ggml_tensor * inp_pos,
-                    ggml_tensor * inp_out_ids,
                             int   n_chain) {
     GGML_ASSERT(n_tokens == n_chain && "MTP chain: the batch must hold exactly n_chain positions");
     GGML_ASSERT(ubatch.token       && "MTP chain: needs the anchor token");
@@ -806,9 +806,6 @@ void llama_model_qwen35moe::graph_mtp::build_chain(
     ggml_tensor * tok = ggml_view_2d(ctx0, tok_embd, tok_embd->ne[0], 1, tok_embd->nb[1], 0);
     ggml_tensor * h   = ggml_view_2d(ctx0, h_embd,   h_embd->ne[0],   1, h_embd->nb[1],   0);
 
-    ggml_tensor * logits = nullptr;
-    ggml_tensor * hidden = nullptr;
-
     for (int j = 0; j < n_chain; ++j) {
         ggml_tensor * pos = ggml_view_2d(ctx0, inp_pos, 1, n_pos, n_chain*ps, j*ps);
         pos = ggml_reshape_1d(ctx0, ggml_cont(ctx0, pos), n_pos);
@@ -819,25 +816,16 @@ void llama_model_qwen35moe::graph_mtp::build_chain(
         ggml_tensor * logits_j = build_lora_mm(head_w, h_next, head_s);
         cb(logits_j, "mtp_chain_logits", j);
 
-        logits = logits ? ggml_concat(ctx0, logits, logits_j, 1) : logits_j;
-        hidden = hidden ? ggml_concat(ctx0, hidden, h_next,   1) : h_next;
+        // the drafted token leaves the graph as an id; nothing else is read back
+        ggml_tensor * next = ggml_argmax(ctx0, logits_j);
+        cb(next, "mtp_chain_next", j);
+        ggml_set_output(next); // read back after the graph, so its memory is not recycled
+        ggml_build_forward_expand(gf, next);
+        res->t_mtp_ids.push_back(next);
 
         if (j + 1 < n_chain) {
-            ggml_tensor * next = ggml_argmax(ctx0, logits_j);
-            cb(next, "mtp_chain_next", j);
-
             tok = ggml_get_rows(ctx0, embd_weights(), next);
             h   = h_next;
         }
     }
-
-    cb(hidden, "h_nextn", -1);
-    ggml_build_forward_expand(gf, hidden); // nothing below reads it, so it is placed here
-    res->t_h_nextn = hidden;
-
-    logits = ggml_get_rows(ctx0, logits, inp_out_ids);
-    cb(logits, "result_output", -1);
-    res->t_logits = logits;
-
-    ggml_build_forward_expand(gf, logits);
 }

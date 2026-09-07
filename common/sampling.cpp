@@ -341,6 +341,18 @@ struct common_sampler * common_sampler_init(
 
         bool use_adaptive_p = false; // see below
 
+        // at temperature 0 the chain is an argmax; truncation samplers keep the top token,
+        // so only samplers that rewrite logits or drop the top token keep the full chain
+        const bool penalties_off = params.penalty_last_n == 0 ||
+            (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+        const bool argmax_only = params.temp <= 0.0f && params.n_probs == 0 && penalties_off && params.dry_multiplier <= 0.0f && (getenv("LLAMA_ARGMAX_ONLY") == nullptr || atoi(getenv("LLAMA_ARGMAX_ONLY")) != 0) &&
+            params.typ_p >= 1.0f && params.xtc_probability <= 0.0f && params.top_n_sigma < 0.0f &&
+            std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == params.samplers.end() &&
+            std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_INFILL)     == params.samplers.end();
+
+        if (argmax_only) {
+            samplers.push_back(llama_sampler_init_greedy());
+        } else
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
                 case COMMON_SAMPLER_TYPE_DRY:
@@ -394,7 +406,7 @@ struct common_sampler * common_sampler_init(
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
-        } else {
+        } else if (!argmax_only) {
             // default: sample from distribution
             samplers.push_back(llama_sampler_init_dist(params.seed));
         }

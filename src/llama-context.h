@@ -57,6 +57,8 @@ struct llama_context {
 
     void synchronize();
 
+    const llama_token * get_mtp_chain_ids(int32_t & n);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -300,6 +302,9 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // ids drafted by a chained MTP graph, one per step
+    std::vector<llama_token> mtp_ids;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

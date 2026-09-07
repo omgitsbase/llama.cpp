@@ -1,4 +1,7 @@
 #include "common.cuh"
+
+// rows one block routes; up to this many rows the outputs may alias the logits
+#define GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK 4
 #include "ggml.h"
 
 #include <initializer_list>

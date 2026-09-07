@@ -1087,6 +1087,19 @@ static void llama_sampler_greedy_backend_apply(
     ggml_set_name(curl, "greedy_argmax");
 
     data->sampled = curl;
+
+    // what leaves the graph is the chosen token and its logit, not the row:
+    // the sampled logits are copied to the host after every decode
+    struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, ggml_nelements(logits));
+    data->logits = ggml_get_rows(ctx, logits_rows, curl);
+    ggml_set_name(data->logits, "greedy_logit");
+    if (data->candidates) {
+        struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, data->candidates->ne[0]);
+        data->candidates = ggml_get_rows(ctx, candidates_rows, curl);
+    } else {
+        data->candidates = curl;
+    }
+    ggml_set_name(data->candidates, "greedy_candidate");
 }
 
 static struct llama_sampler_i llama_sampler_greedy_i = {
