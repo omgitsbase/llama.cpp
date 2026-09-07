@@ -1582,7 +1582,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                static const bool timing = getenv("LLAMA_MTP_CHAIN_TIMING") != nullptr;
+                const int64_t t0 = timing ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                if (timing) {
+                    llama_synchronize(ctx_dft);
+                    LOG_INF("mtp replay: %d tokens, decode %.2f ms\n", (int) batch.n_tokens, (ggml_time_us() - t0)/1000.0);
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
