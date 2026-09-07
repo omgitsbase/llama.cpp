@@ -121,6 +121,11 @@ LLAMA_API bool llama_sampler_on_backend(struct llama_context * ctx, llama_seq_id
 // the target context a chained MTP context takes its rounds' inputs from
 LLAMA_API void llama_set_mtp_round_target(struct llama_context * ctx, struct llama_context * ctx_tgt);
 
+// the decode loop on the device: n_max greedy steps from token0 at pos0 into
+// out, each step fed by the last; needs flash attention, n_rs_seq 0 and a
+// backend sampler on sequence 0. Returns the count, or a negative on failure.
+LLAMA_API int32_t llama_decode_loop(struct llama_context * ctx, llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out);
+
 // Whether the model's DECODER_MTP graph supports chained drafting.
 LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);
 

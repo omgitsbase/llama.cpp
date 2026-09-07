@@ -68,6 +68,11 @@ struct llama_context {
 
     llm_graph_result * get_gf_res_prev() const;
 
+    // the decode loop on the device: n_max steps from token0 at pos0, each
+    // step fed by the last; the ids come back in out. Returns the count, or
+    // a negative on failure.
+    int32_t decode_loop(llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -317,6 +322,12 @@ private:
     std::vector<ggml_tensor *> mtp_ids_pending;
 
     llama_mtp_round_state mtp_round;
+
+    llama_loop_state          loop;
+    const llama_loop_state  * loop_cur = nullptr; // set while a loop graph is built
+    ggml_context_ptr          ctx_loop;
+    ggml_backend_buffer_ptr   buf_loop;
+    llm_graph_result_ptr      gf_res_loop;
     ggml_context_ptr        ctx_mtp_hpend; // holds the tensor's metadata
     ggml_backend_buffer_ptr buf_mtp_hpend;
 

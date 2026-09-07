@@ -67,6 +67,9 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+    if (device) {
+        return;
+    }
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -198,6 +201,9 @@ bool llm_graph_input_mtp_round::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
+    if (device) {
+        return;
+    }
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -541,6 +547,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    if (device) {
+        return;
+    }
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
@@ -1134,10 +1143,13 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // a loop body selects its rows and mask on the device
+    if (!inp_attn->device) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1539,6 +1551,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     mtp_round        (params.mtp_round),
+    loop             (params.loop),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2372,9 +2385,16 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-    cb(inp->tokens, "inp_tokens", -1);
-    ggml_set_input(inp->tokens);
+    if (loop) {
+        // the loop body reads the id its previous step sampled
+        GGML_ASSERT(ubatch.n_tokens == 1 && ubatch.token && "loop body: one token");
+        inp->device = true;
+        inp->tokens = loop->tok;
+    } else {
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        cb(inp->tokens, "inp_tokens", -1);
+        ggml_set_input(inp->tokens);
+    }
     res->t_inp_tokens = inp->tokens;
 
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
@@ -2543,6 +2563,30 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::loop_step() const {
+    GGML_ASSERT(loop);
+    return ggml_cast(ctx0, loop->counter, GGML_TYPE_I32);
+}
+
+void llm_graph_context::build_loop_tail() const {
+    GGML_ASSERT(loop && "loop tail: no loop");
+    GGML_ASSERT(res->t_sampled.size() == 1 && res->t_sampled[0] && "loop body: the row must be sampled on the device");
+
+    ggml_tensor * sampled = res->t_sampled[0]; // I32 [1]
+    ggml_tensor * step    = loop_step();
+
+    // the id joins the ring (kept as floats: set_rows writes floats)
+    ggml_tensor * ring = ggml_set_rows(ctx0,
+            ggml_reshape_2d(ctx0, loop->ring, 1, loop->n_max),
+            ggml_reshape_2d(ctx0, ggml_cast(ctx0, sampled, GGML_TYPE_F32), 1, 1),
+            step);
+    ggml_build_forward_expand(gf, ring);
+
+    // it is the next step's token, and the step advances
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, sampled, loop->tok));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_scale_bias(ctx0, loop->counter, 1.0f, 1.0f), loop->counter));
+}
+
 // A whole speculative round in one graph. Rows 0 .. n_chain replay the verify
 // batch the target just ran: the batch's tokens paired with the target's
 // hidden rows, which come straight from the target's graph. How many of them
@@ -2706,8 +2750,15 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 
     auto & cur = inp->pos;
 
-    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
-    ggml_set_input(cur);
+    if (loop) {
+        // the loop body picks its step's row of the window's positions
+        const int64_t n_pos = hparams.n_pos_per_embd();
+        inp->device = true;
+        cur = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->pos_win, loop_step()), n_pos);
+    } else {
+        cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
+        ggml_set_input(cur);
+    }
 
     res->add_input(std::move(inp));
 
@@ -3062,11 +3113,22 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    const llama_loop_state * loop = nullptr,
+    ggml_tensor * loop_step = nullptr) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
-    {
+    if (loop) {
+        // the loop body picks its step's cache row and mask row from the window
+        GGML_ASSERT(cparams.flash_attn && "loop body: needs flash attention");
+        inp->device = true;
+        inp->self_k_idxs = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->kidx_win, loop_step), 1);
+        inp->self_v_idxs = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, loop->vidx_win, loop_step), 1);
+        ggml_tensor * mask = ggml_get_rows(ctx0, loop->mask_win, loop_step); // F32 [n_kv, 1]
+        inp->self_kq_mask     = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        inp->self_kq_mask_cnv = inp->self_kq_mask;
+    } else {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
@@ -3085,7 +3147,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, loop, loop ? loop_step() : nullptr);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3813,7 +3875,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), loop, loop ? loop_step() : nullptr);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

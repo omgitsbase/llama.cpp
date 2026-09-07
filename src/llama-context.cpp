@@ -1,4 +1,6 @@
 #include "llama-context.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -2580,6 +2582,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.mtp_round   =*/ &mtp_round,
+        /*.loop        =*/ loop_cur,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3977,6 +3980,205 @@ bool llama_sampler_on_backend(llama_context * ctx, llama_seq_id seq_id) {
 
 llm_graph_result * llama_context::get_gf_res_prev() const {
     return static_cast<llm_graph_result *>(gf_res_prev.get());
+}
+
+int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out) {
+    if (!memory || n_max <= 0) {
+        return -1;
+    }
+    if (!cparams.flash_attn) {
+        LLAMA_LOG_ERROR("%s: the loop needs flash attention\n", __func__);
+        return -1;
+    }
+    if (cparams.n_rs_seq != 0) {
+        LLAMA_LOG_ERROR("%s: the loop needs n_rs_seq == 0\n", __func__);
+        return -1;
+    }
+    if (sampling.samplers.find(0) == sampling.samplers.end()) {
+        LLAMA_LOG_ERROR("%s: the loop needs a backend sampler on sequence 0\n", __func__);
+        return -1;
+    }
+    if ((uint32_t) n_max > cparams.n_ubatch) {
+        LLAMA_LOG_ERROR("%s: the window (%d) exceeds n_ubatch (%u)\n", __func__, n_max, cparams.n_ubatch);
+        return -1;
+    }
+
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+    const int64_t n_pos  = hparams.n_pos_per_embd();
+
+    synchronize();
+
+    // the window: n_max rows for sequence 0, every one an output
+    std::vector<llama_token>    w_tok(n_max, token0);
+    std::vector<llama_pos>      w_pos(n_max);
+    std::vector<int32_t>        w_nsq(n_max, 1);
+    std::vector<llama_seq_id>   w_sq0(n_max, 0);
+    std::vector<llama_seq_id *> w_sq(n_max);
+    std::vector<int8_t>         w_out(n_max, 1);
+    for (int32_t i = 0; i < n_max; ++i) {
+        w_pos[i] = pos0 + i;
+        w_sq[i]  = &w_sq0[i];
+    }
+    llama_batch wb = {
+        /*.n_tokens =*/ n_max,
+        /*.token    =*/ w_tok.data(),
+        /*.embd     =*/ nullptr,
+        /*.pos      =*/ w_pos.data(),
+        /*.n_seq_id =*/ w_nsq.data(),
+        /*.seq_id   =*/ w_sq.data(),
+        /*.logits   =*/ w_out.data(),
+    };
+
+    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    if (!balloc->init(wb, vocab, memory.get(), hparams.n_embd_inp(), n_seq_max, false)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize the window batch\n", __func__);
+        return -1;
+    }
+
+    llama_memory_context_ptr mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: no room for a window of %d\n", __func__, n_max);
+        return -1;
+    }
+    if (!mctx->apply()) {
+        LLAMA_LOG_ERROR("%s: failed to apply the window\n", __func__);
+        return -1;
+    }
+    const llama_ubatch & wub = mctx->get_ubatch();
+    if ((int32_t) wub.n_tokens != n_max) {
+        LLAMA_LOG_ERROR("%s: the window split into ubatches (%u of %d)\n", __func__, wub.n_tokens, n_max);
+        return -1;
+    }
+
+    // the attention part of the memory, for its rows and masks
+    const llama_kv_cache_context * mkv = nullptr;
+    if (llama_model_is_hybrid(&model)) {
+        mkv = static_cast<const llama_memory_hybrid_context *>(mctx.get())->get_attn();
+    } else {
+        mkv = static_cast<const llama_kv_cache_context *>(mctx.get());
+    }
+    const int64_t n_kv = mkv->get_n_kv();
+
+    // the host builds every step's rows and mask once, with its usual code
+    ggml_init_params hip = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr hctx(ggml_init(hip));
+    ggml_tensor * h_kidx = ggml_new_tensor_1d(hctx.get(), GGML_TYPE_I64, n_max);
+    ggml_tensor * h_vidx = ggml_new_tensor_1d(hctx.get(), GGML_TYPE_I64, n_max);
+    ggml_tensor * h_mask = ggml_new_tensor_4d(hctx.get(), GGML_TYPE_F16, n_kv, n_max, 1, 1);
+    ggml_backend_buffer_ptr hbuf(ggml_backend_alloc_ctx_tensors_from_buft(hctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(hbuf);
+    mkv->set_input_k_idxs(h_kidx, &wub);
+    mkv->set_input_v_idxs(h_vidx, &wub);
+    mkv->set_input_kq_mask(h_mask, &wub, cparams.causal_attn);
+
+    std::vector<int32_t> kidx(n_max), vidx(n_max);
+    for (int32_t i = 0; i < n_max; ++i) {
+        kidx[i] = (int32_t) ((const int64_t *) h_kidx->data)[i];
+        vidx[i] = (int32_t) ((const int64_t *) h_vidx->data)[i];
+    }
+    std::vector<int32_t> posw((size_t) n_pos * n_max, 0);
+    for (int32_t i = 0; i < n_max; ++i) {
+        // text rows: every section but the last takes the position, the last is 0
+        for (int64_t s = 0; s < n_pos; ++s) {
+            posw[(size_t) i*n_pos + s] = (n_pos == 1 || s + 1 < n_pos) ? w_pos[i] : 0;
+        }
+    }
+
+    // the device side of the window
+    {
+        ggml_backend_t dev_backend = backend_cpu;
+        for (auto & b : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                dev_backend = b.get();
+                break;
+            }
+        }
+        ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
+        ctx_loop.reset(ggml_init(ip));
+        loop.tok      = ggml_new_tensor_1d(ctx_loop.get(), GGML_TYPE_I32, 1);
+        loop.counter  = ggml_new_tensor_1d(ctx_loop.get(), GGML_TYPE_F32, 1);
+        loop.ring     = ggml_new_tensor_1d(ctx_loop.get(), GGML_TYPE_F32, n_max);
+        loop.pos_win  = ggml_new_tensor_2d(ctx_loop.get(), GGML_TYPE_I32, n_pos, n_max);
+        loop.kidx_win = ggml_new_tensor_2d(ctx_loop.get(), GGML_TYPE_I32, 1, n_max);
+        loop.vidx_win = ggml_new_tensor_2d(ctx_loop.get(), GGML_TYPE_I32, 1, n_max);
+        loop.mask_win = ggml_new_tensor_2d(ctx_loop.get(), GGML_TYPE_F16, n_kv, n_max);
+        loop.n_max    = n_max;
+        ggml_set_name(loop.tok,      "loop_tok");
+        ggml_set_name(loop.counter,  "loop_counter");
+        ggml_set_name(loop.ring,     "loop_ring");
+        ggml_set_name(loop.pos_win,  "loop_pos");
+        ggml_set_name(loop.kidx_win, "loop_kidx");
+        ggml_set_name(loop.vidx_win, "loop_vidx");
+        ggml_set_name(loop.mask_win, "loop_mask");
+        buf_loop.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_loop.get(), ggml_backend_get_default_buffer_type(dev_backend)));
+        GGML_ASSERT(buf_loop && "failed to allocate the loop window");
+
+        const float zero = 0.0f;
+        std::vector<float> ring0(n_max, 0.0f);
+        ggml_backend_tensor_set(loop.tok,      &token0,     0, sizeof(token0));
+        ggml_backend_tensor_set(loop.counter,  &zero,       0, sizeof(zero));
+        ggml_backend_tensor_set(loop.ring,     ring0.data(), 0, ggml_nbytes(loop.ring));
+        ggml_backend_tensor_set(loop.pos_win,  posw.data(), 0, ggml_nbytes(loop.pos_win));
+        ggml_backend_tensor_set(loop.kidx_win, kidx.data(), 0, ggml_nbytes(loop.kidx_win));
+        ggml_backend_tensor_set(loop.vidx_win, vidx.data(), 0, ggml_nbytes(loop.vidx_win));
+        ggml_backend_tensor_set(loop.mask_win, h_mask->data, 0, ggml_nbytes(loop.mask_win));
+    }
+
+    // the body: a one-token graph over the window's memory
+    llama_ubatch ub1 = wub;
+    ub1.n_tokens     = 1;
+    ub1.n_seq_tokens = 1;
+    ub1.n_seqs       = 1;
+    ub1.n_seqs_unq   = 1;
+
+    if (!gf_res_loop) {
+        gf_res_loop.reset(new llm_graph_result(graph_max_nodes(cparams.n_ubatch)));
+    }
+    auto * res = static_cast<llm_graph_result *>(gf_res_loop.get());
+    res->reset();
+    ggml_backend_sched_reset(sched.get());
+
+    loop_cur  = &loop;
+    n_outputs = 1;
+    const auto gparams = graph_params(res, ub1, mctx.get(), LLM_GRAPH_TYPE_DEFAULT);
+    ggml_cgraph * gf = model.build_graph(gparams);
+    loop_cur = nullptr;
+    if (!gf) {
+        LLAMA_LOG_ERROR("%s: failed to build the loop body\n", __func__);
+        return -2;
+    }
+    if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the loop body\n", __func__);
+        return -2;
+    }
+    res->set_inputs(&ub1);
+
+    // step 1 of the loop work: the host still launches every step
+    for (int32_t i = 0; i < n_max; ++i) {
+        const auto status = graph_compute(gf, false);
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: step %d failed: %d\n", __func__, i, (int) status);
+            return -3;
+        }
+    }
+    synchronize();
+
+    std::vector<float> ring(n_max);
+    ggml_backend_tensor_get(loop.ring, ring.data(), 0, ggml_nbytes(loop.ring));
+    for (int32_t i = 0; i < n_max; ++i) {
+        out[i] = (llama_token) ring[i];
+    }
+
+    // the next plain decode must not reuse a graph whose memory the loop took
+    gf_res_prev->reset();
+    ggml_backend_sched_reset(sched.get());
+
+    return n_max;
+}
+
+int32_t llama_decode_loop(llama_context * ctx, llama_token token0, llama_pos pos0, int32_t n_max, llama_token * out) {
+    return ctx->decode_loop(token0, pos0, n_max, out);
 }
 
 void llama_set_mtp_round_host(llama_context * ctx, const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off) {

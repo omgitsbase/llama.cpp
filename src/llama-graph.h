@@ -134,6 +134,8 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
+    bool device = false; // a loop body reads its token on the device
+
     const int64_t n_embd = 0;
 };
 
@@ -152,6 +154,21 @@ public:
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// The decode loop on the device. The host reserves a window of cache cells
+// and uploads, once, the position, cache row and mask of every step; the
+// body picks its step's row with a counter it advances itself, feeds the
+// token it sampled back into its own input, and appends it to a ring.
+struct llama_loop_state {
+    ggml_tensor * tok      = nullptr; // I32 [1]            the token this step reads
+    ggml_tensor * counter  = nullptr; // F32 [1]            the step, advanced by the body
+    ggml_tensor * ring     = nullptr; // F32 [n_max]        the ids sampled so far
+    ggml_tensor * pos_win  = nullptr; // I32 [n_pos, n_max] positions of every step
+    ggml_tensor * kidx_win = nullptr; // I32 [1, n_max]     cache row every step writes
+    ggml_tensor * vidx_win = nullptr; // I32 [1, n_max]
+    ggml_tensor * mask_win = nullptr; // F16 [n_kv, n_max]  mask row of every step
+    int32_t       n_max    = 0;
 };
 
 // a chained MTP round takes the target's sampled ids and hidden rows for the
@@ -225,6 +242,8 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * pos = nullptr; // I32 [n_batch]
+
+    bool device = false; // a loop body selects its position on the device
 
     const uint32_t n_pos_per_embd = 1;
 };
@@ -413,6 +432,8 @@ public:
     //       llm_graph_params from a previous batch, causing stack-use-after-return
     const llama_hparams hparams;
     const llama_cparams cparams;
+
+    bool device = false; // a loop body selects its rows and mask on the device
 
     const llama_kv_cache_context * mctx;
 };
@@ -833,6 +854,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     const llama_mtp_round_state  * mtp_round;
+    const llama_loop_state       * loop;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1081,6 +1103,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const llama_mtp_round_state  * mtp_round;
+    const llama_loop_state       * loop;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1206,6 +1229,12 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+
+    // the loop body's step, as an index
+    ggml_tensor * loop_step() const;
+
+    // after sampling: the id joins the ring, feeds the next step, the step advances
+    void build_loop_tail() const;
 
     // a whole speculative round in this graph, see llama_set_mtp_chain
     void build_mtp_round(
