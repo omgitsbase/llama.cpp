@@ -2543,6 +2543,14 @@ bool llama_model_has_mtp_chain(const llama_model * model) {
     return model->has_mtp_round();
 }
 
+bool llama_model_has_mtp_head(const llama_model * model) {
+    const uint32_t il = model->hparams.n_layer();
+    if (model->hparams.n_layer_nextn == 0 || il >= model->layers.size()) {
+        return false;
+    }
+    return model->layers[il].nextn.eh_proj != nullptr;
+}
+
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }

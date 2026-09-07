@@ -1365,7 +1365,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         std::memset(batch.embd, 0, row_bytes * (V + K));
 
-        SPC_ERR("chain_launch: host_route %d first %d base %d replay_n %d last_accepted %d id_last %d\n", (int) host_route, (int) first, (int) base, (int) replay_n, (int) last_accepted, (int) id_last);
+        SPC_DBG("chain_launch: host_route %d first %d base %d replay_n %d last_accepted %d id_last %d\n", (int) host_route, (int) first, (int) base, (int) replay_n, (int) last_accepted, (int) id_last);
 
         // the cache goes back to base: the last round's chain and the replay
         // rows it did not accept live there

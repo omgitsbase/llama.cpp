@@ -45,8 +45,14 @@ static common_speculative_output_limits server_output_limits(const common_params
         return { params.n_batch, 1 };
     }
 
-    auto result = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+    // no speculative choice made: a model with an MTP head drafts for itself
+    // once loaded, so leave room for a round's outputs
+    int32_t n_max = common_speculative_n_max(&params.speculative);
+    if (!params.speculative.types_set) {
+        n_max = std::max<int32_t>(n_max, params.speculative.draft.n_max);
+    }
+
+    auto result = common_speculative_get_output_limits(params.n_batch, params.n_parallel, n_max);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -1124,7 +1130,7 @@ private:
 
         // a model that carries a trained MTP head drafts for itself, so a run
         // with no speculative flags still gets the one-trip round
-        if (!has_spec && !params_base.speculative.types_set && llama_model_n_layer_nextn(model_tgt) > 0) {
+        if (!has_spec && !params_base.speculative.types_set && llama_model_has_mtp_head(model_tgt)) {
             params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             spec_mtp = true;
             has_spec = true;

@@ -173,7 +173,6 @@ void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(src_h && src_h->ne[0] == n_embd && src_h->ne[1] >= n_verify && ggml_is_contiguous(src_h));
         mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, 0);
 
-        LLAMA_LOG_ERROR("%s: device route: t_sampled %zu candidates %zu h_nextn %s n_verify %d\n", __func__, res_tgt->t_sampled.size(), res_tgt->t_candidates.size(), src_h ? src_h->name : "-", (int) n_verify);
         GGML_ASSERT((int64_t) res_tgt->t_sampled.size() >= n_verify);
         for (int64_t i = 0; i < n_verify; ++i) {
             ggml_tensor * src_c = res_tgt->t_sampled[i];
