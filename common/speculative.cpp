@@ -1306,6 +1306,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     llama_pos                chain_base     = 0;     // position of its replay row 0
     int32_t                  chain_off      = 1;     // the anchor sits at chain_base + n_acc + chain_off
     llama_pos                chain_expect   = -1;    // where the next verify batch starts, -1 when none is due
+    bool                     defer_last     = false; // the last batch was a verify batch this drafter did not decode
     std::vector<int32_t>     round_c;               // the host route's inputs
     std::vector<float>       round_h;
 
@@ -1347,7 +1348,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     round_c[i] = i < last_accepted ? replay_tok[i + 1] : -1;
                 }
                 round_c[std::min(last_accepted, K)] = id_last;
-                round_c[K] = last_accepted == K ? id_last : round_c[K];
                 for (int k = 0; k < replay_n; ++k) {
                     std::memcpy(round_h.data() + (size_t) k * n_embd, llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[0] + k), row_bytes);
                 }
@@ -1564,6 +1564,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         chain_launched = false;
         chain_expect   = -1;
         replay_n       = 0;
+        defer_last     = false;
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
@@ -1614,6 +1615,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             replay_pos.assign(batch_in.pos,   batch_in.pos   + n_tokens);
             replay_n       = n_tokens;
             chain_launched = false;
+            defer_last     = true;
             if (chain_started && n_tokens == n_chain + 1 && llama_sampler_on_backend(ctx_tgt, 0)) {
                 chain_launch(false, replay_pos[0], LLAMA_TOKEN_NULL);
             }
@@ -1624,6 +1626,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         chain_launched = false;
         chain_expect   = -1;
         replay_n       = 0;
+        defer_last     = false;
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1871,9 +1874,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         last_accepted = n_accepted;
-        if (replay_n > 0) {
-            // a deferred verify batch: the anchor's hidden row is the target's row after the accepted ones
-            const int32_t i_h = std::min<int32_t>(n_accepted, replay_n - 1);
+        if (defer_last) {
+            // a verify batch this drafter did not decode: the anchor's hidden
+            // row is the target's row after the ones it accepted
+            defer_last = false;
+            const int32_t i_h = std::min<int32_t>(n_accepted, i_batch_end[seq_id] - i_batch_beg[seq_id]);
             std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(params.ctx_tgt, i_batch_beg[seq_id] + i_h), (size_t) n_embd * sizeof(float));
             return;
         }
