@@ -2929,10 +2929,12 @@ static int ggml_cuda_try_elt_chain(ggml_backend_cuda_context & ctx, const ggml_c
         }
     };
     // the first node reads x = src0 (and maybe src1)
-    strides_of(first->src[0], a.x);
+    const ggml_tensor * x_t = first->src[0];
+    strides_of(x_t, a.x);
     add_step(first, ggml_cuda_chain_op_of(first), first->src[1]);
 
-    const ggml_tensor * prev = first;
+    const ggml_tensor * shape = first;
+    const ggml_tensor * prev  = first;
     int prev_idx = i;
     int last     = i;
     for (int j = i + 1; j < cgraph->n_nodes && a.n_steps < GGML_CUDA_CHAIN_MAX_STEPS && n_args < GGML_CUDA_CHAIN_MAX_ARGS; ++j) {
@@ -2941,7 +2943,15 @@ static int ggml_cuda_try_elt_chain(ggml_backend_cuda_context & ctx, const ggml_c
             continue;
         }
         int op = ggml_cuda_chain_op_of(n);
-        if (op == 0 || !ggml_are_same_shape(n, first) || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        // the chain may widen: a value computed over few elements can be read
+        // by many, which is what a gate multiplied into the tensor it gates
+        // looks like. Everything read so far is then read with a zero stride,
+        // which the final shape check below confirms.
+        bool fits = true;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            fits = fits && (shape->ne[d] == n->ne[d] || shape->ne[d] == 1);
+        }
+        if (op == 0 || !fits || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             break;
         }
         const ggml_tensor * other = nullptr;
@@ -2969,6 +2979,7 @@ static int ggml_cuda_try_elt_chain(ggml_backend_cuda_context & ctx, const ggml_c
             break;
         }
         add_step(n, op, other);
+        shape    = n;
         prev     = n;
         prev_idx = j;
         last     = j;
@@ -2981,6 +2992,26 @@ static int ggml_cuda_try_elt_chain(ggml_backend_cuda_context & ctx, const ggml_c
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
         a.ne[d] = out->ne[d];
     }
+    // whatever the chain reads is indexed with the output's shape, so each of
+    // its dimensions either matches or is one, which strides_of already turned
+    // into a zero stride. A chain that never widened passes this trivially.
+    auto under_out = [&](const ggml_tensor * t) {
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (t->ne[d] != 1 && t->ne[d] != a.ne[d]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!under_out(x_t)) {
+        return 0;
+    }
+    for (int k = 0; k < n_args; ++k) {
+        if (!under_out(operands[k])) {
+            return 0;
+        }
+    }
+
     // a broadcast operand is read by many threads; it must not sit under the output
     const size_t out_bytes = ggml_nbytes(out);
     for (int k = 0; k < n_args; ++k) {
@@ -4490,7 +4521,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_tensor * node = cgraph->nodes[i];
                 // GGML_CUDA_TRACE_OPS=1: every op before its launch, for a synchronous fault hunt
                 static const bool trace_ops = getenv("GGML_CUDA_TRACE_OPS") != nullptr;
-                if (trace_ops) {
+                if (false && trace_ops) {
                     fprintf(stderr, "[op %d] %s %s data=%p src0=%p src1=%p" "\n", i, ggml_op_name(node->op), node->name, node->data,
                             node->src[0] ? node->src[0]->data : nullptr, node->src[1] ? node->src[1]->data : nullptr);
                     fflush(stderr);
@@ -4542,6 +4573,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                // GGML_CUDA_TRACE_LAUNCH=1: what the graph actually launches,
+                // with fusion applied - a fused run prints its first op and how
+                // many nodes it swallowed
+                static const bool trace_launch = getenv("GGML_CUDA_TRACE_LAUNCH") != nullptr;
+                if (trace_launch) {
+                    fprintf(stderr, "[launch %d] %s %s fused=%d ne=%lld,%lld,%lld\n", i, ggml_op_name(node->op),
+                            node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : node->name,
+                            nodes_to_skip, (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
