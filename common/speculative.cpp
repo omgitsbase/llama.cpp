@@ -1402,8 +1402,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         chain_launched = false;
 
+        static struct spc_draft_timing {
+            bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+            double ids = 0, rest = 0; int n = 0;
+        } spct;
+        const int64_t spc_t0 = spct.on ? ggml_time_us() : 0;
         int32_t n_ids = 0;
         const llama_token * ids = llama_get_mtp_chain_ids(params.ctx_dft, &n_ids);
+        if (spct.on) {
+            spct.ids += (ggml_time_us() - spc_t0) / 1000.0;
+            if (++spct.n % 100 == 0) {
+                fprintf(stderr, "[round] draft phase n=%d  read ids %.3f ms per round\n", spct.n, spct.ids / spct.n);
+            }
+        }
         GGML_ASSERT(n_ids == K + 1);
         const int32_t n_acc = ids[K];
 
