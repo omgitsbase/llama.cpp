@@ -2842,6 +2842,151 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+static int  ggml_cuda_fuse_off_mask();
+
+// An elementwise node: f32, contiguous, one of the ops the chain kernel
+// speaks, and for a binary op a second operand that broadcasts onto it.
+static int ggml_cuda_chain_op_of(const ggml_tensor * n) {
+    if (n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || n->src[0] == nullptr || n->src[0]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    switch (n->op) {
+        case GGML_OP_ADD: case GGML_OP_SUB: case GGML_OP_MUL: case GGML_OP_DIV: {
+            const ggml_tensor * b = n->src[1];
+            if (b == nullptr || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || !ggml_are_same_shape(n, n->src[0])) {
+                return 0;
+            }
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                if (b->ne[d] != 1 && b->ne[d] != n->ne[d]) {
+                    return 0;
+                }
+            }
+            return n->op == GGML_OP_ADD ? GGML_CUDA_CHAIN_ADD : n->op == GGML_OP_SUB ? GGML_CUDA_CHAIN_SUB :
+                   n->op == GGML_OP_MUL ? GGML_CUDA_CHAIN_MUL : GGML_CUDA_CHAIN_DIV;
+        }
+        case GGML_OP_SCALE: return ggml_are_same_shape(n, n->src[0]) ? GGML_CUDA_CHAIN_SCALE : 0;
+        case GGML_OP_CLAMP: return ggml_are_same_shape(n, n->src[0]) ? GGML_CUDA_CHAIN_CLAMP : 0;
+        case GGML_OP_SQR:   return ggml_are_same_shape(n, n->src[0]) ? GGML_CUDA_CHAIN_SQR : 0;
+        case GGML_OP_SQRT:  return ggml_are_same_shape(n, n->src[0]) ? GGML_CUDA_CHAIN_SQRT : 0;
+        case GGML_OP_LOG:   return ggml_are_same_shape(n, n->src[0]) ? GGML_CUDA_CHAIN_LOG : 0;
+        case GGML_OP_SIN:   return ggml_are_same_shape(n, n->src[0]) ? GGML_CUDA_CHAIN_SIN : 0;
+        case GGML_OP_COS:   return ggml_are_same_shape(n, n->src[0]) ? GGML_CUDA_CHAIN_COS : 0;
+        case GGML_OP_UNARY: {
+            const int u = (int) ggml_get_unary_op(n);
+            return ggml_are_same_shape(n, n->src[0]) && ggml_cuda_chain_unary_supported(u) ? GGML_CUDA_CHAIN_UNARY + u : 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+// The generic pass: a run of elementwise nodes where each consumes the one
+// before it and nothing else does, collapsed into one launch. Views between
+// them are skipped; anything else ends the run. Applies to every model.
+static int ggml_cuda_try_elt_chain(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (ggml_cuda_chain_op_of(first) == 0 || (first->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    if (ggml_cuda_fuse_off_mask() & 128) {
+        return 0;
+    }
+    ggml_cuda_chain_args a{};
+    int n_args = 0;
+    const ggml_tensor * operands[GGML_CUDA_CHAIN_MAX_ARGS] = {};
+    auto strides_of = [&](const ggml_tensor * t, ggml_cuda_chain_arg & out) {
+        out.data = (const float *) t->data;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            out.s[d] = t->ne[d] == 1 ? 0 : (int64_t) (t->nb[d] / sizeof(float));
+        }
+    };
+    auto add_step = [&](const ggml_tensor * n, int op, const ggml_tensor * other) {
+        ggml_cuda_chain_step & st = a.step[a.n_steps++];
+        st.op  = op;
+        st.arg = -1;
+        st.p0  = 0.0f;
+        st.p1  = 0.0f;
+        if (other != nullptr) {
+            st.arg = n_args;
+            operands[n_args] = other;
+            strides_of(other, a.arg[n_args++]);
+        }
+        if (n->op == GGML_OP_SCALE || n->op == GGML_OP_CLAMP) {
+            memcpy(&st.p0, (const float *) n->op_params + 0, sizeof(float));
+            memcpy(&st.p1, (const float *) n->op_params + 1, sizeof(float));
+        }
+    };
+    // the first node reads x = src0 (and maybe src1)
+    strides_of(first->src[0], a.x);
+    add_step(first, ggml_cuda_chain_op_of(first), first->src[1]);
+
+    const ggml_tensor * prev = first;
+    int prev_idx = i;
+    int last     = i;
+    for (int j = i + 1; j < cgraph->n_nodes && a.n_steps < GGML_CUDA_CHAIN_MAX_STEPS && n_args < GGML_CUDA_CHAIN_MAX_ARGS; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n) || ggml_is_empty(n)) {
+            continue;
+        }
+        int op = ggml_cuda_chain_op_of(n);
+        if (op == 0 || !ggml_are_same_shape(n, first) || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        const ggml_tensor * other = nullptr;
+        if (n->src[0] == prev) {
+            other = n->src[1];
+        } else if (n->src[1] == prev && (n->op == GGML_OP_ADD || n->op == GGML_OP_MUL)) {
+            other = n->src[0];
+        } else if (n->src[1] == prev && n->op == GGML_OP_SUB) {
+            op = GGML_CUDA_CHAIN_RSUB; other = n->src[0];
+        } else if (n->src[1] == prev && n->op == GGML_OP_DIV) {
+            op = GGML_CUDA_CHAIN_RDIV; other = n->src[0];
+        } else {
+            break;
+        }
+        if (other != nullptr && !ggml_are_same_shape(other, n)) {
+            // the other operand must broadcast onto the chain's shape
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                if (other->ne[d] != 1 && other->ne[d] != n->ne[d]) {
+                    return 0;
+                }
+            }
+        }
+        // the previous value feeds only this node
+        if (ggml_node_get_use_count(cgraph, prev_idx) != 1) {
+            break;
+        }
+        add_step(n, op, other);
+        prev     = n;
+        prev_idx = j;
+        last     = j;
+    }
+    if (a.n_steps < 2) {
+        return 0;
+    }
+    const ggml_tensor * out = cgraph->nodes[last];
+    a.dst = (float *) out->data;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        a.ne[d] = out->ne[d];
+    }
+    // a broadcast operand is read by many threads; it must not sit under the output
+    const size_t out_bytes = ggml_nbytes(out);
+    for (int k = 0; k < n_args; ++k) {
+        const ggml_tensor * t = operands[k];
+        bool broadcast = false;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            broadcast = broadcast || (t->ne[d] == 1 && a.ne[d] > 1);
+        }
+        const char * ob = (const char *) a.dst;
+        const char * tb = (const char *) t->data;
+        if (broadcast && tb < ob + out_bytes && ob < tb + ggml_nbytes(t)) {
+            return 0;
+        }
+    }
+    ggml_cuda_op_elt_chain(ctx, a);
+    return last - i;
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
@@ -3407,6 +3552,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 
 
+
+    // any run of elementwise ops, on every model
+    if (ggml_cuda_chain_op_of(node) != 0) {
+        const int nodes_to_skip = ggml_cuda_try_elt_chain(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||

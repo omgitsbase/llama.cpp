@@ -644,3 +644,86 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+static __device__ __forceinline__ float ggml_cuda_chain_unary(int op, float x) {
+    switch (op) {
+        case GGML_UNARY_OP_ABS:         return op_abs(x);
+        case GGML_UNARY_OP_SGN:         return op_sgn(x);
+        case GGML_UNARY_OP_NEG:         return op_neg(x);
+        case GGML_UNARY_OP_STEP:        return op_step(x);
+        case GGML_UNARY_OP_TANH:        return op_tanh(x);
+        case GGML_UNARY_OP_ELU:         return op_elu(x);
+        case GGML_UNARY_OP_RELU:        return op_relu(x);
+        case GGML_UNARY_OP_SIGMOID:     return op_sigmoid(x);
+        case GGML_UNARY_OP_GELU:        return op_gelu(x);
+        case GGML_UNARY_OP_GELU_QUICK:  return op_gelu_quick(x);
+        case GGML_UNARY_OP_SILU:        return op_silu(x);
+        case GGML_UNARY_OP_HARDSWISH:   return op_hardswish(x);
+        case GGML_UNARY_OP_HARDSIGMOID: return op_hardsigmoid(x);
+        case GGML_UNARY_OP_EXP:         return op_exp(x);
+        case GGML_UNARY_OP_EXPM1:       return op_expm1(x);
+        case GGML_UNARY_OP_SOFTPLUS:    return op_softplus(x);
+        case GGML_UNARY_OP_GELU_ERF:    return op_gelu_erf(x);
+        case GGML_UNARY_OP_FLOOR:       return op_floor(x);
+        case GGML_UNARY_OP_CEIL:        return op_ceil(x);
+        case GGML_UNARY_OP_ROUND:       return op_round(x);
+        case GGML_UNARY_OP_TRUNC:       return op_trunc(x);
+        default:                        return x;
+    }
+}
+
+bool ggml_cuda_chain_unary_supported(int op) {
+    switch (op) {
+        case GGML_UNARY_OP_ABS: case GGML_UNARY_OP_SGN: case GGML_UNARY_OP_NEG: case GGML_UNARY_OP_STEP:
+        case GGML_UNARY_OP_TANH: case GGML_UNARY_OP_ELU: case GGML_UNARY_OP_RELU: case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_GELU: case GGML_UNARY_OP_GELU_QUICK: case GGML_UNARY_OP_SILU: case GGML_UNARY_OP_HARDSWISH:
+        case GGML_UNARY_OP_HARDSIGMOID: case GGML_UNARY_OP_EXP: case GGML_UNARY_OP_EXPM1: case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_GELU_ERF: case GGML_UNARY_OP_FLOOR: case GGML_UNARY_OP_CEIL: case GGML_UNARY_OP_ROUND:
+        case GGML_UNARY_OP_TRUNC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static __global__ void elt_chain_f32(const ggml_cuda_chain_args a, const int64_t n) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int64_t i0 = idx % a.ne[0];
+    const int64_t i1 = (idx / a.ne[0]) % a.ne[1];
+    const int64_t i2 = (idx / (a.ne[0] * a.ne[1])) % a.ne[2];
+    const int64_t i3 = idx / (a.ne[0] * a.ne[1] * a.ne[2]);
+    auto at = [&](const ggml_cuda_chain_arg & t) -> float {
+        return t.data[i0 * t.s[0] + i1 * t.s[1] + i2 * t.s[2] + i3 * t.s[3]];
+    };
+    float v = at(a.x);
+#pragma unroll 1
+    for (int k = 0; k < a.n_steps; k++) {
+        const ggml_cuda_chain_step st = a.step[k];
+        switch (st.op) {
+            case GGML_CUDA_CHAIN_ADD:   v = v + at(a.arg[st.arg]); break;
+            case GGML_CUDA_CHAIN_SUB:   v = v - at(a.arg[st.arg]); break;
+            case GGML_CUDA_CHAIN_MUL:   v = v * at(a.arg[st.arg]); break;
+            case GGML_CUDA_CHAIN_DIV:   v = v / at(a.arg[st.arg]); break;
+            case GGML_CUDA_CHAIN_RSUB:  v = at(a.arg[st.arg]) - v; break;
+            case GGML_CUDA_CHAIN_RDIV:  v = at(a.arg[st.arg]) / v; break;
+            case GGML_CUDA_CHAIN_SCALE: v = st.p0 * v + st.p1; break;
+            case GGML_CUDA_CHAIN_CLAMP: v = fminf(fmaxf(v, st.p0), st.p1); break;
+            case GGML_CUDA_CHAIN_SQR:   v = v * v; break;
+            case GGML_CUDA_CHAIN_SQRT:  v = sqrtf(v); break;
+            case GGML_CUDA_CHAIN_LOG:   v = logf(v); break;
+            case GGML_CUDA_CHAIN_SIN:   v = sinf(v); break;
+            case GGML_CUDA_CHAIN_COS:   v = cosf(v); break;
+            default:                    v = ggml_cuda_chain_unary(st.op - GGML_CUDA_CHAIN_UNARY, v); break;
+        }
+    }
+    a.dst[idx] = v;
+}
+
+void ggml_cuda_op_elt_chain(ggml_backend_cuda_context & ctx, const ggml_cuda_chain_args & a) {
+    const int64_t n = a.ne[0] * a.ne[1] * a.ne[2] * a.ne[3];
+    const int64_t blocks = (n + 255) / 256;
+    elt_chain_f32<<<(unsigned) blocks, 256, 0, ctx.stream()>>>(a, n);
+}

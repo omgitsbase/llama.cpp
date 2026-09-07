@@ -112,3 +112,41 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
     out_glu = out_glu * (1.0f + g);
     return out_glu;
 }
+
+// A chain of elementwise ops run as one launch. Each step applies one op
+// to the running value, with an optional second operand read through
+// broadcast strides. The expressions are the ones the separate kernels use,
+// so the result is the same to the bit.
+#define GGML_CUDA_CHAIN_MAX_STEPS 8
+#define GGML_CUDA_CHAIN_MAX_ARGS  8
+
+enum ggml_cuda_chain_op {
+    GGML_CUDA_CHAIN_ADD = 1, GGML_CUDA_CHAIN_SUB, GGML_CUDA_CHAIN_MUL, GGML_CUDA_CHAIN_DIV,
+    GGML_CUDA_CHAIN_RSUB, GGML_CUDA_CHAIN_RDIV,
+    GGML_CUDA_CHAIN_SCALE = 10, GGML_CUDA_CHAIN_CLAMP, GGML_CUDA_CHAIN_SQR, GGML_CUDA_CHAIN_SQRT,
+    GGML_CUDA_CHAIN_LOG, GGML_CUDA_CHAIN_SIN, GGML_CUDA_CHAIN_COS,
+    GGML_CUDA_CHAIN_UNARY = 100, // + ggml_unary_op
+};
+
+struct ggml_cuda_chain_arg {
+    const float * data;
+    int64_t       s[4]; // element strides, 0 where the operand broadcasts
+};
+
+struct ggml_cuda_chain_step {
+    int   op;
+    int   arg; // index into arg[], or -1
+    float p0, p1;
+};
+
+struct ggml_cuda_chain_args {
+    ggml_cuda_chain_arg  x;
+    ggml_cuda_chain_arg  arg[GGML_CUDA_CHAIN_MAX_ARGS];
+    ggml_cuda_chain_step step[GGML_CUDA_CHAIN_MAX_STEPS];
+    int     n_steps;
+    float * dst;
+    int64_t ne[4];
+};
+
+bool ggml_cuda_chain_unary_supported(int op);
+void ggml_cuda_op_elt_chain(ggml_backend_cuda_context & ctx, const ggml_cuda_chain_args & a);
