@@ -2947,9 +2947,13 @@ static int ggml_cuda_try_elt_chain(ggml_backend_cuda_context & ctx, const ggml_c
         // by many, which is what a gate multiplied into the tensor it gates
         // looks like. Everything read so far is then read with a zero stride,
         // which the final shape check below confirms.
+        // GGML_CUDA_CHAIN_NOGROW=1 holds the chain to one shape, which is what
+        // it did before it could widen: for measuring the difference with one
+        // binary rather than two
+        static const bool no_grow = getenv("GGML_CUDA_CHAIN_NOGROW") != nullptr;
         bool fits = true;
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            fits = fits && (shape->ne[d] == n->ne[d] || shape->ne[d] == 1);
+            fits = fits && (shape->ne[d] == n->ne[d] || (!no_grow && shape->ne[d] == 1));
         }
         if (op == 0 || !fits || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             break;
