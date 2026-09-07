@@ -58,7 +58,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const char * model_path = argv[1];
-    const int n_gen = argc > 2 ? atoi(argv[2]) : 64;
+    const int n_gen    = argc > 2 ? atoi(argv[2]) : 64;
+    const int n_repeat = argc > 3 ? atoi(argv[3]) : 1; // the prompt this many times over, to lengthen it
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
@@ -70,8 +71,12 @@ int main(int argc, char ** argv) {
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    std::vector<llama_token> toks(512);
-    const int n_tok = llama_tokenize(vocab, PROMPT, (int32_t) strlen(PROMPT), toks.data(), (int32_t) toks.size(), true, true);
+    std::string prompt;
+    for (int i = 0; i < n_repeat; ++i) {
+        prompt += PROMPT;
+    }
+    std::vector<llama_token> toks(prompt.size() + 16);
+    const int n_tok = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), toks.data(), (int32_t) toks.size(), true, true);
     if (n_tok <= 0) {
         fprintf(stderr, "tokenize failed\n");
         return 1;

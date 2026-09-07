@@ -6023,8 +6023,13 @@ static int ggml_backend_cuda_loop(ggml_backend_t backend, ggml_cgraph * cgraph, 
 
     cudaGraphExec_t exec = nullptr;
     CUDA_CHECK(cudaGraphInstantiate(&exec, parent, 0));
+    const int64_t t_launch = ggml_time_us();
     CUDA_CHECK(cudaGraphLaunch(exec, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (getenv("GGML_CUDA_LOOP_TIMING") != nullptr) {
+        const double ms = (ggml_time_us() - t_launch) / 1000.0;
+        GGML_LOG_INFO("%s: device loop: %d iterations in %.1f ms, %.3f ms each\n", __func__, n_iter - done, ms, ms / std::max(1, n_iter - done));
+    }
     CUDA_CHECK(cudaGraphExecDestroy(exec));
     CUDA_CHECK(cudaGraphDestroy(parent));
     return 2;
