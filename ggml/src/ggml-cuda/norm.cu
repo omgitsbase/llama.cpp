@@ -673,6 +673,20 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
 }
 
+void ggml_cuda_op_l2_norm_pair(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    const ggml_tensor * src0 = a->src[0];
+
+    float eps;
+    memcpy(&eps, a->op_params, sizeof(float));
+
+    const size_t  ts0 = ggml_type_size(src0->type);
+    const int64_t s01 = src0->nb[1] / ts0;
+
+    // one grid over both ranges: a's rows first, then b's, which sit right after
+    l2_norm_f32_cuda((const float *) src0->data, (float *) a->data,
+                     a->ne[0], a->ne[1] + b->ne[1], 1, 1, s01, 0, 0, eps, ctx.stream());
+}
+
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;

@@ -2687,6 +2687,90 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+// Two L2 norms whose inputs are views of the same tensor, laid out as one
+// contiguous run of rows, with the outputs likewise adjacent. The delta-net
+// q/k normalisation is this shape in every model that has it.
+static bool ggml_cuda_should_fuse_l2_norm_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->op != GGML_OP_L2_NORM || b->op != GGML_OP_L2_NORM) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * sa = a->src[0];
+    const ggml_tensor * sb = b->src[0];
+    if (!sa->view_src || sa->view_src != sb->view_src) {
+        return false;
+    }
+    if (a->ne[0] != b->ne[0] || a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) {
+        return false;
+    }
+    if (memcmp(a->op_params, b->op_params, sizeof(float)) != 0) {
+        return false;
+    }
+    if (sa->nb[1] != sb->nb[1] || a->nb[1] != b->nb[1] || !ggml_is_contiguous_rows(a) || !ggml_is_contiguous_rows(b)) {
+        return false;
+    }
+    // b's rows follow a's directly, in the source view and in the outputs
+    const bool src_adjacent = (const char *) sb->data == (const char *) sa->data + a->ne[1]*sa->nb[1];
+    const bool dst_adjacent = (const char *)  b->data == (const char *)  a->data + a->ne[1]* a->nb[1];
+    return src_adjacent && dst_adjacent;
+}
+
+// The mixture-of-experts combine is emitted as n_expert_used - 1 chained
+// ADDs over 2D views of one [n_embd, n_expert_used, n_tokens] tensor, each
+// view one expert row further along. That is one strided row-sum. Returns
+// the number of ADD nodes in the chain (0 = no match) and the tensor whose
+// rows are summed.
+static int ggml_cuda_match_expert_sum(const ggml_cgraph * cgraph, int i, const ggml_tensor ** experts_out) {
+    const ggml_tensor * add = cgraph->nodes[i];
+    if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const ggml_tensor * v0 = add->src[0];
+    const ggml_tensor * v1 = add->src[1];
+    if (v0->op != GGML_OP_VIEW || v1->op != GGML_OP_VIEW || v0->view_src != v1->view_src) {
+        return 0;
+    }
+    const ggml_tensor * experts = v0->view_src;
+    if (experts->type != GGML_TYPE_F32 || !ggml_is_contiguous(experts) || experts->ne[3] != 1) {
+        return 0;
+    }
+    const size_t stride = experts->nb[1];
+    if (v0->view_offs != 0 || v1->view_offs != stride) {
+        return 0;
+    }
+    // each view is one expert row across all tokens
+    if (v0->ne[0] != experts->ne[0] || v0->ne[1] != experts->ne[2] || v0->nb[1] != experts->nb[2] ||
+            !ggml_are_same_shape(v0, v1) || !ggml_are_same_shape(add, v0)) {
+        return 0;
+    }
+    int n = 2; // rows summed so far
+    int last = i;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * nxt = cgraph->nodes[j];
+        if (nxt->op != GGML_OP_ADD || nxt->src[0] != cgraph->nodes[last]) {
+            break;
+        }
+        const ggml_tensor * v = nxt->src[1];
+        if (v->op != GGML_OP_VIEW || v->view_src != experts || v->view_offs != (size_t) n*stride ||
+                !ggml_are_same_shape(v, v0) || v->nb[1] != v0->nb[1]) {
+            break;
+        }
+        // the partial sum feeds only the next ADD
+        if (ggml_node_get_use_count(cgraph, last) != 1 || (cgraph->nodes[last]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        last = j;
+        n++;
+    }
+    if (n != experts->ne[1]) {
+        return 0; // a partial chain is not the full combine
+    }
+    *experts_out = experts;
+    return last - i + 1;
+}
+
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                     const ggml_tensor * mul,
                                                     const ggml_tensor * rope) {
@@ -3973,6 +4057,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // the expert combine: a chain of ADDs over one tensor's rows, as one sum
+    if (node->op == GGML_OP_ADD) {
+        const ggml_tensor * experts = nullptr;
+        const int n_adds = ggml_cuda_match_expert_sum(cgraph, i, &experts);
+        if (n_adds > 0) {
+            ggml_cuda_op_sum_expert_rows(*cuda_ctx, experts, cgraph->nodes[i + n_adds - 1], (int) experts->ne[1]);
+            return n_adds - 1;
+        }
+    }
+
+    // two l2_norms over adjacent views of one tensor (q and k after the
+    // conv in a delta-net layer): one launch covering both row ranges
+    if (node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes &&
+            ggml_cuda_should_fuse_l2_norm_pair(node, cgraph->nodes[i + 1])) {
+        ggml_cuda_op_l2_norm_pair(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -4140,6 +4242,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // a node with no elements has nothing to compute; recurrent
+                // models emit several per layer when only one sequence is live
+                if (ggml_is_empty(node)) {
                     continue;
                 }
 
