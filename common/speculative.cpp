@@ -1498,7 +1498,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // as a single graph, which saves a host round trip per drafted token.
         // backend sampling allows one output per sequence and a chained
         // round needs n_max, so the draft reads its logits back instead
-        if (!chain_heads && n_seq == 1 && this->params.n_max >= 2 &&
+        // LLAMA_NO_MTP_CHAIN=1 drafts a token per decode instead, which is what
+        // the round costs without a graph of its own: for measuring the two
+        // against each other with one binary
+        static const bool no_chain = getenv("LLAMA_NO_MTP_CHAIN") != nullptr;
+        if (!no_chain && !chain_heads && n_seq == 1 && this->params.n_max >= 2 &&
                 llama_model_has_mtp_chain(llama_get_model(ctx_dft))) {
             n_chain = this->params.n_max;
             llama_set_mtp_round_target(ctx_dft, ctx_tgt);
