@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 
 #include "llama-kv-cache-dsa.h"
 
@@ -545,37 +546,26 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 //   shared_head_norm (fallback output_norm) -> shared LM head.
 // The DSA indexer is not used at runtime (same as the trunk graph).
 llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
-    : llm_graph_context(params) {
+    : llm_graph_context(params), model(model), layer(model.layers[hparams.n_layer() + params.cparams.nextn_layer_offset]) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "GLM_DSA MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "GLM_DSA MTP currently only supports a single MTP block");
     GGML_ASSERT(hparams.is_mla() && "GLM_DSA MTP requires MLA");
-
-    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
     GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
                 cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
                 "nextn_layer_offset out of range [0, n_layer_nextn)");
-    const auto & layer = model.layers[il];
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
     GGML_ASSERT(layer.ffn_gate_inp  && "MTP block missing ffn_gate_inp");
 
-    // note: these are the actual head sizes you get when treating as MHA or after "decompression" using wv_b for MLA
-    const int64_t n_embd_head_k = hparams.n_embd_head_k_mla();
+    head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    head_w      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    head_s      = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    GGML_ASSERT(head_norm_w && "GLM_DSA MTP: missing both nextn.shared_head_norm and output_norm");
+    GGML_ASSERT(head_w      && "GLM_DSA MTP: missing LM head (nextn.shared_head_head or model.output)");
 
-    const int64_t n_embd_head_qk_rope = hparams.n_rot();
-    const int64_t n_embd_head_qk_nope = n_embd_head_k - n_embd_head_qk_rope;
-
-    const uint32_t kv_lora_rank = hparams.n_lora_kv;
-
-    // We have to pre-scale kq_scale and attn_factor to make the YaRN RoPE work correctly.
-    // See the deepseek2 trunk graph for the detailed explanation - this must match it EXACTLY.
-    GGML_ASSERT(ext_factor >= 0.0f);
-    const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
-
-    const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
-    const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k));
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
 
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
@@ -588,27 +578,97 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
 
     ggml_tensor * tok_embd;
     if (ubatch.token) {
-        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = ggml_get_rows(ctx0, embd_weights(), inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
-    cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
-
-    ggml_tensor * h_embd = inp->h;
+    ggml_tensor * h_embd = nullptr;
+    if (cparams.mtp_chain == 0) {
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+        h_embd = inp->h;
+    }
+    ggml_tensor * inp_tokens = ubatch.token ? inp->tokens : nullptr;
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     // MLA with the absorption optimization uses a K-only cache (V is a view of K)
     auto * inp_attn = build_attn_inp_k();
+
+    if (cparams.mtp_chain > 0) {
+        inp_attn_cur = inp_attn;
+        build_mtp_round(*this, llm_graph_mtp_attn_of(inp_attn), tok_embd, inp_tokens, inp_pos, cparams.mtp_chain);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * cur = build_step(inp_attn, tok_embd, h_embd, inp_pos, -1, il);
+
+    res->t_h_nextn = cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+
+    cur = build_lora_mm(head_w, cur, head_s);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+bool llama_model_glm_dsa::has_mtp_round() const {
+    return hparams.n_layer_nextn == 1;
+}
+
+ggml_tensor * llama_model_glm_dsa::graph_mtp::mtp_step(
+        ggml_tensor * tok_embd,
+        ggml_tensor * h,
+        ggml_tensor * pos,
+                int   row,
+               bool   kv_only,
+        ggml_tensor * mask) {
+    return build_step(inp_attn_cur, tok_embd, h, pos, row, hparams.n_layer() + cparams.nextn_layer_offset, kv_only, mask);
+}
+
+ggml_tensor * llama_model_glm_dsa::graph_mtp::mtp_embd_weights() const {
+    return embd_weights();
+}
+
+ggml_tensor * llama_model_glm_dsa::graph_mtp::mtp_head(ggml_tensor * h) {
+    return build_lora_mm(head_w, h, head_s);
+}
+
+ggml_tensor * llama_model_glm_dsa::graph_mtp::embd_weights() const {
+    return layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+}
+
+// the MTP block: dense MLA attention, then the MoE FFN, both as in the trunk
+ggml_tensor * llama_model_glm_dsa::graph_mtp::build_step(
+         llm_graph_input_attn_k * inp_attn,
+                    ggml_tensor * tok_embd,
+                    ggml_tensor * h_embd,
+                    ggml_tensor * inp_pos,
+                            int   step,
+                            int   il,
+                           bool   kv_only,
+                    ggml_tensor * mask_in) {
+    const int64_t n_rows = tok_embd->ne[1];
+
+    // note: these are the actual head sizes you get when treating as MHA or after "decompression" using wv_b for MLA
+    const int64_t  n_embd_head_k_mla   = hparams.n_embd_head_k_mla();
+    const int64_t  n_embd_head_qk_rope = hparams.n_rot();
+    const int64_t  n_embd_head_qk_nope = n_embd_head_k_mla - n_embd_head_qk_rope;
+    const uint32_t kv_lora_rank        = hparams.n_lora_kv;
+
+    // We have to pre-scale kq_scale and attn_factor to make the YaRN RoPE work correctly.
+    // See the deepseek2 trunk graph for the detailed explanation - this must match it EXACTLY.
+    GGML_ASSERT(ext_factor >= 0.0f);
+    const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+    const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
+    const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k_mla));
 
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -630,85 +690,73 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
     // self-attention: dense MLA, same construction as the deepseek2 trunk graph
     {
         ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
-        cb(q, "mtp_q", il);
-
         q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-        cb(q, "mtp_q", il);
-
         q = ggml_mul_mat(ctx0, layer.wq_b, q);
-        cb(q, "mtp_q", il);
 
-        // split into {n_embd_head_qk_nope, n_head, n_tokens}
+        // split into {n_embd_head_qk_nope, n_head, n_rows}
         ggml_tensor * q_nope =
-            ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens, ggml_row_size(q->type, n_embd_head_k),
-                         ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
-        cb(q_nope, "mtp_q_nope", il);
+            ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_rows, ggml_row_size(q->type, n_embd_head_k_mla),
+                         ggml_row_size(q->type, n_embd_head_k_mla) * n_head, 0);
 
-        // and {n_embd_head_qk_rope, n_head, n_tokens}
+        // and {n_embd_head_qk_rope, n_head, n_rows}
         ggml_tensor * q_pe = ggml_view_3d(
-            ctx0, q, n_embd_head_qk_rope, n_head, n_tokens, ggml_row_size(q->type, n_embd_head_k),
-            ggml_row_size(q->type, n_embd_head_k) * n_head, ggml_row_size(q->type, n_embd_head_qk_nope));
-        cb(q_pe, "mtp_q_pe", il);
+            ctx0, q, n_embd_head_qk_rope, n_head, n_rows, ggml_row_size(q->type, n_embd_head_k_mla),
+            ggml_row_size(q->type, n_embd_head_k_mla) * n_head, ggml_row_size(q->type, n_embd_head_qk_nope));
 
         ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
-        cb(kv_cmpr_pe, "mtp_kv_cmpr_pe", il);
 
-        // split into {kv_lora_rank, n_tokens}
+        // split into {kv_lora_rank, n_rows}
         ggml_tensor * kv_cmpr =
-            ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
+            ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_rows,
                          ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
-        cb(kv_cmpr, "mtp_kv_cmpr", il);
 
-        // and {n_embd_head_qk_rope, 1, n_tokens}
-        ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
+        // and {n_embd_head_qk_rope, 1, n_rows}
+        ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_rows,
                                           ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
                                           ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
                                           ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
-        cb(k_pe, "mtp_k_pe", il);
 
         q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                              ext_factor, attn_factor, beta_fast, beta_slow);
-        cb(q_pe, "mtp_q_pe", il);
-
         k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                              ext_factor, attn_factor, beta_fast, beta_slow);
-        cb(k_pe, "mtp_k_pe", il);
 
         kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
-        cb(kv_cmpr, "mtp_kv_cmpr", il);
 
-        // {n_embd_head_qk_nope, n_tokens, n_head}
+        // {n_embd_head_qk_nope, n_rows, n_head}
         q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
-        cb(q_nope, "mtp_q_nope_perm", il);
 
-        // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_tokens, n_head}
+        // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_rows, n_head}
         ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
-        cb(q_nope_absorbed, "mtp_q_nope_absorbed", il);
 
-        // {kv_lora_rank, n_head, n_tokens}
+        // {kv_lora_rank, n_head, n_rows}
         q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
-        cb(q_nope_absorbed, "mtp_q_nope_absorbed_perm", il);
 
-        // {n_embd_head_qk_rope + kv_lora_rank, n_head, n_tokens}
+        // {n_embd_head_qk_rope + kv_lora_rank, n_head, n_rows}
         // note: rope must go first for in-place context shifting in build_rope_shift()
         ggml_tensor * Qcur = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
-        cb(Qcur, "mtp_Qcur", il);
 
-        kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
-        cb(kv_cmpr, "mtp_kv_cmpr_reshape", il);
+        kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_rows);
 
-        // {n_embd_head_qk_rope + kv_lora_rank, 1, n_tokens}
+        // {n_embd_head_qk_rope + kv_lora_rank, 1, n_rows}
         ggml_tensor * Kcur = ggml_concat(ctx0, kv_cmpr, k_pe, 0);
-        cb(Kcur, "mtp_Kcur", il);
 
-        // {kv_lora_rank, 1, n_tokens}
+        // {kv_lora_rank, 1, n_rows}
         ggml_tensor * Vcur = kv_cmpr;
-        cb(Vcur, "mtp_Vcur", il);
 
         // note: MLA with the absorption optimization converts into MQA (ie: GQA with 1 group)
-        cur = build_attn(inp_attn,
-                layer.wo, NULL, layer.wo_s,
-                Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale, il);
+        if (step < 0) {
+            cur = build_attn(inp_attn,
+                    layer.wo, NULL, layer.wo_s,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale, il);
+        } else {
+            cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn),
+                    layer.wo, NULL, layer.wo_s,
+                    Qcur, Kcur, Vcur, layer.wv_b, kq_scale, il, step, kv_only, mask_in);
+            if (!cur) {
+                return nullptr;
+            }
+        }
         cb(cur, "mtp_attn_out", il);
     }
 
@@ -737,7 +785,6 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
         layer.ffn_down_exps_s);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
-    // FFN shared expert
     ggml_tensor * ffn_shexp =
         build_ffn(cur,
             layer.ffn_up_shexp, NULL, layer.ffn_up_shexp_s,
@@ -747,31 +794,10 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
     cb(ffn_shexp, "mtp_ffn_shexp", il);
 
     cur = ggml_add(ctx0, moe_out, ffn_shexp);
-    cb(cur, "mtp_ffn_out", il);
-
     cur = ggml_add(ctx0, cur, ffn_inp);
     cb(cur, "mtp_post_ffn", il);
 
     // shared_head_norm applied after the decoder block, before the shared LM head.
     // The post-norm hidden state seeds the next MTP step.
-    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
-            ? layer.nextn.shared_head_norm
-            : model.output_norm;
-    GGML_ASSERT(head_norm_w && "GLM_DSA MTP: missing both nextn.shared_head_norm and output_norm");
-    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
-
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    cb(cur, "mtp_shared_head_norm", -1);
-
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "GLM_DSA MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
-    cb(cur, "result_output", -1);
-
-    res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
+    return build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 }
