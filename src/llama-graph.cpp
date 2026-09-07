@@ -2484,6 +2484,7 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
                      ggml_tensor * q,
                      ggml_tensor * k,
                      ggml_tensor * v,
+                     ggml_tensor * v_mla,
                            float   kq_scale,
                              int   il,
                              int   row,
@@ -2508,8 +2509,15 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
     ggml_tensor * mask = mask_in ? mask_in
         : ggml_view_2d(ctx0, attn.kq_mask, attn.kq_mask->ne[0], n_rows, attn.kq_mask->nb[1], row*attn.kq_mask->nb[1]);
 
-    ggml_tensor * cur = build_attn_mha(q, mctx_cur->get_k(ctx0, il), attn.v_idxs ? mctx_cur->get_v(ctx0, il) : nullptr,
-            nullptr, mask, nullptr, nullptr, kq_scale, il);
+    ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
+
+    // a cache that holds no separate V reads it out of the K rows, as build_attn does
+    ggml_tensor * v_all = attn.v_idxs
+        ? mctx_cur->get_v(ctx0, il)
+        : ggml_view_4d(ctx0, k_all, v->ne[0], k_all->ne[1], k_all->ne[2], k_all->ne[3], k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
+
+    ggml_tensor * cur = build_attn_mha(q, k_all, v_all,
+            nullptr, mask, nullptr, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {

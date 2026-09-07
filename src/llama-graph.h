@@ -1226,6 +1226,7 @@ struct llm_graph_context {
                  ggml_tensor * q,
                  ggml_tensor * k,
                  ggml_tensor * v,
+                 ggml_tensor * v_mla,
                        float   kq_scale,
                          int   il,
                          int   row,

@@ -427,7 +427,7 @@ ggml_tensor * llama_model_mimo2::graph_mtp::build_step(
     } else {
         cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn, hparams.is_swa(il)),
                 layer.wo, nullptr, layer.wo_s,
-                Qcur, Kcur, Vcur, kq_scale, il, step, kv_only, mask_in);
+                Qcur, Kcur, Vcur, nullptr, kq_scale, il, step, kv_only, mask_in);
         if (!cur) {
             return nullptr;
         }

@@ -527,7 +527,7 @@ ggml_tensor * llama_model_step35::graph_mtp::build_step(
     } else {
         attn_out = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn, is_swa),
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_scale, il, step, kv_only, mask_in);
+                Qcur, Kcur, Vcur, nullptr, kq_scale, il, step, kv_only, mask_in);
         if (!attn_out) {
             return nullptr;
         }
