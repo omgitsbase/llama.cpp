@@ -2604,7 +2604,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (getenv("LLAMA_ROUND_TIMING") != nullptr && cgraph->n_nodes > 1000) {
+    static const bool uid_trace = getenv("LLAMA_ROUND_TIMING") != nullptr;
+    if (uid_trace && cgraph->n_nodes > 1000) {
         static int uid_hits = 0, uid_miss = 0, uid_zero = 0;
         if (cgraph->uid == 0) {
             uid_zero++;
