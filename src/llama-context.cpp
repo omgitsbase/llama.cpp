@@ -29,14 +29,17 @@
 // would remove.
 struct llama_round_timing {
     bool    on = getenv("LLAMA_ROUND_TIMING") != nullptr;
-    struct acc { double prep = 0, graph = 0, inputs = 0, launch = 0, outputs = 0, total = 0, wait = 0; int n = 0; int built = 0; int splits = 0; int copies = 0; };
+    struct acc { double prep = 0, graph = 0, inputs = 0, launch = 0, outputs = 0, total = 0, wait = 0; int n = 0; int built = 0; int splits = 0; int copies = 0; int done = 0; };
     std::map<std::pair<const void *, int>, acc> by_tokens;
     double wait_pending = 0;
     void report(const void * ctx, int n_tokens) {
         acc & a = by_tokens[{ctx, n_tokens}];
         if (a.n % 100 != 0) return;
-        fprintf(stderr, "[round] decode ctx=%p T=%d n=%d  prep %.3f  graph %.3f (built %d)  inputs %.3f  launch %.3f  outputs %.3f  total %.3f  wait-in-getters %.3f ms  splits %d copies %d\n",
-                ctx, n_tokens, a.n, a.prep / a.n, a.graph / a.n, a.built, a.inputs / a.n, a.launch / a.n, a.outputs / a.n, a.total / a.n, a.wait / a.n, a.splits, a.copies);
+        fprintf(stderr, "[round] decode ctx=%p T=%d calls %d-%d  prep %.3f  graph %.3f (built %d)  inputs %.3f  launch %.3f  outputs %.3f  total %.3f  wait-in-getters %.3f ms  splits %d copies %d\n",
+                ctx, n_tokens, a.done, a.done + a.n, a.prep / a.n, a.graph / a.n, a.built, a.inputs / a.n, a.launch / a.n, a.outputs / a.n, a.total / a.n, a.wait / a.n, a.splits, a.copies);
+        const int done = a.done + a.n;
+        a = acc{};
+        a.done = done;
     }
 };
 static llama_round_timing & llama_round_timer() { static llama_round_timing t; return t; }

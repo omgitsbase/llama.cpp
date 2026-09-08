@@ -1603,13 +1603,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 // LLAMA_ROUND_TIMING=1: host time inside the scheduler's compute, per phase
 struct sched_host_timing {
     bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
-    struct acc { double sync = 0, copy = 0, compute = 0; int n = 0; int n_inputs = 0; };
+    struct acc { double sync = 0, copy = 0, compute = 0; int n = 0; int n_inputs = 0; int total = 0; };
     std::map<const void *, acc> by_sched;
     void add(const void * key, double a, double b, double c, int inputs) {
         acc & t = by_sched[key];
         t.sync += a; t.copy += b; t.compute += c; t.n_inputs += inputs; t.n++;
         if (t.n % 100 == 0) {
-            fprintf(stderr, "[round] sched %p n=%d  input-sync %.3f  input-copy %.3f  backend-compute %.3f ms per call  inputs/call %.1f\n", key, t.n, t.sync / t.n, t.copy / t.n, t.compute / t.n, (double) t.n_inputs / t.n);
+            fprintf(stderr, "[round] sched %p calls %d-%d  input-sync %.3f  input-copy %.3f  backend-compute %.3f ms per call  inputs/call %.1f\n",
+                    key, t.total, t.total + t.n, t.sync / t.n, t.copy / t.n, t.compute / t.n, (double) t.n_inputs / t.n);
+            const int total = t.total + t.n;
+            t = acc{};
+            t.total = total;
         }
     }
 };

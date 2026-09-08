@@ -2604,6 +2604,20 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    if (getenv("LLAMA_ROUND_TIMING") != nullptr && cgraph->n_nodes > 1000) {
+        static int uid_hits = 0, uid_miss = 0, uid_zero = 0;
+        if (cgraph->uid == 0) {
+            uid_zero++;
+        } else if (cgraph->uid == graph->uid) {
+            uid_hits++;
+        } else {
+            uid_miss++;
+        }
+        if ((uid_hits + uid_miss + uid_zero) % 100 == 0) {
+            GGML_LOG_INFO("%s: graph uid: %d reused, %d changed, %d absent\n", __func__, uid_hits, uid_miss, uid_zero);
+            uid_hits = uid_miss = uid_zero = 0;
+        }
+    }
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -4733,6 +4747,19 @@ struct cuda_host_timing {
             fputc(10, stderr);
         }
     }
+    // the three scans that run before a replay: the key, the compatibility
+    // walk, and the property comparison
+    struct chk { double key = 0, compat = 0, props = 0; int n = 0; };
+    std::map<const void *, chk> checks;
+    void add_check(const void * key, double a, double b, double c) {
+        chk & k = checks[key];
+        k.key += a; k.compat += b; k.props += c; k.n++;
+        if (k.n % 100 == 0) {
+            fprintf(stderr, "[round] cuda %p   check: key %.3f  compat %.3f  props %.3f ms per call\n",
+                    key, k.key / k.n, k.compat / k.n, k.props / k.n);
+            k = chk{};
+        }
+    }
     void add(const void * key, double a, double b, bool used_graph, bool captured) {
         acc & t = by_backend[key];
         t.check += a; t.evaluate += b; t.n++; t.graphs += used_graph ? 1 : 0;
@@ -4793,7 +4820,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
 #ifdef USE_CUDA_GRAPH
+    const int64_t cht_k0 = cht.on ? ggml_time_us() : 0;
     graph_key = ggml_cuda_graph_get_key(cgraph);
+    const int64_t cht_key = cht.on ? ggml_time_us() : 0;
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -4801,8 +4830,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     graph->n_seen++;
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const int64_t cht_compat = cht.on ? ggml_time_us() : 0;
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            if (cht.on) {
+                cht.add_check(backend, (cht_key - cht_k0) / 1000.0,
+                              (cht_compat - cht_key) / 1000.0,
+                              (ggml_time_us() - cht_compat) / 1000.0);
+            }
 
             // Warming up by evaluating the graph node by node costs far more
             // than capturing it does: 31 ms against 6 on a 35B MoE here. The
