@@ -1514,6 +1514,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // against each other with one binary
         static const bool no_chain = getenv("LLAMA_NO_MTP_CHAIN") != nullptr;
         if (!no_chain && !chain_heads && n_seq == 1 && this->params.n_max >= 2 &&
+                llama_context_flash_attn(ctx_dft) &&
                 llama_model_has_mtp_chain(llama_get_model(ctx_dft))) {
             n_chain = this->params.n_max;
             llama_set_mtp_round_target(ctx_dft, ctx_tgt);

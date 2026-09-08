@@ -3823,6 +3823,10 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
 }
 
+bool llama_context_flash_attn(const llama_context * ctx) {
+    return ctx->get_cparams().flash_attn;
+}
+
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }

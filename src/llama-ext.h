@@ -132,6 +132,10 @@ LLAMA_API bool llama_decode_loop_on_device(const struct llama_context * ctx);
 // Whether the model's DECODER_MTP graph supports chained drafting.
 LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);
 
+// Whether this context runs attention through the flash-attention path. The
+// chained MTP round is written against it and cannot be built without it.
+LLAMA_API bool llama_context_flash_attn(const struct llama_context * ctx);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
