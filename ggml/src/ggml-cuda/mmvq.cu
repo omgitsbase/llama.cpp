@@ -283,6 +283,20 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // GGML_CUDA_MMVQ_MAX caps the batch this path will take, so the one below
+    // it in the dispatch order gets a turn. mul_mat_vec_q reads each weight
+    // block once and then does one integer dot product per column, so its cost
+    // climbs with the batch in a way a bandwidth-bound kernel's does not; where
+    // that crossover sits is worth measuring rather than assuming.
+    {
+        static const int cap = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_MAX");
+            return e ? atoi(e) : -1;
+        }();
+        if (cap >= 0 && ne11 > cap) {
+            return false;
+        }
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
