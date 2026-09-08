@@ -3589,6 +3589,64 @@ static int ggml_cuda_fuse_off_mask() {
     return mask;
 }
 
+
+// A residual add whose result feeds the rms_norm and weight-multiply after it,
+// which is how every transformer block starts. The add's output has two
+// readers - the norm here and the next block's residual - so it cannot be
+// treated as a dead intermediate the way a fused chain's middle is; the kernel
+// writes it as well as the normalised result. Only the contiguous,
+// same-shaped, F32 case is taken, which is the residual and nothing else.
+static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * add  = cgraph->nodes[i];
+    ggml_tensor * norm = cgraph->nodes[i + 1];
+    ggml_tensor * mul  = cgraph->nodes[i + 2];
+
+    if (add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    if (norm->src[0] != add) {
+        return 0;
+    }
+    if (mul->src[0] != norm && mul->src[1] != norm) {
+        return 0;
+    }
+    // the normalised value must go nowhere but the multiply, or skipping the
+    // node would lose a reader
+    if (ggml_node_get_use_count(cgraph, i + 1) != 1) {
+        return 0;
+    }
+
+    ggml_tensor * a = add->src[0];
+    ggml_tensor * b = add->src[1];
+    ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+    for (const ggml_tensor * t : { (const ggml_tensor *) add, (const ggml_tensor *) norm,
+                                   (const ggml_tensor *) mul, (const ggml_tensor *) a,
+                                   (const ggml_tensor *) b, (const ggml_tensor *) w }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+    }
+    // no broadcasting: the residual and the sum line up element for element,
+    // and the weight is one row reused by every row
+    if (!ggml_are_same_shape(add, a) || !ggml_are_same_shape(add, b) ||
+        !ggml_are_same_shape(add, norm) || !ggml_are_same_shape(add, mul)) {
+        return 0;
+    }
+    if (w->ne[0] != add->ne[0] || ggml_nrows(w) != 1) {
+        return 0;
+    }
+    if (add->ne[0] > 4096) {
+        return 0;
+    }
+
+    ggml_cuda_op_add_rms_norm_mul(ctx, add, norm, mul);
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3597,6 +3655,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // a residual add folded into the norm that reads it
+    if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & 256)) {
+        const int nodes_to_skip = ggml_cuda_try_add_rms_norm_mul(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {

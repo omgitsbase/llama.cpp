@@ -477,6 +477,86 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
 }
 
+
+// A residual add feeding the norm that follows it. llama.cpp already fuses the
+// mirror image, norm(x)*w + add, where the add comes after; this is the one
+// every transformer block opens with, where the add comes first. The sum is
+// written out as well as normalised because the next residual reads it, which
+// is why it cannot be folded away as a dead intermediate.
+template <int block_size>
+static __global__ void add_rms_norm_mul_f32(const float * a,
+                                            const float * b,
+                                            float *       sum_dst,
+                                            float *       dst,
+                                            const float * mul,
+                                            const int     ncols,
+                                            const float   eps) {
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    a       += row*ncols;
+    b       += row*ncols;
+    sum_dst += row*ncols;
+    dst     += row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float s = a[col] + b[col];
+        sum_dst[col] = s;
+        tmp += s*s;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * sum_dst[col] * mul[col];
+    }
+}
+
+static void add_rms_norm_mul_f32_cuda(const float * a,
+                                      const float * b,
+                                      float *       sum_dst,
+                                      float *       dst,
+                                      const float * mul,
+                                      const int     ncols,
+                                      const int     nrows,
+                                      const float   eps,
+                                      cudaStream_t  stream) {
+    const dim3 blocks_num(nrows, 1, 1);
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const size_t nbytes = block_dims.x > WARP_SIZE ? 32*sizeof(float) : 0;
+        add_rms_norm_mul_f32<256><<<blocks_num, block_dims, nbytes, stream>>>(a, b, sum_dst, dst, mul, ncols, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const size_t nbytes = block_dims.x > WARP_SIZE ? 32*sizeof(float) : 0;
+        add_rms_norm_mul_f32<1024><<<blocks_num, block_dims, nbytes, stream>>>(a, b, sum_dst, dst, mul, ncols, eps);
+    }
+}
+
+void ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx,
+                                   ggml_tensor *               add,
+                                   ggml_tensor *               norm,
+                                   ggml_tensor *               mul) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+
+    const int   ncols = add->ne[0];
+    const int   nrows = ggml_nrows(add);
+
+    add_rms_norm_mul_f32_cuda((const float *) a->data, (const float *) b->data,
+                              (float *) add->data, (float *) mul->data,
+                              (const float *) w->data, ncols, nrows, eps, ctx.stream());
+}
+
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
