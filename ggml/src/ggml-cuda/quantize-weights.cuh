@@ -11,3 +11,9 @@ extern "C" GGML_BACKEND_API size_t ggml_cuda_quantize_chunk(int type, const floa
 // Whether the call above would take this tensor, so a caller can keep its own
 // threads on the rows this file leaves to the CPU.
 extern "C" GGML_BACKEND_API bool ggml_cuda_quantize_supported(int type, int64_t n_per_row, bool has_imatrix);
+
+// The same from a source that is still quantized: the raw rows cross the bus
+// and are expanded on the device, a quarter of the traffic of sending f32.
+extern "C" GGML_BACKEND_API size_t ggml_cuda_requantize_chunk(int src_type, const void * src, int dst_type, void * dst,
+                                                              int64_t nrows, int64_t n_per_row,
+                                                              const float * imatrix);

@@ -116,6 +116,11 @@ GGML_API bool iq2xs_tables_impl(enum ggml_type type, const uint64_t ** grid, con
                                 const uint16_t ** neighbours, int * grid_size, int * map_size,
                                 int * neighbours_size);
 GGML_API void iq3xs_init_impl(int grid_size);
+
+// The IQ3 lattice tables, the counterpart of iq2xs_tables_impl.
+GGML_API bool iq3xs_tables_impl(int grid_size, const uint32_t ** grid, const int ** map,
+                                const uint16_t ** neighbours, int * grid_out, int * map_size,
+                                int * neighbours_size);
 GGML_API void iq3xs_free_impl(int grid_size);
 
 #ifdef __cplusplus

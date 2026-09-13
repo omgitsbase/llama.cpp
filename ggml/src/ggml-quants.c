@@ -3707,11 +3707,14 @@ typedef struct {
     uint32_t * grid;
     int      * map;
     uint16_t * neighbours;
+    int        grid_size;
+    int        map_size;
+    int        neighbours_size;
 } iq3_entry_t;
 
 static iq3_entry_t iq3_data[2] = {
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
+    {NULL, NULL, NULL, 0, 0, 0},
+    {NULL, NULL, NULL, 0, 0, 0},
 };
 
 static inline int iq3_data_index(int grid_size) {
@@ -3802,8 +3805,10 @@ void iq3xs_init_impl(int grid_size) {
     }
     kgrid_q3xs = the_grid;
     iq3_data[gindex].grid = the_grid;
+    iq3_data[gindex].grid_size = grid_size;
     kmap_q3xs = (int *)malloc(kmap_size*sizeof(int));
     iq3_data[gindex].map = kmap_q3xs;
+    iq3_data[gindex].map_size = kmap_size;
     for (int i = 0; i < kmap_size; ++i) kmap_q3xs[i] = -1;
     uint32_t aux32;
     uint8_t * aux8 = (uint8_t *)&aux32;
@@ -3867,6 +3872,7 @@ void iq3xs_init_impl(int grid_size) {
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q3xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq3_data[gindex].neighbours = kneighbors_q3xs;
+    iq3_data[gindex].neighbours_size = num_neighbors + num_not_in_map;
 
     int * offsets = (int *)malloc(kmap_size*sizeof(int));
     GGML_ASSERT(offsets);
@@ -3927,6 +3933,24 @@ void iq3xs_init_impl(int grid_size) {
     free(n_per_i);
 }
 
+bool iq3xs_tables_impl(int grid_size, const uint32_t ** grid, const int ** map, const uint16_t ** neighbours,
+                       int * grid_out, int * map_size, int * neighbours_size) {
+    if (grid_size != 256 && grid_size != 512) {
+        return false;
+    }
+    const iq3_entry_t * e = &iq3_data[iq3_data_index(grid_size)];
+    if (!e->grid || !e->map || !e->neighbours) {
+        return false;
+    }
+    *grid            = e->grid;
+    *map             = e->map;
+    *neighbours      = e->neighbours;
+    *grid_out        = e->grid_size;
+    *map_size        = e->map_size;
+    *neighbours_size = e->neighbours_size;
+    return true;
+}
+
 void iq3xs_free_impl(int grid_size) {
     GGML_ASSERT(grid_size == 256 || grid_size == 512);
     const int gindex = iq3_data_index(grid_size);
@@ -3934,6 +3958,7 @@ void iq3xs_free_impl(int grid_size) {
         free(iq3_data[gindex].grid);       iq3_data[gindex].grid = NULL;
         free(iq3_data[gindex].map);        iq3_data[gindex].map  = NULL;
         free(iq3_data[gindex].neighbours); iq3_data[gindex].neighbours = NULL;
+        iq3_data[gindex].grid_size = iq3_data[gindex].map_size = iq3_data[gindex].neighbours_size = 0;
     }
 }
 
