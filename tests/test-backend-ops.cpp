@@ -9106,6 +9106,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
@@ -10032,6 +10033,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Cold-read matvec: the usual cases fit in L2 and report several TB/s, which
+    // says nothing about decode, where every weight is a miss. Same inner dim as
+    // the model, enough rows that the matrix cannot stay resident.
+    if (getenv("GGML_BENCH_COLD")) {
+        for (ggml_type type_a : {GGML_TYPE_Q8_0,    GGML_TYPE_Q6_K,   GGML_TYPE_Q5_K,  GGML_TYPE_Q5_0,
+                                 GGML_TYPE_Q4_K,    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S,
+                                 GGML_TYPE_Q3_K,    GGML_TYPE_Q2_K,   GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                                 GGML_TYPE_IQ2_XS,  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 262144, 1, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  65536, 1, 8192, {1, 1}, {1, 1}));
+            // the model's own matrix shape, 128 distinct copies so each read is cold
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 1, 2048, {128, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 131072, 1, 2048, {1, 1}, {1, 1}));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

@@ -129,6 +129,13 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    # The weight quantizers reproduce ggml-quants.c block for block, so this
+    # file opts out of the -use_fast_math set above: an approximate reciprocal
+    # or a contracted multiply-add moves a scale by one ulp, which is enough to
+    # push a value across a rounding boundary and change a nibble.
+    set_source_files_properties(quantize-weights.cu PROPERTIES
+                                COMPILE_OPTIONS "-fmad=false;-prec-div=true;-prec-sqrt=true;-ftz=false")
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)

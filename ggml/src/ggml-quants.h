@@ -107,6 +107,14 @@ GGML_API size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_REST
 
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
+
+// The lattice tables the IQ2 search walks, so a backend can run that search
+// itself. Valid after ggml_quantize_init(type); false for a type that has
+// none. The neighbour list's order comes out of a qsort here, so a backend
+// must copy these rather than rebuild them if it wants the same answers.
+GGML_API bool iq2xs_tables_impl(enum ggml_type type, const uint64_t ** grid, const int ** map,
+                                const uint16_t ** neighbours, int * grid_size, int * map_size,
+                                int * neighbours_size);
 GGML_API void iq3xs_init_impl(int grid_size);
 GGML_API void iq3xs_free_impl(int grid_size);
 

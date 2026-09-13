@@ -2821,13 +2821,16 @@ typedef struct {
     uint64_t * grid;
     int      * map;
     uint16_t * neighbours;
+    int        grid_size;
+    int        map_size;
+    int        neighbours_size;
 } iq2_entry_t;
 
 static iq2_entry_t iq2_data[4] = {
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
+    {NULL, NULL, NULL, 0, 0, 0},
+    {NULL, NULL, NULL, 0, 0, 0},
+    {NULL, NULL, NULL, 0, 0, 0},
+    {NULL, NULL, NULL, 0, 0, 0},
 };
 
 static inline int iq2_data_index(enum ggml_type type) {
@@ -3126,8 +3129,10 @@ void iq2xs_init_impl(enum ggml_type type) {
     }
     kgrid_q2xs = the_grid;
     iq2_data[gindex].grid = the_grid;
+    iq2_data[gindex].grid_size = grid_size;
     kmap_q2xs = (int *)malloc(kmap_size*sizeof(int));
     iq2_data[gindex].map = kmap_q2xs;
+    iq2_data[gindex].map_size = kmap_size;
     for (int i = 0; i < kmap_size; ++i) kmap_q2xs[i] = -1;
     uint64_t aux64;
     uint8_t * aux8 = (uint8_t *)&aux64;
@@ -3197,6 +3202,7 @@ void iq2xs_init_impl(enum ggml_type type) {
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q2xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq2_data[gindex].neighbours = kneighbors_q2xs;
+    iq2_data[gindex].neighbours_size = num_neighbors + num_not_in_map;
 
     int * offsets = (int *)malloc(kmap_size*sizeof(int));
     GGML_ASSERT(offsets);
@@ -3257,6 +3263,25 @@ void iq2xs_init_impl(enum ggml_type type) {
     free(n_per_i);
 }
 
+bool iq2xs_tables_impl(enum ggml_type type, const uint64_t ** grid, const int ** map,
+                       const uint16_t ** neighbours, int * grid_size, int * map_size, int * neighbours_size) {
+    if (type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_IQ1_S &&
+        type != GGML_TYPE_IQ1_M && type != GGML_TYPE_IQ2_S) {
+        return false;
+    }
+    const iq2_entry_t * e = &iq2_data[iq2_data_index(type)];
+    if (!e->grid || !e->map || !e->neighbours) {
+        return false;
+    }
+    *grid            = e->grid;
+    *map             = e->map;
+    *neighbours      = e->neighbours;
+    *grid_size       = e->grid_size;
+    *map_size        = e->map_size;
+    *neighbours_size = e->neighbours_size;
+    return true;
+}
+
 void iq2xs_free_impl(enum ggml_type type) {
     GGML_ASSERT(type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ2_S);
     const int gindex = iq2_data_index(type);
@@ -3264,6 +3289,7 @@ void iq2xs_free_impl(enum ggml_type type) {
         free(iq2_data[gindex].grid);       iq2_data[gindex].grid = NULL;
         free(iq2_data[gindex].map);        iq2_data[gindex].map  = NULL;
         free(iq2_data[gindex].neighbours); iq2_data[gindex].neighbours = NULL;
+        iq2_data[gindex].grid_size = iq2_data[gindex].map_size = iq2_data[gindex].neighbours_size = 0;
     }
 }
 
