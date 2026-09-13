@@ -1813,12 +1813,32 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static ggml_cuda_norm_fold * ggml_cuda_norm_fold_for(ggml_backend_cuda_context & ctx, const ggml_tensor * act) {
+    if (ctx.norm_folds.empty()) {
+        return nullptr;
+    }
+    const auto it = ctx.norm_folds.find(act);
+    return it == ctx.norm_folds.end() || it->second.materialized ? nullptr : &it->second;
+}
+
+// a reader that cannot quantize the norm on the way in gets the product written out, once
+static void ggml_cuda_norm_fold_materialize(ggml_backend_cuda_context & ctx, const ggml_tensor * act) {
+    ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, act);
+    if (fold) {
+        ggml_cuda_op_rms_norm_fused(ctx, fold->norm, fold->mul);
+        fold->materialized = true;
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
+        ggml_cuda_norm_fold_materialize(ctx, src1);
+        if (ggml_cuda_op_fwht(ctx, src1, dst)) {
+            return;
+        }
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -1827,6 +1847,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        ggml_cuda_norm_fold_materialize(ctx, src1);
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -1837,6 +1858,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        ggml_cuda_norm_fold_materialize(ctx, src1);
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1851,17 +1873,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dst_vec.nb[1] = dst_vec.nb[0]*ne11;
         dst_vec.nb[2] = dst_vec.nb[1];
         dst_vec.nb[3] = dst_vec.nb[1];
+        ggml_cuda_norm_fold_materialize(ctx, src1);
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        ggml_cuda_norm_fold_materialize(ctx, src1);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst, nullptr, ggml_cuda_norm_fold_for(ctx, src1));
         return;
     }
+    ggml_cuda_norm_fold_materialize(ctx, src1);
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -3589,6 +3614,80 @@ static int ggml_cuda_fuse_off_mask() {
     return mask;
 }
 
+// a reader of the normed activation that will take the quantized vector path
+static bool ggml_cuda_norm_fold_reader_ok(const ggml_tensor * mm, const ggml_tensor * act, int cc) {
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != act || mm->src[0] == act || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    return ggml_is_quantized(src0->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm) &&
+           ggml_cuda_should_use_mmvq(src0->type, cc, act->ne[1]);
+}
+
+// rms_norm at i, its weight multiply at i+1: record the fold when every reader
+// of the product is a quantized matvec, so neither node needs a launch
+static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
+    // the readers share one quantized copy in stream order; forked streams would not see it
+    static const bool multi_stream = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
+    if (multi_stream || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * norm = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    if (mul->op != GGML_OP_MUL || mul->src[0] != norm) {
+        return false;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[1];
+    if (norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (w->ne[0] != norm->ne[0] || ggml_nelements(w) != w->ne[0] || !ggml_is_contiguous(w)) {
+        return false;
+    }
+    if ((norm->flags | mul->flags) & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1) {
+        return false;
+    }
+    const int n_uses = ggml_node_get_use_count(cgraph, i + 1);
+    if (n_uses < 1) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    int found = 0;
+    for (int j = i + 2; j < cgraph->n_nodes && found < n_uses; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            reads |= t->src[s] == mul;
+        }
+        if (!reads) {
+            continue;
+        }
+        found++;
+        if (!ggml_cuda_norm_fold_reader_ok(t, mul, cc)) {
+            return false;
+        }
+    }
+    if (found != n_uses) {
+        return false;
+    }
+
+    ggml_cuda_norm_fold fold;
+    fold.norm = norm;
+    fold.mul  = mul;
+    fold.x    = x;
+    fold.w    = w;
+    memcpy(&fold.eps, norm->op_params, sizeof(float));
+    ctx->norm_folds[mul] = fold;
+    return true;
+}
+
 
 // A residual add whose result feeds the rms_norm and weight-multiply after it,
 // which is how every transformer block starts. The add's output has two
@@ -3989,7 +4088,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
                     break;
@@ -4082,7 +4181,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
                     break;
@@ -4151,7 +4250,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
@@ -4188,7 +4287,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -4276,7 +4375,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_scale = scale;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
@@ -4341,7 +4440,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
@@ -4350,6 +4449,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // rms_norm > mul(weight) read only by quantized matvecs: neither is
+    // launched, the matvecs apply the norm while quantizing their input
+    if (node->op == GGML_OP_RMS_NORM && !(ggml_cuda_fuse_off_mask() & 256) && ggml_cuda_try_norm_fold(cuda_ctx, cgraph, i)) {
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
@@ -4635,6 +4740,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             const bool op_stats = ggml_cuda_op_stats() && !use_cuda_graph;
             if (op_stats) { ggml_cuda_op_timer_get().begin(cuda_ctx->stream()); }
+            cuda_ctx->norm_folds.clear();
+            cuda_ctx->norm_fold_order.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 // GGML_CUDA_TRACE_OPS=1: every op before its launch, for a synchronous fault hunt
@@ -4745,6 +4852,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            for (auto it = cuda_ctx->norm_fold_order.rbegin(); it != cuda_ctx->norm_fold_order.rend(); ++it) {
+                ggml_cuda_norm_fold & fold = cuda_ctx->norm_folds.at(*it);
+                cuda_ctx->pool().free(fold.q8, fold.q8_size);
+            }
+            cuda_ctx->norm_fold_order.clear();
+            cuda_ctx->norm_folds.clear();
             if (op_stats) { ggml_cuda_op_timer_get().flush(cuda_ctx->stream(), cgraph->n_nodes); }
         }
 

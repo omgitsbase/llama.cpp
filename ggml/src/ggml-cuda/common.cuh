@@ -1413,6 +1413,19 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// an rms_norm and its weight multiply left unlaunched: the quantized matvecs
+// that read the product apply the norm while quantizing their input instead
+struct ggml_cuda_norm_fold {
+    ggml_tensor *       norm = nullptr;
+    ggml_tensor *       mul  = nullptr; // its buffer stands in for the product on a path that cannot fold
+    const ggml_tensor * x    = nullptr; // the norm's input
+    const ggml_tensor * w    = nullptr; // the norm weight, one value per column
+    float eps          = 0.0f;
+    bool  materialized = false;
+    void *  q8      = nullptr; // the quantized product, made by the first reader, shared by the rest
+    size_t  q8_size = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1422,6 +1435,11 @@ struct ggml_backend_cuda_context {
     // for pending_order, and order_event is what this context offers others
     cudaEvent_t order_event   = nullptr;
     cudaEvent_t pending_order = nullptr;
+
+    // keyed by the weight-multiply node; filled while a graph is walked, cleared at its start.
+    // norm_fold_order lists the folds whose buffer was taken from the pool, which frees in reverse
+    std::unordered_map<const ggml_tensor *, ggml_cuda_norm_fold> norm_folds;
+    std::vector<const ggml_tensor *> norm_fold_order;
 
 
 
