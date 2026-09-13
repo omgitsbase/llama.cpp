@@ -3742,6 +3742,12 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
         return 0;
     }
 
+    // the fold comes first: the add alone, the norm and multiply into its readers
+    if (!(ggml_cuda_fuse_off_mask() & 256) && ggml_cuda_try_norm_fold(&ctx, cgraph, i + 1)) {
+        GGML_ASSERT(ggml_cuda_compute_forward(ctx, add));
+        return 2;
+    }
+
     ggml_cuda_op_add_rms_norm_mul(ctx, add, norm, mul);
     return 2;
 }
@@ -4851,6 +4857,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            // GGML_CUDA_TRACE_FOLD=1: how many norms this walk left unlaunched
+            static const bool trace_fold = getenv("GGML_CUDA_TRACE_FOLD") != nullptr;
+            if (trace_fold && !cuda_ctx->norm_folds.empty()) {
+                int materialized = 0;
+                for (const auto & kv : cuda_ctx->norm_folds) {
+                    materialized += kv.second.materialized;
+                }
+                fprintf(stderr, "[fold] %zu norms folded, %d of them written out anyway, in a walk of %d nodes\n",
+                        cuda_ctx->norm_folds.size(), materialized, cgraph->n_nodes);
             }
             for (auto it = cuda_ctx->norm_fold_order.rbegin(); it != cuda_ctx->norm_fold_order.rend(); ++it) {
                 ggml_cuda_norm_fold & fold = cuda_ctx->norm_folds.at(*it);
