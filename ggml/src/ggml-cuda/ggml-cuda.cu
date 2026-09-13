@@ -4502,6 +4502,39 @@ static ggml_cuda_op_timer & ggml_cuda_op_timer_get() {
     return t;
 }
 
+// GGML_CUDA_SKIP_OPS=RMS_NORM,ADD,...: launch nothing for these op types. A fused
+// run is checked on its head node only, so name every op of the group to drop
+// it whole. The output is garbage; only the wall clock means anything.
+static bool ggml_cuda_skip_op(const ggml_tensor * node) {
+    static const std::vector<std::string> ops = [] {
+        std::vector<std::string> v;
+        const char * e = getenv("GGML_CUDA_SKIP_OPS");
+        std::string s = e ? e : "";
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t j = s.find(',', i);
+            if (j == std::string::npos) {
+                j = s.size();
+            }
+            if (j > i) {
+                v.push_back(s.substr(i, j - i));
+            }
+            i = j + 1;
+        }
+        return v;
+    }();
+    if (ops.empty()) {
+        return false;
+    }
+    const char * name = node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : ggml_op_name(node->op);
+    for (const auto & o : ops) {
+        if (o == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4654,6 +4687,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // a node with no elements has nothing to compute; recurrent
                 // models emit several per layer when only one sequence is live
                 if (ggml_is_empty(node) && !(ggml_cuda_fuse_off_mask() & 1)) {
+                    continue;
+                }
+
+                if (ggml_cuda_skip_op(node)) {
                     continue;
                 }
 
