@@ -1285,23 +1285,24 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t  q8_bytes    = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * q8 = nullptr;
+    const int64_t s11_src = src1->nb[1] / ts_src1;
+    const int64_t s12_src = src1->nb[2] / ts_src1;
+    const int64_t s13_src = src1->nb[3] / ts_src1;
     if (fold) {
-        GGML_ASSERT(!ids && fold->x->type == GGML_TYPE_F32 && fold->w->type == GGML_TYPE_F32);
-        // the first reader quantizes; the graph walk frees the buffer
-        if (!fold->q8) {
-            fold->q8 = ctx.pool().alloc(q8_bytes, &fold->q8_size);
-            ctx.norm_fold_order.push_back(fold->mul);
-            const ggml_tensor * x = fold->x;
-            quantize_row_q8_1_rms_cuda((const float *) x->data, (const float *) fold->w->data, fold->eps, fold->q8,
-                ne10, x->nb[1] / ts_src1, x->nb[2] / ts_src1, x->nb[3] / ts_src1, ne10_padded, ne11, ne12, ne13, stream);
+        GGML_ASSERT(fold->x->type == GGML_TYPE_F32 && fold->w->type == GGML_TYPE_F32 && fold->q8_bytes == q8_bytes);
+        ggml_cuda_norm_fold_reserve(ctx, *fold);
+        // the first quantized reader quantizes, and writes the row factors for any float reader.
+        // src1 may be a plain view of the product, so its own strides walk the norm's input
+        if (!fold->q8_ready) {
+            quantize_row_q8_1_rms_cuda((const float *) fold->x->data, (const float *) fold->w->data, fold->eps, fold->q8, fold->scale,
+                ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, stream);
+            fold->q8_ready    = true;
+            fold->scale_ready = true;
         }
         q8 = (char *) fold->q8;
     } else {
         q8 = src1_q8_1.alloc(q8_bytes);
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, q8, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, q8, src0->type, ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

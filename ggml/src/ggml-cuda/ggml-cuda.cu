@@ -1818,7 +1818,64 @@ static ggml_cuda_norm_fold * ggml_cuda_norm_fold_for(ggml_backend_cuda_context &
         return nullptr;
     }
     const auto it = ctx.norm_folds.find(act);
-    return it == ctx.norm_folds.end() || it->second.materialized ? nullptr : &it->second;
+    return it == ctx.norm_folds.end() || it->second->materialized ? nullptr : it->second.get();
+}
+
+// GGML_CUDA_FOLD_CHECK=1 (graphs off): after a fold's factors exist, the reference
+// norm is run into the product's buffer and compared bit for bit with scale*x*w
+static void ggml_cuda_norm_fold_check(ggml_backend_cuda_context & ctx, ggml_cuda_norm_fold & fold) {
+    static const bool on = getenv("GGML_CUDA_FOLD_CHECK") != nullptr;
+    if (!on || !fold.scale_ready) {
+        return;
+    }
+    const int64_t n = ggml_nelements(fold.mul);
+    ggml_cuda_pool_alloc<float> ours(ctx.pool(), n);
+    rms_apply_cuda((const float *) fold.x->data, (const float *) fold.w->data, fold.scale, ours.get(), fold.mul->ne[0], fold.n_rows, ctx.stream());
+    ggml_cuda_op_rms_norm_fused(ctx, fold.norm, fold.mul);
+    std::vector<float> a(n), b(n), s(fold.n_rows);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    CUDA_CHECK(cudaMemcpy(a.data(), ours.get(), n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), fold.mul->data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(s.data(), fold.scale, fold.n_rows * sizeof(float), cudaMemcpyDeviceToHost));
+    int64_t bad = 0, first = -1;
+    for (int64_t i = 0; i < n; ++i) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            if (first < 0) { first = i; }
+            bad++;
+        }
+    }
+    // the fold's q8 against the plain quantization of the reference product
+    int64_t bad_q8 = -1, first_q8 = -1;
+    if (fold.q8_ready) {
+        const ggml_tensor * m = fold.mul;
+        ggml_cuda_pool_alloc<char> q8ref(ctx.pool(), fold.q8_bytes);
+        quantize_row_q8_1_cuda((const float *) m->data, nullptr, q8ref.get(), GGML_TYPE_Q8_0, m->ne[0],
+            m->nb[1] / sizeof(float), m->nb[2] / sizeof(float), m->nb[3] / sizeof(float),
+            GGML_PAD(m->ne[0], MATRIX_ROW_PADDING), m->ne[1], m->ne[2], m->ne[3], ctx.stream());
+        std::vector<char> qa(fold.q8_bytes), qb(fold.q8_bytes);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        CUDA_CHECK(cudaMemcpy(qa.data(), fold.q8, fold.q8_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(qb.data(), q8ref.get(), fold.q8_bytes, cudaMemcpyDeviceToHost));
+        bad_q8 = 0;
+        for (size_t i = 0; i < fold.q8_bytes; ++i) {
+            if (qa[i] != qb[i]) {
+                if (first_q8 < 0) { first_q8 = (int64_t) i; }
+                bad_q8++;
+            }
+        }
+    }
+    fprintf(stderr, "[fold-check] %s: product %lld of %lld differ%s; q8 %lld bytes differ%s; scale[0]=%.9g\n", fold.norm->name,
+            (long long) bad, (long long) n,
+            first < 0 ? "" : (" first at " + std::to_string(first) + ": ours " + std::to_string(a[first]) + " ref " + std::to_string(b[first])).c_str(),
+            (long long) bad_q8, first_q8 < 0 ? "" : (" first at byte " + std::to_string(first_q8)).c_str(), s[0]);
+}
+
+// the check right after a reader, while the norm's input is still live
+static void ggml_cuda_norm_fold_check_at(ggml_backend_cuda_context & ctx, const ggml_tensor * act) {
+    ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, act);
+    if (fold) {
+        ggml_cuda_norm_fold_check(ctx, *fold);
+    }
 }
 
 // a reader that cannot quantize the norm on the way in gets the product written out, once
@@ -1858,8 +1915,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_norm_fold_materialize(ctx, src1);
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst, nullptr, ggml_cuda_norm_fold_for(ctx, src1)); ggml_cuda_norm_fold_check_at(ctx, src1);
         return;
     }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
@@ -1883,7 +1939,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst, nullptr, ggml_cuda_norm_fold_for(ctx, src1));
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst, nullptr, ggml_cuda_norm_fold_for(ctx, src1)); ggml_cuda_norm_fold_check_at(ctx, src1);
         return;
     }
     ggml_cuda_norm_fold_materialize(ctx, src1);
@@ -1944,17 +2000,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, nullptr, ggml_cuda_norm_fold_for(ctx, src1)); ggml_cuda_norm_fold_check_at(ctx, src1);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    ggml_cuda_norm_fold_materialize(ctx, src1);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
             }
         }
 
+        ggml_cuda_norm_fold_materialize(ctx, src1);
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -1968,6 +2026,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+    ggml_cuda_norm_fold_materialize(ctx, src1);
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -3614,17 +3673,34 @@ static int ggml_cuda_fuse_off_mask() {
     return mask;
 }
 
-// a reader of the normed activation that will take the quantized vector path
+// a reader of the normed activation that will take a vector path: quantized
+// weights through mmvq (experts included), float weights through mmvf on a
+// plain 2-D activation
 static bool ggml_cuda_norm_fold_reader_ok(const ggml_tensor * mm, const ggml_tensor * act, int cc) {
-    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != act || mm->src[0] == act || mm->type != GGML_TYPE_F32) {
+    if ((mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID) || mm->src[1] != act || mm->src[0] == act || mm->type != GGML_TYPE_F32) {
         return false;
     }
     if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return false;
     }
     const ggml_tensor * src0 = mm->src[0];
-    return ggml_is_quantized(src0->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm) &&
-           ggml_cuda_should_use_mmvq(src0->type, cc, act->ne[1]);
+    if (src0->buffer == nullptr) {
+        return false;
+    }
+    if (mm->op == GGML_OP_MUL_MAT_ID) {
+        return !(ggml_cuda_fuse_off_mask() & 1024) && ggml_is_quantized(src0->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm);
+    }
+    if (ggml_is_quantized(src0->type)) {
+        return ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_cuda_should_use_mmvq(src0->type, cc, act->ne[1]);
+    }
+    if (ggml_cuda_fuse_off_mask() & 512) {
+        return false;
+    }
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+           !bad_padding_clear && act->ne[2] == 1 && act->ne[3] == 1 &&
+           ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, act->ne[1]);
 }
 
 // rms_norm at i, its weight multiply at i+1: record the fold when every reader
@@ -3648,6 +3724,10 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     if (w->ne[0] != norm->ne[0] || ggml_nelements(w) != w->ne[0] || !ggml_is_contiguous(w)) {
         return false;
     }
+    // readers take the norm's input through the product's strides
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(x, mul)) {
+        return false;
+    }
     if ((norm->flags | mul->flags) & GGML_TENSOR_FLAG_OUTPUT) {
         return false;
     }
@@ -3659,6 +3739,9 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
         return false;
     }
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    // a plain view of the product (the experts read it reshaped) is a reader
+    // when everything reading the view qualifies; it then shares the record
+    std::vector<const ggml_tensor *> views;
     int found = 0;
     for (int j = i + 2; j < cgraph->n_nodes && found < n_uses; ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
@@ -3670,22 +3753,124 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
             continue;
         }
         found++;
-        if (!ggml_cuda_norm_fold_reader_ok(t, mul, cc)) {
+        if (ggml_cuda_norm_fold_reader_ok(t, mul, cc)) {
+            continue;
+        }
+        const bool plain_view = (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src == mul && t->view_offs == 0 &&
+                                t->type == mul->type && ggml_is_contiguous(t) && ggml_nelements(t) == ggml_nelements(mul);
+        if (!plain_view || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return false;
         }
+        const int n_uses_v = ggml_node_get_use_count(cgraph, j);
+        int found_v = 0;
+        for (int k = j + 1; k < cgraph->n_nodes && found_v < n_uses_v; ++k) {
+            const ggml_tensor * u = cgraph->nodes[k];
+            bool reads_v = false;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                reads_v |= u->src[s] == t;
+            }
+            if (!reads_v) {
+                continue;
+            }
+            found_v++;
+            if (!ggml_cuda_norm_fold_reader_ok(u, t, cc)) {
+                return false;
+            }
+        }
+        if (found_v != n_uses_v || n_uses_v < 1) {
+            return false;
+        }
+        views.push_back(t);
     }
     if (found != n_uses) {
         return false;
     }
 
-    ggml_cuda_norm_fold fold;
-    fold.norm = norm;
-    fold.mul  = mul;
-    fold.x    = x;
-    fold.w    = w;
-    memcpy(&fold.eps, norm->op_params, sizeof(float));
+    auto fold = std::make_shared<ggml_cuda_norm_fold>();
+    fold->norm     = norm;
+    fold->mul      = mul;
+    fold->x        = x;
+    fold->w        = w;
+    fold->n_rows   = ggml_nrows(mul);
+    fold->q8_bytes = fold->n_rows * (GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
+    memcpy(&fold->eps, norm->op_params, sizeof(float));
     ctx->norm_folds[mul] = fold;
+    for (const ggml_tensor * v : views) {
+        ctx->norm_folds[v] = fold;
+    }
+    // GGML_CUDA_FOLD_TRACE_ALIAS=1: every other tensor whose bytes lie inside the product's buffer
+    static const bool trace_alias = getenv("GGML_CUDA_FOLD_TRACE_ALIAS") != nullptr;
+    if (trace_alias) {
+        const char * lo = (const char *) mul->data;
+        const char * hi = lo + ggml_nbytes(mul);
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            const char * d = (const char *) t->data;
+            if (t == mul || t == norm || !d || d >= hi || d + ggml_nbytes(t) <= lo || (t->view_src == mul)) {
+                continue;
+            }
+            fprintf(stderr, "[fold-alias] %s: node %d %s (%s) at +%lld, %s\n", norm->name, j, ggml_op_name(t->op), t->name,
+                    (long long) (d - lo), j < i ? "earlier" : "later");
+        }
+    }
     return true;
+}
+
+// GGML_CUDA_FOLD_DIAG=1: a recorded fold is written out at once, so every reader takes
+// its usual path and only the split of the residual add from the norm remains to differ.
+// GGML_CUDA_FOLD_DIAG2=1: written out as well, but the readers keep the fold path, which
+// separates "a reader is wrong" from "something unseen reads the product's buffer"
+static bool ggml_cuda_norm_fold_diag() {
+    static const bool diag = getenv("GGML_CUDA_FOLD_DIAG") != nullptr;
+    return diag;
+}
+
+static void ggml_cuda_norm_fold_diag2(ggml_backend_cuda_context & ctx, const ggml_tensor * act) {
+    static const bool diag2 = getenv("GGML_CUDA_FOLD_DIAG2") != nullptr;
+    ggml_cuda_norm_fold * fold = diag2 ? ggml_cuda_norm_fold_for(ctx, act) : nullptr;
+    if (fold) {
+        ggml_cuda_op_rms_norm_fused(ctx, fold->norm, fold->mul);
+    }
+    // GGML_CUDA_FOLD_POISON=1 (graphs off): the unwritten product filled with NaN, so
+    // whatever reads it shows up as the first node whose output turns NaN
+    static const bool poison = getenv("GGML_CUDA_FOLD_POISON") != nullptr;
+    ggml_cuda_norm_fold * pf = poison ? ggml_cuda_norm_fold_for(ctx, act) : nullptr;
+    if (pf) {
+        CUDA_CHECK(cudaMemsetAsync(pf->mul->data, 0xFF, ggml_nbytes(pf->mul), ctx.stream()));
+        if (pf->norm->data != pf->mul->data) {
+            CUDA_CHECK(cudaMemsetAsync(pf->norm->data, 0xFF, ggml_nbytes(pf->norm), ctx.stream()));
+        }
+    }
+}
+
+static bool ggml_cuda_norm_fold_poison() {
+    static const bool poison = getenv("GGML_CUDA_FOLD_POISON") != nullptr;
+    return poison;
+}
+
+// after a node ran: does its output hold NaN (the poisoned product leaking through)?
+static void ggml_cuda_norm_fold_poison_scan(ggml_backend_cuda_context & ctx, const ggml_tensor * node, int i) {
+    if (!ggml_cuda_norm_fold_poison() || ctx.norm_folds.empty() || node->type != GGML_TYPE_F32 || !node->data) {
+        return;
+    }
+    const int64_t n = ggml_nelements(node);
+    if (n > (1 << 22)) {
+        return;
+    }
+    std::vector<float> h(n);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    CUDA_CHECK(cudaMemcpy(h.data(), node->data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    int64_t bad = 0;
+    for (int64_t k = 0; k < n; ++k) {
+        bad += h[k] != h[k];
+    }
+    if (bad) {
+        fprintf(stderr, "[fold-poison] node %d %s (%s): %lld of %lld NaN; srcs:", i, ggml_op_name(node->op), node->name, (long long) bad, (long long) n);
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+            fprintf(stderr, " %s", node->src[s]->name);
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 
@@ -3745,6 +3930,10 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
     // the fold comes first: the add alone, the norm and multiply into its readers
     if (!(ggml_cuda_fuse_off_mask() & 256) && ggml_cuda_try_norm_fold(&ctx, cgraph, i + 1)) {
         GGML_ASSERT(ggml_cuda_compute_forward(ctx, add));
+        if (ggml_cuda_norm_fold_diag()) {
+            ggml_cuda_norm_fold_materialize(ctx, mul);
+        }
+        ggml_cuda_norm_fold_diag2(ctx, mul);
         return 2;
     }
 
@@ -4094,7 +4283,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
                     break;
@@ -4187,7 +4376,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
                     break;
@@ -4243,7 +4432,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
@@ -4256,7 +4445,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
@@ -4282,7 +4471,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -4293,7 +4482,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -4381,7 +4570,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_scale = scale;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
@@ -4439,14 +4628,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
-            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1));
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data, ggml_cuda_norm_fold_for(*cuda_ctx, src1)); ggml_cuda_norm_fold_check_at(*cuda_ctx, src1);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
@@ -4460,6 +4649,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // rms_norm > mul(weight) read only by quantized matvecs: neither is
     // launched, the matvecs apply the norm while quantizing their input
     if (node->op == GGML_OP_RMS_NORM && !(ggml_cuda_fuse_off_mask() & 256) && ggml_cuda_try_norm_fold(cuda_ctx, cgraph, i)) {
+        if (ggml_cuda_norm_fold_diag()) {
+            ggml_cuda_norm_fold_materialize(*cuda_ctx, cgraph->nodes[i + 1]);
+        }
+        ggml_cuda_norm_fold_diag2(*cuda_ctx, cgraph->nodes[i + 1]);
         return 1;
     }
 
@@ -4807,6 +5000,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // GGML_CUDA_FOLD_TRACE_READERS=1: any node that touches a folded product other
+                // than through a matvec is named, since it would be reading an unwritten buffer
+                static const bool trace_readers = getenv("GGML_CUDA_FOLD_TRACE_READERS") != nullptr;
+                if (trace_readers && !cuda_ctx->norm_folds.empty()) {
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        const ggml_tensor * src = node->src[s];
+                        if (!src) {
+                            continue;
+                        }
+                        const ggml_tensor * base = src->view_src ? src->view_src : src;
+                        for (const auto & kv : cuda_ctx->norm_folds) {
+                            if ((src == kv.first || base == kv.second->mul || base == kv.second->norm) &&
+                                    node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_RESHAPE && node->op != GGML_OP_VIEW) {
+                                fprintf(stderr, "[fold-reader] node %d %s (%s) reads fold %s through src%d %s\n", i, ggml_op_name(node->op), node->name,
+                                        kv.second->norm->name, s, src->name);
+                            }
+                        }
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 // GGML_CUDA_TRACE_LAUNCH=1: what the graph actually launches,
@@ -4827,6 +5040,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
                     if (op_stats) { ggml_cuda_op_timer_get().mark(cuda_ctx->stream(), node, nodes_to_skip + 1); }
+                    ggml_cuda_norm_fold_poison_scan(*cuda_ctx, cgraph->nodes[i + nodes_to_skip], i + nodes_to_skip);
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4852,6 +5066,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                ggml_cuda_norm_fold_poison_scan(*cuda_ctx, node, i);
                 if (op_stats) { ggml_cuda_op_timer_get().mark(cuda_ctx->stream(), node, 0); }
 
                 if (!is_concurrent_event_active) {
@@ -4861,16 +5076,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // GGML_CUDA_TRACE_FOLD=1: how many norms this walk left unlaunched
             static const bool trace_fold = getenv("GGML_CUDA_TRACE_FOLD") != nullptr;
             if (trace_fold && !cuda_ctx->norm_folds.empty()) {
-                int materialized = 0;
+                int folded = 0, materialized = 0;
                 for (const auto & kv : cuda_ctx->norm_folds) {
-                    materialized += kv.second.materialized;
+                    if (kv.first == kv.second->mul) {
+                        folded++;
+                        materialized += kv.second->materialized;
+                    }
                 }
-                fprintf(stderr, "[fold] %zu norms folded, %d of them written out anyway, in a walk of %d nodes\n",
-                        cuda_ctx->norm_folds.size(), materialized, cgraph->n_nodes);
+                fprintf(stderr, "[fold] %d norms folded, %d of them written out anyway, in a walk of %d nodes\n",
+                        folded, materialized, cgraph->n_nodes);
             }
             for (auto it = cuda_ctx->norm_fold_order.rbegin(); it != cuda_ctx->norm_fold_order.rend(); ++it) {
-                ggml_cuda_norm_fold & fold = cuda_ctx->norm_folds.at(*it);
-                cuda_ctx->pool().free(fold.q8, fold.q8_size);
+                cuda_ctx->pool().free((*it)->q8, (*it)->q8_size);
             }
             cuda_ctx->norm_fold_order.clear();
             cuda_ctx->norm_folds.clear();

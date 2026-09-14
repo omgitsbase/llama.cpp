@@ -562,7 +562,7 @@ static __global__ void quantize_mmq_q8_1(
 template <int block_size>
 __launch_bounds__(block_size, 1)
 static __global__ void quantize_q8_1_rms(
-        const float * __restrict__ x, const float * __restrict__ w, const float eps, void * __restrict__ vy,
+        const float * __restrict__ x, const float * __restrict__ w, const float eps, void * __restrict__ vy, float * __restrict__ scale_out,
         const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int ne0, const int ne1, const uint3 ne2) {
     ggml_cuda_pdl_lc();
@@ -571,9 +571,10 @@ static __global__ void quantize_q8_1_rms(
     const int i3  = fastdiv(blockIdx.z, ne2);
     const int i2  = blockIdx.z - i3*ne2.z;
     const int tid = threadIdx.x;
+    const int64_t row = ((int64_t) i3*ne2.z + i2) * ne1 + i1;
 
     x += i3*s03 + i2*s02 + i1*s01;
-    block_q8_1 * y = (block_q8_1 *) vy + (((int64_t) i3*ne2.z + i2) * ne1 + i1) * (ne0 / QK8_1);
+    block_q8_1 * y = (block_q8_1 *) vy + row * (ne0 / QK8_1);
 
     ggml_cuda_pdl_sync();
     float tmp = 0.0f;
@@ -584,8 +585,11 @@ static __global__ void quantize_q8_1_rms(
     __shared__ float s_sum[32];
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
-    const float mean  = tmp / ne00;
-    const float scale = rsqrtf(mean + eps);
+    const float scale = ggml_cuda_rms_scale(tmp, ne00, eps);
+
+    if (scale_out && blockIdx.x == 0 && tid == 0) {
+        scale_out[row] = scale;
+    }
 
     const int lane = tid % WARP_SIZE;
     const int ib   = blockIdx.x*nwarps + tid / WARP_SIZE;
@@ -610,7 +614,7 @@ static __global__ void quantize_q8_1_rms(
 }
 
 void quantize_row_q8_1_rms_cuda(
-        const float * x, const float * w, const float eps, void * vy,
+        const float * x, const float * w, const float eps, void * vy, float * scale_out,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
@@ -621,11 +625,71 @@ void quantize_row_q8_1_rms_cuda(
     if (ne00 < 1024) {
         const dim3 num_blocks((nblk + 8 - 1) / 8, ne1, ne2*ne3);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(256, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(quantize_q8_1_rms<256>, launch_params, x, w, eps, vy, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv);
+        ggml_cuda_kernel_launch(quantize_q8_1_rms<256>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv);
     } else {
         const dim3 num_blocks((nblk + 32 - 1) / 32, ne1, ne2*ne3);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(1024, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(quantize_q8_1_rms<1024>, launch_params, x, w, eps, vy, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv);
+        ggml_cuda_kernel_launch(quantize_q8_1_rms<1024>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv);
+    }
+}
+
+static __global__ void rms_apply(const float * __restrict__ x, const float * __restrict__ w, const float * __restrict__ scale,
+                                 float * __restrict__ dst, const int ne00) {
+    const int64_t row = blockIdx.y;
+    const int     col = blockIdx.x*blockDim.x + threadIdx.x;
+    if (col >= ne00) {
+        return;
+    }
+    dst[row*ne00 + col] = scale[row] * x[row*ne00 + col] * w[col];
+}
+
+void rms_apply_cuda(const float * x, const float * w, const float * scale, float * dst, const int64_t ne00, const int64_t n_rows, cudaStream_t stream) {
+    const dim3 blocks((ne00 + 255) / 256, n_rows, 1);
+    rms_apply<<<blocks, 256, 0, stream>>>(x, w, scale, dst, (int) ne00);
+}
+
+// the factor alone: one block per row, rms_norm_f32's loop and block size
+template <int block_size>
+__launch_bounds__(block_size, 1)
+static __global__ void rms_scale(
+        const float * __restrict__ x, const float eps, float * __restrict__ scale_out,
+        const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int ne1, const uint3 ne2) {
+    ggml_cuda_pdl_lc();
+    const int i1  = blockIdx.x;
+    const int i3  = fastdiv(blockIdx.y, ne2);
+    const int i2  = blockIdx.y - i3*ne2.z;
+    const int tid = threadIdx.x;
+
+    x += i3*s03 + i2*s02 + i1*s01;
+
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = tid; col < ne00; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    if (tid == 0) {
+        scale_out[((int64_t) i3*ne2.z + i2) * ne1 + i1] = ggml_cuda_rms_scale(tmp, ne00, eps);
+    }
+}
+
+void rms_scale_cuda(
+        const float * x, const float eps, float * scale_out,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+    const dim3  num_blocks(ne1, ne2*ne3, 1);
+
+    if (ne00 < 1024) {
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(256, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(rms_scale<256>, launch_params, x, eps, scale_out, (int) ne00, s01, s02, s03, (int) ne1, ne2_fastdiv);
+    } else {
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(1024, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(rms_scale<1024>, launch_params, x, eps, scale_out, (int) ne00, s01, s02, s03, (int) ne1, ne2_fastdiv);
     }
 }
 

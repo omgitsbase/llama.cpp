@@ -1413,6 +1413,12 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// the rms_norm factor from a row's sum of squares, with the division and the
+// add pinned so every kernel that derives it agrees to the bit
+static __device__ __forceinline__ float ggml_cuda_rms_scale(const float sum_sq, const int ncols, const float eps) {
+    return rsqrtf(__fadd_rn(__fdiv_rn(sum_sq, (float) ncols), eps));
+}
+
 // an rms_norm and its weight multiply left unlaunched: the quantized matvecs
 // that read the product apply the norm while quantizing their input instead
 struct ggml_cuda_norm_fold {
@@ -1422,8 +1428,14 @@ struct ggml_cuda_norm_fold {
     const ggml_tensor * w    = nullptr; // the norm weight, one value per column
     float eps          = 0.0f;
     bool  materialized = false;
-    void *  q8      = nullptr; // the quantized product, made by the first reader, shared by the rest
-    size_t  q8_size = 0;
+    // one pool buffer taken by the first reader: the quantized product, then one scale per row
+    void *  q8          = nullptr;
+    float * scale       = nullptr;
+    size_t  q8_bytes    = 0;
+    int64_t n_rows      = 0;
+    size_t  q8_size     = 0;
+    bool    q8_ready    = false;
+    bool    scale_ready = false;
 };
 
 struct ggml_backend_cuda_context {
@@ -1436,10 +1448,11 @@ struct ggml_backend_cuda_context {
     cudaEvent_t order_event   = nullptr;
     cudaEvent_t pending_order = nullptr;
 
-    // keyed by the weight-multiply node; filled while a graph is walked, cleared at its start.
-    // norm_fold_order lists the folds whose buffer was taken from the pool, which frees in reverse
-    std::unordered_map<const ggml_tensor *, ggml_cuda_norm_fold> norm_folds;
-    std::vector<const ggml_tensor *> norm_fold_order;
+    // keyed by the weight-multiply node and by any plain view of it; filled while a graph is
+    // walked, cleared at its start. norm_fold_order lists the records whose buffer was taken
+    // from the pool, which frees in reverse
+    std::unordered_map<const ggml_tensor *, std::shared_ptr<ggml_cuda_norm_fold>> norm_folds;
+    std::vector<ggml_cuda_norm_fold *> norm_fold_order;
 
 
 
@@ -1551,6 +1564,15 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// the fold's buffer comes from the pool on first use; the graph walk frees it in reverse order
+static inline void ggml_cuda_norm_fold_reserve(ggml_backend_cuda_context & ctx, ggml_cuda_norm_fold & fold) {
+    if (!fold.q8) {
+        fold.q8    = ctx.pool().alloc(fold.q8_bytes + fold.n_rows * sizeof(float), &fold.q8_size);
+        fold.scale = (float *) ((char *) fold.q8 + fold.q8_bytes);
+        ctx.norm_fold_order.push_back(&fold);
+    }
+}
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1560,6 +1582,9 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_glu_op glu_op;
 };
 struct ggml_cuda_mm_fusion_args_device {
+    // the norm fold: y is the pre-norm activation, scaled by norm_scale[row] and norm_w[col] on the way in
+    const float * norm_w = nullptr;
+    const float * norm_scale = nullptr;
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;

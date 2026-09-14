@@ -3,6 +3,20 @@
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
+
+// the norm fold: y is the pre-norm activation, and scale*y*w is the standalone
+// norm's own expression, so the product is bit-identical to reading its output
+static __device__ __forceinline__ float2 mmvf_load_y(const float2 * y2, const float2 * w2, const float * scale, const int idx, const int col2, const int j) {
+    float2 v = y2[idx];
+    if (scale) {
+        const float2 w = w2[col2];
+        const float  s = scale[j];
+        v.x = s * v.x * w.x;
+        v.y = s * v.y * w.y;
+    }
+    return v;
+}
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -94,7 +108,9 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
-    const float2 * y2 = (const float2 *) y;
+    const float2 * y2     = (const float2 *) y;
+    const float2 * w2     = (const float2 *) fusion.norm_w;
+    const float  * nscale = fusion.norm_scale;
 
     extern __shared__ char data_mmv[];
     float * buf_iw = (float *) data_mmv;
@@ -144,7 +160,7 @@ static __global__ void mul_mat_vec_f(
 
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                const float2 tmpy = mmvf_load_y(y2, w2, nscale, j*stride_col_y2 + col2, col2, j);
                 ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                 ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -176,7 +192,7 @@ static __global__ void mul_mat_vec_f(
                 }
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    const float2 tmpy = mmvf_load_y(y2, w2, nscale, j*stride_col_y2 + col2, col2, j);
                     ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                     ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -203,7 +219,7 @@ static __global__ void mul_mat_vec_f(
                 }
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    const float2 tmpy = mmvf_load_y(y2, w2, nscale, j*stride_col_y2 + col2, col2, j);
                     sumh2[j] += tmpx * make_half2(tmpy.x, tmpy.y);
 
                     if constexpr (has_fusion) {
@@ -251,7 +267,7 @@ static __global__ void mul_mat_vec_f(
             }
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                const float2 tmpy = mmvf_load_y(y2, w2, nscale, j*stride_col_y2 + col2, col2, j);
                 const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
                 const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
                 ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
@@ -285,7 +301,7 @@ static __global__ void mul_mat_vec_f(
             }
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                const float2 tmpy = mmvf_load_y(y2, w2, nscale, j*stride_col_y2 + col2, col2, j);
                 ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
                 ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
 
@@ -627,7 +643,7 @@ static void mul_mat_vec_f_cuda(
 }
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-    const ggml_cuda_mm_fusion_args_host * fusion) {
+    const ggml_cuda_mm_fusion_args_host * fusion, ggml_cuda_norm_fold * fold) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
@@ -654,6 +670,27 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+
+    // the fold: src1 was never written; read its norm input with the norm applied on the way in
+    if (fold) {
+        GGML_ASSERT(!ids && ne12 == 1 && ne13 == 1 && fold->x->type == GGML_TYPE_F32 && fold->w->type == GGML_TYPE_F32);
+        ggml_cuda_norm_fold_reserve(ctx, *fold);
+        if (!fold->scale_ready) {
+            const ggml_tensor * x = fold->x;
+            rms_scale_cuda((const float *) x->data, fold->eps, fold->scale,
+                ne10, x->nb[1] / ts_src1, x->nb[2] / ts_src1, x->nb[3] / ts_src1, ne11, ne12, ne13, ctx.stream());
+            fold->scale_ready = true;
+        }
+        // GGML_CUDA_FOLD_FLOAT_MATERIALIZE=1: the product written out and read as before, to bisect the in-kernel path
+        static const bool materialize_float = getenv("GGML_CUDA_FOLD_FLOAT_MATERIALIZE") != nullptr;
+        if (materialize_float) {
+            rms_apply_cuda((const float *) fold->x->data, (const float *) fold->w->data, fold->scale, (float *) fold->mul->data, ne10, ne11, ctx.stream());
+        } else {
+            src1_d                  = (const float *) fold->x->data;
+            fusion_local.norm_w     = (const float *) fold->w->data;
+            fusion_local.norm_scale = fold->scale;
+        }
+    }
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);

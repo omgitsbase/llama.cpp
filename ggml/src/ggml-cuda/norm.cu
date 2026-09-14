@@ -138,8 +138,7 @@ static __global__ void rms_norm_f32(const float * x,
     extern __shared__ float s_sum[];
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
-    const float mean = tmp / ncols;
-    const float scale = rsqrtf(mean + eps) * out_scale;
+    const float scale = ggml_cuda_rms_scale(tmp, ncols, eps) * out_scale;
 
     for (int col = tid; col < ncols; col += block_size) {
         if constexpr (do_multiply && do_add) {
@@ -509,7 +508,7 @@ static __global__ void add_rms_norm_mul_f32(const float * a,
     extern __shared__ float s_sum[];
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
-    const float scale = rsqrtf(tmp / ncols + eps);
+    const float scale = ggml_cuda_rms_scale(tmp, ncols, eps);
 
     for (int col = tid; col < ncols; col += block_size) {
         dst[col] = scale * sum_dst[col] * mul[col];

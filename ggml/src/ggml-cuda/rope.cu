@@ -713,7 +713,7 @@ static __global__ void rms_norm_mul_rope_f32(
     extern __shared__ float s_sum[];
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
-    const float scale = rsqrtf(tmp/ncols + eps);
+    const float scale = ggml_cuda_rms_scale(tmp, ncols, eps);
 
     int64_t idst = sample*s3 + channel*s2 + row*s1;
     if (set_rows_stride != 0) {

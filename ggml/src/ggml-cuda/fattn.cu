@@ -1,5 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+
+#include <cstring>
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -457,8 +459,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // GGML_CUDA_FA_FORCE=mma|vec: the choice below overridden, for measuring the two at decode
+    static const char * force = getenv("GGML_CUDA_FA_FORCE");
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if (force && strcmp(force, "mma") == 0) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        if (force && strcmp(force, "vec") == 0 && can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {

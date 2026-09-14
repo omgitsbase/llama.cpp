@@ -7,11 +7,20 @@
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
 
-// quantize_row_q8_1 with rms_norm(x) * w applied on the way in
+// quantize_row_q8_1 with rms_norm(x) * w applied on the way in; scale_out, if given, receives each row's factor
 void quantize_row_q8_1_rms_cuda(
-        const float * x, const float * w, float eps, void * vy,
+        const float * x, const float * w, float eps, void * vy, float * scale_out,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+// scale[row] * x * w written out, contiguous rows
+void rms_apply_cuda(const float * x, const float * w, const float * scale, float * dst, int64_t ne00, int64_t n_rows, cudaStream_t stream);
+
+// each row's rms_norm factor alone, computed exactly as rms_norm_f32 does
+void rms_scale_cuda(
+        const float * x, float eps, float * scale_out,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 #define CUDA_QUANTIZE_BLOCK_SIZE_MMQ 128
 
 static_assert(MATRIX_ROW_PADDING %    CUDA_QUANTIZE_BLOCK_SIZE      == 0, "Risk of out-of-bounds access.");

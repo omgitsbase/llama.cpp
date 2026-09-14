@@ -10048,6 +10048,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 1, 2048, {128, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 131072, 1, 2048, {1, 1}, {1, 1}));
+
+        // Qwen3.6-35B-A3B's expert matvecs at decode: 8 of 256 experts, one token, then a verify batch of four
+        for (int64_t n_tokens : {1, 4}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 256, 8, true,  512, n_tokens, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 8, true, 2048, n_tokens,  512));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K,    GGML_TYPE_F32, 256, 8, true,  512, n_tokens, 2048));
+        }
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
@@ -10259,6 +10266,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // decode attention as the served models issue it: gemma-4 E4B (8 heads over 2), Qwen3.6-A3B (16 over 2), Qwen3.8-27B (24 over 4), head size 256
+    for (int64_t kv : {256, 1024, 4096}) {
+        for (int64_t nb : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256,  8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 24, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
