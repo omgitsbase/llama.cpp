@@ -184,6 +184,8 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx

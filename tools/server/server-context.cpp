@@ -449,6 +449,12 @@ struct server_slot {
             return 0;
         }
 
+        // the drafter skips embedding batches, so an image leaves a hole in
+        // ctx_dft; drafting across it faults (~1 in 4) and costs acceptance
+        if (task->tokens.has_media() || prompt.tokens.has_media()) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -2977,10 +2983,12 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // n_past is a position: with media it is not the token
+                        // count (2623 tokens, 61 positions for one picture)
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            /* .n_past   = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
