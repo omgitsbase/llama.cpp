@@ -450,8 +450,9 @@ struct server_slot {
         }
 
         // the drafter skips embedding batches, so an image leaves a hole in
-        // ctx_dft; drafting across it faults (~1 in 4) and costs acceptance
-        if (task->tokens.has_media() || prompt.tokens.has_media()) {
+        // ctx_dft; set this if drafting across one ever faults again
+        static const bool no_spec_media = getenv("LLAMA_SPEC_NO_MEDIA") != nullptr;
+        if (no_spec_media && (task->tokens.has_media() || prompt.tokens.has_media())) {
             return 0;
         }
 

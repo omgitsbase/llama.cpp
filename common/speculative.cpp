@@ -1598,6 +1598,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // TODO: how to make it work with vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            // the drafter never sees these positions, so a round started before
+            // them must not be replayed across the gap
+            chain_started  = false;
+            chain_launched = false;
+            chain_expect   = -1;
+            replay_n       = 0;
+            defer_last     = false;
             return true;
         }
 
