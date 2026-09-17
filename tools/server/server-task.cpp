@@ -1754,8 +1754,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_buf state_data_tgt;
+    common_state_buf state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {

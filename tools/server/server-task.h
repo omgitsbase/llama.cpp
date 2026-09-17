@@ -581,8 +581,8 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_buf main;
+    common_state_buf drft;
 
     size_t size() const {
         return main.size() + drft.size();

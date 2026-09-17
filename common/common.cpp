@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "unicode.h"
 
+#include <mutex>
+#include <new>
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -2224,6 +2226,127 @@ bool common_prompt_batch_decode(
     }
 
     return true;
+}
+
+namespace {
+
+struct common_state_pool {
+    std::mutex mu;
+    std::vector<std::pair<ggml_backend_buffer_t, size_t>> parked;  // buffer, its size
+    size_t parked_bytes = 0;
+    ggml_backend_buffer_type_t buft = nullptr;
+    bool probed = false;
+
+    ggml_backend_buffer_type_t host_buft() {
+        if (!probed) {
+            probed = true;
+            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        }
+        return buft;
+    }
+};
+
+common_state_pool & state_pool() {
+    static common_state_pool p;
+    return p;
+}
+
+constexpr size_t kStatePoolMax = 4ull << 30;  // parked pinned memory, at most
+
+} // namespace
+
+common_state_buf::~common_state_buf() {
+    release();
+}
+
+common_state_buf::common_state_buf(const common_state_buf & o) {
+    resize(o.n_);
+    if (n_ > 0) {
+        memcpy(ptr_, o.ptr_, n_);
+    }
+}
+
+common_state_buf & common_state_buf::operator=(const common_state_buf & o) {
+    if (this != &o) {
+        resize(o.n_);
+        if (n_ > 0) {
+            memcpy(ptr_, o.ptr_, n_);
+        }
+    }
+    return *this;
+}
+
+common_state_buf::common_state_buf(common_state_buf && o) noexcept
+    : ptr_(o.ptr_), n_(o.n_), cap_(o.cap_), buf_(o.buf_) {
+    o.ptr_ = nullptr, o.n_ = 0, o.cap_ = 0, o.buf_ = nullptr;
+}
+
+common_state_buf & common_state_buf::operator=(common_state_buf && o) noexcept {
+    if (this != &o) {
+        release();
+        ptr_ = o.ptr_, n_ = o.n_, cap_ = o.cap_, buf_ = o.buf_;
+        o.ptr_ = nullptr, o.n_ = 0, o.cap_ = 0, o.buf_ = nullptr;
+    }
+    return *this;
+}
+
+void common_state_buf::release() {
+    if (buf_ != nullptr) {
+        auto & pool = state_pool();
+        std::lock_guard<std::mutex> lock(pool.mu);
+        if (pool.parked_bytes + cap_ <= kStatePoolMax) {
+            pool.parked.emplace_back((ggml_backend_buffer_t) buf_, cap_);
+            pool.parked_bytes += cap_;
+        } else {
+            ggml_backend_buffer_free((ggml_backend_buffer_t) buf_);
+        }
+    } else if (ptr_ != nullptr) {
+        free(ptr_);
+    }
+    ptr_ = nullptr, n_ = 0, cap_ = 0, buf_ = nullptr;
+}
+
+void common_state_buf::resize(size_t n) {
+    if (n <= cap_) {
+        n_ = n;
+        return;
+    }
+    release();
+    if (n == 0) {
+        return;
+    }
+    auto & pool = state_pool();
+    ggml_backend_buffer_t buf = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(pool.mu);
+        // the smallest parked buffer that holds it
+        size_t best = SIZE_MAX, at = SIZE_MAX;
+        for (size_t i = 0; i < pool.parked.size(); i++) {
+            if (pool.parked[i].second >= n && pool.parked[i].second < best) {
+                best = pool.parked[i].second, at = i;
+            }
+        }
+        if (at != SIZE_MAX) {
+            buf = pool.parked[at].first;
+            pool.parked_bytes -= pool.parked[at].second;
+            pool.parked.erase(pool.parked.begin() + at);
+        } else if (ggml_backend_buffer_type_t buft = pool.host_buft()) {
+            buf = ggml_backend_buft_alloc_buffer(buft, n);
+        }
+    }
+    if (buf != nullptr) {
+        buf_ = buf;
+        ptr_ = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        cap_ = ggml_backend_buffer_get_size(buf);
+    } else {
+        ptr_ = (uint8_t *) malloc(n);
+        if (ptr_ == nullptr) {
+            throw std::bad_alloc();
+        }
+        cap_ = n;
+    }
+    n_ = n;
 }
 
 size_t common_prompt_checkpoint::size() const {

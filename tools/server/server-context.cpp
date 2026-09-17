@@ -877,6 +877,9 @@ private:
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // a checkpoint costs about what re-reading this many tokens costs
+    static constexpr int64_t kCheckpointMinGap = 64;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
@@ -2341,6 +2344,43 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // The state at the end of a reply, so the next turn starts from here instead
+    // of rewinding to the last checkpoint made while its prompt was read. Only
+    // for models whose state cannot be rewound; the pinned copy is cheap.
+    void checkpoint_after_generation(server_slot & slot) {
+        if (params_base.n_ctx_checkpoints <= 0 || !slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            SLT_DBG(slot, "no checkpoint after the reply: task %d type %d\n", slot.task ? 1 : 0, slot.task ? (int) slot.task->type : -1);
+            return;
+        }
+        if (!(ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+              ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0)) {
+            SLT_DBG(slot, "%s", "no checkpoint after the reply: the memory rewinds\n");
+            return;
+        }
+        if (slot.prompt.tokens.has_mtmd) {
+            return;
+        }
+        const auto & ckpts = slot.prompt.checkpoints;
+        if (!ckpts.empty() && slot.prompt.n_tokens() < ckpts.back().n_tokens + kCheckpointMinGap) {
+            SLT_DBG(slot, "no checkpoint after the reply: %d tokens, last checkpoint at %" PRId64 "\n", slot.prompt.n_tokens(), ckpts.back().n_tokens);
+            return;
+        }
+        const auto pos_next = slot.prompt.tokens.pos_next();
+        auto       pos_max  = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max + 1 > pos_next) {
+            // anything past the tokens is a rejected draft; drop it as the next round would
+            slot.mem.seq_rm(slot.id, pos_next, -1);
+            pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        }
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0 || pos_max + 1 != pos_next) {
+            SLT_DBG(slot, "no checkpoint after the reply: pos_min = %d, pos_max = %d, pos_next = %d\n", pos_min, pos_max, pos_next);
+            return;
+        }
+        create_checkpoint(slot, 0, pos_min, pos_max);
+        SLT_DBG(slot, "checkpoint after the reply at n_tokens = %d\n", slot.prompt.n_tokens());
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only accessing metrics is safe
@@ -3522,12 +3562,15 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
+                        // break at the last user message, or at user messages at least min step past the last checkpoint;
+                        // never within a few tokens of the previous checkpoint, which costs more than re-reading them
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
+                            const int64_t since = checkpoints.empty() ? pos : pos - checkpoints.back().n_tokens;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (since >= kCheckpointMinGap &&
+                                (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step)) {
                                 break;
                             }
                         }
@@ -3541,9 +3584,11 @@ private:
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
+                            const auto & checkpoints = slot.prompt.checkpoints;
+                            const int64_t since = checkpoints.empty() ? slot.prompt.n_tokens() : slot.prompt.n_tokens() - checkpoints.back().n_tokens;
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                if (since >= kCheckpointMinGap && slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
                                     break;
                                 }
@@ -3597,7 +3642,11 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together, unless it's the last user message;
+                    // and none within a few tokens of the previous one, which costs more than re-reading them
+                    do_checkpoint = do_checkpoint && (
+                            slot.prompt.checkpoints.empty() ||
+                            n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + kCheckpointMinGap);
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
@@ -3873,6 +3922,7 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
+                checkpoint_after_generation(slot);
                 slot.release();
 
                 return;
@@ -3997,6 +4047,7 @@ private:
                 if (!process_token(result, slot)) {
                     slot.print_timings();
                     send_final_response(slot);
+                    checkpoint_after_generation(slot);
                     slot.release();
 
                     return;
