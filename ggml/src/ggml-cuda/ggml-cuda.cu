@@ -921,11 +921,33 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return size;
 }
 
+// The largest single buffer to ask the driver for. Under WDDM a cudaMalloc
+// past roughly half the card fails outright, however much is free: a context
+// of a million tokens on a 96 GB card wants its 64 GiB cache in one piece and
+// is refused while the card holds 12 GB. Capping the buffer size makes ggml
+// lay the same tensors out across several buffers instead.
+static size_t ggml_backend_cuda_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    static const size_t cap = [] {
+        if (const char * env = getenv("GGML_CUDA_MAX_BUFFER_GB")) {
+            const double gb = atof(env);
+            return gb > 0 ? (size_t) (gb * (1ull << 30)) : SIZE_MAX;
+        }
+#ifdef _WIN32
+        return (size_t) 16 << 30;
+#else
+        return SIZE_MAX;
+#endif
+    }();
+    return cap;
+
+    GGML_UNUSED(buft);
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
-    /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+    /* .get_max_size     = */ ggml_backend_cuda_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
 };
