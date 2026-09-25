@@ -837,6 +837,14 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         }
     }
 
+    // A matrix of a few hundred rows (a MoE router, the SSM alpha/beta projections) under a speculative verify
+    // batch of 2-8 went to the tensor-core kernel, which cost Qwen3.8-27B with BF16 alpha/beta 15-17% of its
+    // MTP decode rate, and computed those rows in less precision than the single-token path the drafts came from.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && src0_ne[1] <= 512 && src0_ne[2]*src0_ne[3] == 1 && ne11 <= MMVF_MAX_BATCH_SIZE &&
+            (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+        return true;
+    }
+
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
