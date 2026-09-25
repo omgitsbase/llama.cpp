@@ -871,6 +871,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 return updated;
             }
 
+            ggml_backend_sched_wait_inputs(sched);
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {

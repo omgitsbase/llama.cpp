@@ -634,6 +634,9 @@ void llama_context::sched_reserve() {
     // busy with when the draft is queued.
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         ggml_backend_sched_set_async_inputs(sched.get(), true);
+    } else if (getenv("LLAMA_SYNC_INPUTS") == nullptr) {
+        // each input uploaded under a wait costs a round trip before the graph can start
+        ggml_backend_sched_set_fenced_inputs(sched.get(), true);
     }
 
     llama_memory_context_ptr mctx;
@@ -1438,6 +1441,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         if (rt.on) { rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}].graph += (ggml_time_us() - rt0) / 1000.0; }
         const int64_t rt1 = rt.on ? ggml_time_us() : 0;
+        ggml_backend_sched_wait_inputs(sched.get());
         res->set_inputs(&ubatch);
         if (rt.on) { rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}].inputs += (ggml_time_us() - rt1) / 1000.0; }
 
@@ -3577,6 +3581,7 @@ void llama_context::opt_epoch_iter(
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
+            ggml_backend_sched_wait_inputs(sched.get());
             res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
@@ -4182,6 +4187,7 @@ int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n
         LLAMA_LOG_ERROR("%s: failed to allocate the loop body\n", __func__);
         return -2;
     }
+    ggml_backend_sched_wait_inputs(sched.get());
     res->set_inputs(&ub1);
 
     // the loop runs on the device where the backend can; otherwise the host steps it

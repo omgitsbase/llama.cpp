@@ -330,6 +330,10 @@ extern "C" {
     // first. Only set this when the caller is known to read a result of the
     // graph before writing its inputs again, which orders the two anyway.
     GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs);
+    // user inputs are uploaded without a wait, behind a fence per backend; call wait_inputs before
+    // writing the input tensors again
+    GGML_API void                 ggml_backend_sched_set_fenced_inputs(ggml_backend_sched_t sched, bool fenced);
+    GGML_API void                 ggml_backend_sched_wait_inputs(ggml_backend_sched_t sched);
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);

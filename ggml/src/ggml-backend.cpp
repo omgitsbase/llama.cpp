@@ -780,6 +780,12 @@ struct ggml_backend_sched {
 
     bool async_inputs = false; // see ggml_backend_sched_set_async_inputs
 
+    // see ggml_backend_sched_set_fenced_inputs
+    bool                 fenced_inputs = false;
+    ggml_backend_event_t input_fence[GGML_SCHED_MAX_BACKENDS] = {};
+    bool                 input_fence_tried[GGML_SCHED_MAX_BACKENDS] = {};
+    bool                 input_fence_pending[GGML_SCHED_MAX_BACKENDS] = {};
+
     // pinned inputs of a split replayed without the scheduler, see ggml_backend_sched_pin_split_inputs
     struct ggml_context   * pin_ctx = NULL;
     ggml_backend_buffer_t   pin_buf = NULL;
@@ -1654,6 +1660,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 const int64_t ts0 = sht.on ? ggml_time_us() : 0;
+                if (!sched->async_inputs && sched->fenced_inputs && !sched->input_fence_tried[split_backend_id]) {
+                    sched->input_fence_tried[split_backend_id] = true;
+                    sched->input_fence[split_backend_id] = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+                }
+                if (!sched->async_inputs && sched->fenced_inputs && sched->input_fence[split_backend_id] != NULL) {
+                    // queued in stream order behind the backend's earlier work; the host waits on
+                    // the fence recorded below only before it writes the inputs again
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    sched->input_fence_pending[split_backend_id] = true;
+                    if (sht.on) { t_copy += (ggml_time_us() - ts0) / 1000.0; }
+                    continue;
+                }
                 if (sched->async_inputs) {
                     // the caller reads a result before writing these again
                 } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1783,6 +1801,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (sched->input_fence_pending[split_backend_id]) {
+            ggml_backend_event_record(sched->input_fence[split_backend_id], split_backend);
         }
 
         if (!sched->callback_eval) {
@@ -1924,6 +1946,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+        if (sched->input_fence[b] != NULL) {
+            ggml_backend_event_free(sched->input_fence[b]);
         }
     }
     ggml_gallocr_free(sched->galloc);
@@ -2128,6 +2153,21 @@ int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
 void ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs) {
     GGML_ASSERT(sched);
     sched->async_inputs = async_inputs;
+}
+
+void ggml_backend_sched_set_fenced_inputs(ggml_backend_sched_t sched, bool fenced) {
+    GGML_ASSERT(sched);
+    sched->fenced_inputs = fenced;
+}
+
+void ggml_backend_sched_wait_inputs(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->input_fence_pending[b]) {
+            ggml_backend_event_synchronize(sched->input_fence[b]);
+            sched->input_fence_pending[b] = false;
+        }
+    }
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
