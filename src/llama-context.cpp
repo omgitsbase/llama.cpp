@@ -742,6 +742,13 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::flush_outputs() {
+    for (const auto & c : outputs_pending) {
+        ggml_backend_tensor_get_async(c.backend, c.tensor, c.dst, 0, c.size);
+    }
+    outputs_pending.clear();
+}
+
 void llama_context::synchronize() {
     auto & rt = llama_round_timer();
     const int64_t rt0 = rt.on ? ggml_time_us() : 0;
@@ -749,6 +756,8 @@ void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+
+    flush_outputs();
 
     ggml_backend_sched_synchronize(sched.get());
 
@@ -1652,13 +1661,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return 0;
 }
 
-template<typename T>
+template<typename T, typename F>
 static void copy_tensor_async_rows(
     const std::vector<ggml_tensor *> & tensors,
     const buffer_view<T> & dst,
     size_t stride,
     uint32_t row_offset,
     ggml_backend_sched_t sched,
+    const F & issue,
     std::vector<uint32_t> * counts = nullptr) {
     if (!dst.has_data()) {
         return;
@@ -1678,7 +1688,7 @@ static void copy_tensor_async_rows(
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         T * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
+        issue(backend, tensor, row_ptr, ggml_nbytes(tensor));
 
         if (counts) {
             GGML_ASSERT(row < counts->size());
@@ -1860,6 +1870,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     if (rt.on) { rt.p_t[2] = ggml_time_us(); }
+    // outputs of an earlier decode nobody read: this one overwrites them
+    outputs_pending.clear();
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -1897,6 +1909,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         if (rt.on && rt_d1 == 0) { rt_d1 = ggml_time_us(); rt_tokens = ubatch.n_tokens; }
+        // the next graph overwrites the last one's outputs, so what it left to read back goes first, in stream order
+        flush_outputs();
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
         if (rt.on) { rt_d2 = ggml_time_us(); }
 
@@ -2067,7 +2081,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                outputs_pending.push_back({backend_h, t_h_nextn, embd_nextn_out, n_rows*n_embd*sizeof(float)});
             }
         }
 
@@ -2100,12 +2114,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (has_samplers) {
             const auto stride = n_vocab;
+            const auto defer  = [this](ggml_backend_t b, ggml_tensor * t, void * d, size_t n) { outputs_pending.push_back({b, t, d, n}); };
 
-            // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            // the sampling data comes back to the host at the first synchronize()
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get(), defer);
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), defer, &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), defer, &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), defer, &sampling.candidates_count);
         }
 
         n_outputs_prev += n_outputs;

@@ -134,6 +134,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_chain(int32_t k);
+    void flush_outputs();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -321,6 +322,12 @@ private:
     // ids drafted by a chained MTP graph, one per step, read back on demand
     std::vector<llama_token> mtp_ids;
     std::vector<ggml_tensor *> mtp_ids_pending;
+
+    // the sampled rows and nextn rows decode reads back, issued by synchronize() rather than behind the graph:
+    // there they sat at the head of the copy queue until the graph finished, and a drafter's uploads queued
+    // behind them waited for the whole verify
+    struct output_copy { ggml_backend_t backend; ggml_tensor * tensor; void * dst; size_t size; };
+    std::vector<output_copy> outputs_pending;
     // pinned, so the id copies queue and are waited on once; a copy into pageable memory waits on its own
     ggml_backend_buffer_ptr mtp_ids_buf;
 
