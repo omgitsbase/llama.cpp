@@ -29,7 +29,9 @@
 // would remove.
 struct llama_round_timing {
     bool    on = getenv("LLAMA_ROUND_TIMING") != nullptr;
-    struct acc { double prep = 0, graph = 0, inputs = 0, launch = 0, outputs = 0, total = 0, wait = 0; int n = 0; int built = 0; int splits = 0; int copies = 0; int done = 0; };
+    struct acc { double prep = 0, graph = 0, inputs = 0, launch = 0, outputs = 0, total = 0, wait = 0; int n = 0; int built = 0; int splits = 0; int copies = 0; int done = 0;
+                 double p_balloc = 0, p_mem = 0, p_slot = 0, p_res = 0, p_out = 0; };
+    int64_t p_t[4] = {};
     std::map<std::pair<const void *, int>, acc> by_tokens;
     double wait_pending = 0;
     void report(const void * ctx, int n_tokens) {
@@ -37,6 +39,8 @@ struct llama_round_timing {
         if (a.n % 100 != 0) return;
         fprintf(stderr, "[round] decode ctx=%p T=%d calls %d-%d  prep %.3f  graph %.3f (built %d)  inputs %.3f  launch %.3f  outputs %.3f  total %.3f  wait-in-getters %.3f ms  splits %d copies %d\n",
                 ctx, n_tokens, a.done, a.done + a.n, a.prep / a.n, a.graph / a.n, a.built, a.inputs / a.n, a.launch / a.n, a.outputs / a.n, a.total / a.n, a.wait / a.n, a.splits, a.copies);
+        fprintf(stderr, "[round]   prep: batch %.3f  reserve+memory update %.3f  memory slot %.3f  output_reserve %.3f  sampler+ubatch %.3f ms\n",
+                a.p_balloc / a.n, a.p_mem / a.n, a.p_slot / a.n, a.p_res / a.n, a.p_out / a.n);
         const int done = a.done + a.n;
         a = acc{};
         a.done = done;
@@ -1773,6 +1777,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+    if (rt.on) { rt.p_t[0] = ggml_time_us(); }
 
     if (output_all) {
         // require that all tokens are output
@@ -1807,6 +1812,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // handle any pending shifts/copies
     memory_update(false);
+    if (rt.on) { rt.p_t[1] = ggml_time_us(); }
 
     llama_memory_context_ptr mctx;
 
@@ -1853,12 +1859,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    if (rt.on) { rt.p_t[2] = ggml_time_us(); }
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
 
+    if (rt.on) { rt.p_t[3] = ggml_time_us(); }
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
@@ -2108,6 +2116,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto & a = rt.by_tokens[{(const void *) this, rt_tokens}];
         const int64_t now = ggml_time_us();
         a.prep    += (rt_d1 - rt_d0) / 1000.0;
+        a.p_balloc += (rt.p_t[0] - rt_d0) / 1000.0;
+        a.p_mem    += (rt.p_t[1] - rt.p_t[0]) / 1000.0;
+        a.p_slot   += (rt.p_t[2] - rt.p_t[1]) / 1000.0;
+        a.p_res    += (rt.p_t[3] - rt.p_t[2]) / 1000.0;
+        a.p_out    += (rt_d1 - rt.p_t[3]) / 1000.0;
         a.outputs += (now - rt_d2) / 1000.0;
         a.total   += (now - rt_d0) / 1000.0;
         a.wait    += rt.wait_pending;

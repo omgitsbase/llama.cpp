@@ -1646,9 +1646,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 said.insert(sched);
                 for (int k = 0; k < split->n_inputs; k++) {
                     ggml_tensor * in = split->inputs[k];
-                    fprintf(stderr, "[sched] split input %p %-24s %-10s %8zu bytes  %s\n", (void *) sched, in->name,
+                    fprintf(stderr, "[sched] split input %p %-24s %-10s %8zu bytes  %s  op %s view_src %s src0 %s backend %s\n", (void *) sched, in->name,
                             in->buffer ? ggml_backend_buffer_name(in->buffer) : "(none)", ggml_nbytes(in),
-                            (in->flags & GGML_TENSOR_FLAG_INPUT) ? "user input" : "copied from another backend");
+                            (in->flags & GGML_TENSOR_FLAG_INPUT) ? "user input" : "copied from another backend",
+                            ggml_op_desc(in), in->view_src ? in->view_src->name : "-", in->src[0] ? in->src[0]->name : "-",
+                            ggml_backend_name(ggml_backend_sched_get_tensor_backend(sched, in)));
                 }
             }
         }
@@ -1657,7 +1659,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (ggml_nbytes(input) == 0) {
+                continue;
+            }
+            // a view of a user input (the recurrent state's copy indices) holds the user's data as well, and
+            // taking it for a computed tensor waited on both backends before a synchronous copy
+            const bool user_input = (input->flags & GGML_TENSOR_FLAG_INPUT) ||
+                (input->op == GGML_OP_VIEW && input->view_src && (input->view_src->flags & GGML_TENSOR_FLAG_INPUT) && ggml_is_contiguous(input));
+            if (user_input) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 const int64_t ts0 = sht.on ? ggml_time_us() : 0;
                 if (!sched->async_inputs && sched->fenced_inputs && !sched->input_fence_tried[split_backend_id]) {
