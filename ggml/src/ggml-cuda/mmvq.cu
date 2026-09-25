@@ -36,6 +36,21 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     }
 }
 
+static constexpr __device__ bool has_vec_dot_multi(ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S;
+}
+
+template <ggml_type type, int ncols>
+static __device__ __forceinline__ void vec_dot_multi(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int stride_col_y,
+        const int kbx, const int kqs, float * __restrict__ out) {
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        vec_dot_q4_K_q8_1_multi<ncols>(vx, y, stride_col_y, kbx, kqs, out);
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        vec_dot_iq2_s_q8_1_multi<ncols>(vx, y, stride_col_y, kbx, kqs, out);
+    }
+}
+
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
@@ -611,16 +626,37 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        if constexpr (ncols_dst > 1 && has_vec_dot_multi(type)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                float r[ncols_dst];
+                vec_dot_multi<type, ncols_dst>(vx, &y[kby], stride_col_y, kbx_offset + i*stride_row_x + kbx, kqs, r);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += r[j];
+                }
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        vec_dot_multi<type, ncols_dst>(vgate, &y[kby], stride_col_y, kbx_offset + i*stride_row_x + kbx, kqs, r);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += r[j];
+                        }
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
