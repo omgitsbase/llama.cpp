@@ -1293,6 +1293,49 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     return d * sumi;
 }
 
+// ncols columns of y against one x block, whose grid lookups and signs are done once; bitwise
+// the same as ncols calls of vec_dot_iq3_xxs_q8_1
+template <int ncols>
+static __device__ __forceinline__ void vec_dot_iq3_xxs_q8_1_multi(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int stride_col_y,
+    const int & kbx, const int & iqs, float * __restrict__ out) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    int grid_l[4];
+    int grid_h[4];
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+
+        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+        grid_l[l0/2] = __vsub4(grid_pos.x ^ signs0, signs0);
+        grid_h[l0/2] = __vsub4(grid_pos.y ^ signs1, signs1);
+    }
+    const int   ls = aux32 >> 28;
+    const float dx = __half2float(bq3->d);
+
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+        const block_q8_1 * by = bq8_1 + c*stride_col_y + iqs/2;
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            sumi = ggml_cuda_dp4a(grid_l[l0/2], get_int_b4(by->qs, l0 + 0), sumi);
+            sumi = ggml_cuda_dp4a(grid_h[l0/2], get_int_b4(by->qs, l0 + 1), sumi);
+        }
+        sumi = (ls*sumi + sumi/2)/2;
+        const float d = dx * __low2float(by->ds);
+        out[c] = d * sumi;
+    }
+}
+
 #define VDR_IQ3_S_Q8_1_MMVQ 2
 #define VDR_IQ3_S_Q8_1_MMQ  2
 
@@ -1334,6 +1377,55 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
 
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
+}
+
+// ncols columns of y against one x block, whose grid lookups and signs are done once; bitwise
+// the same as ncols calls of vec_dot_iq3_s_q8_1
+template <int ncols>
+static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_multi(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int stride_col_y,
+    const int & kbx, const int & iqs, float * __restrict__ out) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    int grid_l[4];
+    int grid_h[4];
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+
+        grid_l[l0/2] = __vsub4(grid_pos.x ^ signs0, signs0);
+        grid_h[l0/2] = __vsub4(grid_pos.y ^ signs1, signs1);
+    }
+    const int   scale = 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float dx    = __half2float(bq3->d);
+
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+        const block_q8_1 * by = bq8_1 + c*stride_col_y + iqs/2;
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            sumi = ggml_cuda_dp4a(grid_l[l0/2], get_int_b4(by->qs, l0 + 0), sumi);
+            sumi = ggml_cuda_dp4a(grid_h[l0/2], get_int_b4(by->qs, l0 + 1), sumi);
+        }
+        sumi *= scale;
+        const float d = dx * __low2float(by->ds);
+        out[c] = d * sumi;
+    }
 }
 
 #define VDR_IQ1_S_Q8_1_MMVQ 1

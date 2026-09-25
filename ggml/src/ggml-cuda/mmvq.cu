@@ -37,7 +37,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 }
 
 static constexpr __device__ bool has_vec_dot_multi(ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S;
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S;
 }
 
 template <ggml_type type, int ncols>
@@ -48,6 +48,10 @@ static __device__ __forceinline__ void vec_dot_multi(
         vec_dot_q4_K_q8_1_multi<ncols>(vx, y, stride_col_y, kbx, kqs, out);
     } else if constexpr (type == GGML_TYPE_IQ2_S) {
         vec_dot_iq2_s_q8_1_multi<ncols>(vx, y, stride_col_y, kbx, kqs, out);
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        vec_dot_iq3_xxs_q8_1_multi<ncols>(vx, y, stride_col_y, kbx, kqs, out);
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        vec_dot_iq3_s_q8_1_multi<ncols>(vx, y, stride_col_y, kbx, kqs, out);
     }
 }
 
