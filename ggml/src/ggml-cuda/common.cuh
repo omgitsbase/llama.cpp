@@ -1252,6 +1252,8 @@ struct ggml_cuda_graph {
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        // graphs are keyed by shape, so an f16 graph must not replay over bf16 sources at the same addresses
+        int32_t  node_src_type[GGML_MAX_SRC];
     };
     std::vector<node_properties> node_props;
 
