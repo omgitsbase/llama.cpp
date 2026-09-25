@@ -3979,16 +3979,31 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 
 const llama_token * llama_context::get_mtp_chain_ids(int32_t & n) {
     if (!mtp_ids_pending.empty()) {
-        mtp_ids.assign(mtp_ids_pending.size(), LLAMA_TOKEN_NULL);
-        for (size_t j = 0; j < mtp_ids_pending.size(); ++j) {
+        const size_t k = mtp_ids_pending.size();
+        mtp_ids.assign(k, LLAMA_TOKEN_NULL);
+        llama_token * dst = mtp_ids.data();
+        ggml_backend_t backend0 = ggml_backend_sched_get_tensor_backend(sched.get(), mtp_ids_pending[0]);
+        if (backend0 != nullptr && (!mtp_ids_buf || ggml_backend_buffer_get_size(mtp_ids_buf.get()) < k * sizeof(llama_token))) {
+            mtp_ids_buf.reset();
+            if (auto * buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend0))) {
+                mtp_ids_buf.reset(ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(64, k) * sizeof(llama_token)));
+            }
+        }
+        llama_token * pinned = mtp_ids_buf ? (llama_token *) ggml_backend_buffer_get_base(mtp_ids_buf.get()) : dst;
+        for (size_t j = 0; j < k; ++j) {
             ggml_tensor * t = mtp_ids_pending[j];
             ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
             GGML_ASSERT(backend_t != nullptr);
-            ggml_backend_tensor_get_async(backend_t, t, &mtp_ids[j], 0, sizeof(llama_token));
+            ggml_backend_tensor_get_async(backend_t, t, &pinned[j], 0, sizeof(llama_token));
         }
         mtp_ids_pending.clear();
+        synchronize();
+        if (pinned != dst) {
+            std::copy(pinned, pinned + k, dst);
+        }
+    } else {
+        synchronize();
     }
-    synchronize();
     n = (int32_t) mtp_ids.size();
     return mtp_ids.data();
 }

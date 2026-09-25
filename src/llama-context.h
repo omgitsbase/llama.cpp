@@ -321,6 +321,8 @@ private:
     // ids drafted by a chained MTP graph, one per step, read back on demand
     std::vector<llama_token> mtp_ids;
     std::vector<ggml_tensor *> mtp_ids_pending;
+    // pinned, so the id copies queue and are waited on once; a copy into pageable memory waits on its own
+    ggml_backend_buffer_ptr mtp_ids_buf;
 
     llama_mtp_round_state mtp_round;
 
