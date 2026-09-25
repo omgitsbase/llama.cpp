@@ -384,6 +384,8 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    size_t sched_max_nodes = 0;     // what sched was built with, see sched_reserve
+    bool   sched_pp        = false;
 
     bool sched_need_reserve = true;
 

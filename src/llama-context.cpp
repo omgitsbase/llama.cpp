@@ -629,7 +629,16 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // The server sets a new sampler for every request, and a new scheduler freed every compute buffer and
+    // allocated them again, pinned host memory included: about 100 ms before the first token of each request.
+    // Measuring the graphs again on the same scheduler keeps the buffers that are still large enough.
+    if (!sched || sched_max_nodes != max_nodes || sched_pp != cparams.pipeline_parallel) {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_max_nodes = max_nodes;
+        sched_pp        = cparams.pipeline_parallel;
+    } else {
+        ggml_backend_sched_reset(sched.get());
+    }
 
     // An MTP context's graph is queued behind the target's and its caller reads
     // the ids it drafts before feeding it again, so its inputs need not be
@@ -677,6 +686,8 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched_max_nodes = max_nodes;
+                sched_pp        = false;
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -760,6 +771,9 @@ void llama_context::synchronize() {
     flush_outputs();
 
     ggml_backend_sched_synchronize(sched.get());
+    if (rt.on && ggml_time_us() - rt0 > 3000) {
+        fprintf(stderr, "[round] sync ctx=%p waited %.2f ms\n", (void *) this, (ggml_time_us() - rt0) / 1000.0);
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2142,6 +2156,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         rt.wait_pending = 0;
         a.n++;
         rt.report((const void *) this, rt_tokens);
+        if (rt_tokens > 8 && rt_tokens < 1000) {
+            fprintf(stderr, "[round] decode once ctx=%p T=%d  prep %.2f  ubatch %.2f  outputs %.2f  total %.2f ms\n", (void *) this, rt_tokens,
+                    (rt_d1 - rt_d0) / 1000.0, (rt_d2 - rt_d1) / 1000.0, (now - rt_d2) / 1000.0, (now - rt_d0) / 1000.0);
+        }
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
