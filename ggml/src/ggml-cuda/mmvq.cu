@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-mma.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1366,6 +1367,12 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    if (!ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_mma_supported(src0->type, ggml_cuda_info().devices[ctx.device].cc, ncols_dst)) {
+        ggml_cuda_mmvq_mma(src0->data, src0->type, q8, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, q8, ids_d, fusion_local, dst_d, ne00,

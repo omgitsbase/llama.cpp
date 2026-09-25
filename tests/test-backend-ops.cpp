@@ -9944,6 +9944,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // small batches against quantized weights, as a speculative verify multiplies: row counts that leave the
+    // last 16-row tile partial and rows of up to twenty superblocks, so the tensor-core path's warps all get work
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS,
+                             GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n = 2; n <= 8; ++n) {
+            for (int64_t m : {13, 50, 272}) {
+                for (int64_t k : {256, 2304, 5120}) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            for (bool with_bias : {false, true}) {
+                for (int64_t m_batch : {2, 4, 7}) {
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, glu_op, m_batch, 50, 2304,
+                        false, 16, 8, false, with_bias, true, false, {1, 1}));
+                }
+            }
+        }
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
@@ -10228,6 +10249,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
+        }
+    }
+
+    // weights far larger than L2, as a model's layers are in a real decode: what a speculative verify batch
+    // costs over one token when the weights come from DRAM
+    for (int bs : {1, 2, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K,
+                                 GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 131072, bs, 5120, {1, 1}, {1, 1}));
         }
     }
 
