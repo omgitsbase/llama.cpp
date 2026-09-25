@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <cmath>
 #include <cassert>
 #include <cstring>
 #include <iomanip>
