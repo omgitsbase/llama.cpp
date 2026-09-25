@@ -2704,10 +2704,22 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return (const void *) (uintptr_t) (h | 1);
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+// hashing every node of a verify graph took longer than launching it; a graph the scheduler has not re-split
+// keeps its uid, and with it the key it had
+static const void * ggml_cuda_graph_key_for(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    if (cgraph->uid != 0 && cgraph->uid == cuda_ctx->last_uid) {
+        return cuda_ctx->last_key;
+    }
+    const void * key = ggml_cuda_graph_get_key(cgraph);
+    cuda_ctx->last_uid    = cgraph->uid;
+    cuda_ctx->last_key    = key;
+    cuda_ctx->last_compat = ggml_cuda_graph_check_compability(cgraph);
+    return key;
+}
+
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     static const bool uid_trace = getenv("LLAMA_ROUND_TIMING") != nullptr;
@@ -5293,7 +5305,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #ifdef USE_CUDA_GRAPH
     const int64_t cht_k0 = cht.on ? ggml_time_us() : 0;
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    graph_key = ggml_cuda_graph_key_for(cuda_ctx, cgraph);
     const int64_t cht_key = cht.on ? ggml_time_us() : 0;
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -5301,10 +5313,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     graph->n_seen++;
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = cuda_ctx->last_compat;
         const int64_t cht_compat = cht.on ? ggml_time_us() : 0;
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
             if (cht.on) {
                 cht.add_check(backend, (cht_key - cht_k0) / 1000.0,
                               (cht_compat - cht_key) / 1000.0,

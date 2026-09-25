@@ -1466,6 +1466,11 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    // the key and compatibility of the graph with this uid, which the scheduler hands over again unchanged
+    uint64_t     last_uid    = 0;
+    const void * last_key    = nullptr;
+    bool         last_compat = false;
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
