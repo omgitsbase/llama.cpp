@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <string>
 #include <vector>
 
 struct llama_vocab;
@@ -36,6 +37,7 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+std::string llama_sampler_backend_signature(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(

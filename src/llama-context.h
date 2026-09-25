@@ -386,6 +386,8 @@ private:
     ggml_backend_sched_ptr sched;
     size_t sched_max_nodes = 0;     // what sched was built with, see sched_reserve
     bool   sched_pp        = false;
+    // per sequence, the backend signature of the sampler the last reservation measured
+    std::map<llama_seq_id, std::string> sampler_sigs_reserved;
 
     bool sched_need_reserve = true;
 

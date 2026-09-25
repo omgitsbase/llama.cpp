@@ -4396,3 +4396,50 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
 }
+
+// What a sampler's backend part adds to a graph, as far as shapes and branches go: chains with the same
+// signature build graphs that need the same memory. A sampler this does not know gives none.
+std::string llama_sampler_backend_signature(const llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return "";
+    }
+    const auto * iface = smpl->iface;
+    if (iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+        std::string sig = "chain";
+        for (const auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            const std::string s = llama_sampler_backend_signature(entry.ptr);
+            if (s.empty()) {
+                return "";
+            }
+            sig += "|" + s;
+        }
+        return sig;
+    }
+    if (iface == &llama_sampler_empty_i)  { return "empty"; }
+    if (iface == &llama_sampler_greedy_i) { return "greedy"; }
+    if (iface == &llama_sampler_dist_i)   { return "dist"; }
+    if (iface == &llama_sampler_top_p_i)  { return "top_p"; }
+    if (iface == &llama_sampler_min_p_i)  { return "min_p"; }
+    if (iface == &llama_sampler_top_k_i) {
+        return "top_k:" + std::to_string(((const llama_sampler_top_k *) smpl->ctx)->k);
+    }
+    if (iface == &llama_sampler_temp_i) {
+        return std::string("temp:") + (((const llama_sampler_temp *) smpl->ctx)->temp <= 0.0f ? "0" : "1");
+    }
+    if (iface == &llama_sampler_temp_ext_i) {
+        const auto * c = (const llama_sampler_temp_ext *) smpl->ctx;
+        return std::string("temp_ext:") + (c->temp <= 0.0f ? "0" : "1") + (c->delta <= 0.0f ? "0" : "1");
+    }
+    if (iface == &llama_sampler_penalties_i) {
+        const auto * c = (const llama_sampler_penalties *) smpl->ctx;
+        return c->is_disabled() ? std::string("penalties:off") : "penalties:" + std::to_string(std::min(c->penalty_last_n, c->n_vocab));
+    }
+    if (iface == &llama_sampler_logit_bias_i) {
+        return "logit_bias:" + std::to_string(((const llama_sampler_logit_bias *) smpl->ctx)->logit_bias.size());
+    }
+    return "";
+}

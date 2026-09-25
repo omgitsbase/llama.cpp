@@ -741,6 +741,11 @@ void llama_context::sched_reserve() {
         LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg);
     }
 
+    sampler_sigs_reserved.clear();
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        sampler_sigs_reserved[seq_id] = llama_sampler_backend_signature(smpl);
+    }
+
     if (n_splits_pp == n_splits_tg) {
         LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
     } else {
@@ -1309,7 +1314,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        // the server sets a new sampler for every request, most often shaped like the one before, and the graphs
+        // measured for that one need no measuring again
+        const std::string sig = llama_sampler_backend_signature(sampler);
+        const auto it = sampler_sigs_reserved.find(seq_id);
+        if (sig.empty() || it == sampler_sigs_reserved.end() || it->second != sig) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -1326,9 +1337,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return false;
     }
 
+    // without its sampler a sequence's graphs only shrink, so what was measured still holds
     sampling.samplers.erase(seq_id);
-
-    sched_need_reserve = true;
 
     return true;
 }
