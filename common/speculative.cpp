@@ -1394,9 +1394,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_pos                expect        = -1;     // where the next verify batch starts, -1 when none is due
         bool                     defer_last    = false;  // the last batch was a verify batch this drafter did not decode
         int32_t                  col           = -1;     // its column in the chained decode in flight
-        // a draft left on the device for the verify to take there (llama_set_tokens_device_seq): the draft holds
-        // placeholders until resolve_ids() reads the ids, which the host then waits for behind nothing but the
-        // draft graph. LLAMA_NO_DRAFT_HANDOFF=1 reads them before the verify is queued, as before
+        // a draft left on the device for the verify (llama_set_tokens_device_seq) holds placeholders until resolve_ids()
+        // reads it; LLAMA_NO_DRAFT_HANDOFF=1 reads it before the verify is queued
         llama_tokens *           ids_result    = nullptr;
         int32_t                  ids_col       = -1;
         llama_pos                ids_n_past    = -1;
@@ -1738,9 +1737,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        // one trained head: a round's draft steps run as one graph, over every drafting sequence.
-        // LLAMA_NO_MTP_CHAIN=1 drafts a token per decode; more than one sequence chains only under LLAMA_MTP_CHAIN_SEQS=1,
-        // and needs a unified target KV: split_equal would reorder the rows the drafts read the target's hidden state by
+        // several sequences chain only under LLAMA_MTP_CHAIN_SEQS=1 and a unified target KV: split_equal would reorder
+        // the rows the drafts read the target's hidden state from
         static const bool no_chain   = getenv("LLAMA_NO_MTP_CHAIN") != nullptr;
         static const bool chain_seqs = getenv("LLAMA_MTP_CHAIN_SEQS") != nullptr && atoi(getenv("LLAMA_MTP_CHAIN_SEQS")) != 0;
         const uint32_t n_round_rows = n_seq * (2*this->params.n_max + 1);

@@ -2822,7 +2822,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 #endif // USE_CUDA_GRAPH
 
 static bool ggml_cuda_fuse_multi_rope(const int mode) {
-    return (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) && !(ggml_cuda_fuse_off_mask() & 67108864);
+    return (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MROPE);
 }
 
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
@@ -3054,7 +3054,7 @@ static int ggml_cuda_try_elt_chain(ggml_backend_cuda_context & ctx, const ggml_c
     if (ggml_cuda_chain_op_of(first) == 0 || (first->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
-    if (ggml_cuda_fuse_off_mask() & 128) {
+    if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_ELT_CHAIN) {
         return 0;
     }
     ggml_cuda_chain_args a{};
@@ -3261,7 +3261,7 @@ static bool ggml_cuda_ranges_overlap(const void * a, size_t na, const void * b, 
 static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int g) {
     static const bool disabled = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION"))) ||
                                  (getenv("GGML_CUDA_GRAPH_OPT") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1);
-    if (disabled || (ggml_cuda_fuse_off_mask() & 1073741824)) {
+    if (disabled || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_STATE_FOLD)) {
         return false;
     }
 
@@ -3852,21 +3852,15 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
-// GGML_CUDA_FUSE_OFF (decimal or 0x): each bit set turns one path off.
-//   1 empty-skip, 2 l2 pair, 4 expert-sum, 8 nscale, 128 elt_chain, 256 norm fold / add+rms,
-//   512 float fold reader, 1024 quantized fold reader, 2048 matvec pairs, 4096 matvec prefetch, 8192 matvec release,
-//   16384 norm weight read before the PDL wait (quantize_q8_1_rms, norm+rope), 65536 one_row, 131072 lane groups,
-//   262144 matvec epilogue, 524288 its one-column form, 1048576 gate/up pairs and merged GLU,
-//   4194304 a fold's float reader quantizes, 67108864 multi-section rope in norm+rope(+set_rows),
-//   1073741824 state fold, 4294967296 register-resident quantize_q8_1_rms, 8589934592 topk_moe REDUX selection,
-//   1<<34 get_rows into a copy, 1<<37 ids-early prefetch, 1<<38 producer prefetch.
-// GGML_CUDA_MMV_EXPERIMENTAL=0 turns the matvec bits in 0x2000037000 off together
+// GGML_CUDA_FUSE_OFF (decimal or 0x) is a mask of ggml_cuda_fuse_path bits, GGML_CUDA_MMV_EXPERIMENTAL=0 adds the matvec ones
 uint64_t ggml_cuda_fuse_off_mask() {
     static const uint64_t mask = [] {
         const char *   e   = getenv("GGML_CUDA_FUSE_OFF");
         const char *   x   = getenv("GGML_CUDA_MMV_EXPERIMENTAL");
         const uint64_t off = e ? std::strtoull(e, nullptr, 0) : 0;
-        return off | (x && atoi(x) == 0 ? 0x2000037000ull : 0);
+        constexpr uint64_t mmv = GGML_CUDA_FUSE_MMV_PREFETCH | GGML_CUDA_FUSE_MMV_RELEASE | GGML_CUDA_FUSE_NORM_WEIGHT_EARLY |
+                                GGML_CUDA_FUSE_MMV_ONE_ROW | GGML_CUDA_FUSE_MMV_LANE_GROUPS | GGML_CUDA_FUSE_MMV_IDS_EARLY;
+        return off | (x && atoi(x) == 0 ? mmv : 0);
     }();
     return mask;
 }
@@ -3920,12 +3914,12 @@ static bool ggml_cuda_norm_fold_reader_ok(const ggml_tensor * mm, const ggml_ten
         return false;
     }
     if (mm->op == GGML_OP_MUL_MAT_ID) {
-        return !(ggml_cuda_fuse_off_mask() & 1024) && ggml_is_quantized(src0->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm);
+        return !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_FOLD_Q8_READER) && ggml_is_quantized(src0->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm);
     }
     if (ggml_is_quantized(src0->type)) {
         return ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_cuda_should_use_mmvq(src0->type, cc, act->ne[1]);
     }
-    if (ggml_cuda_fuse_off_mask() & 512) {
+    if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_FOLD_F32_READER) {
         return false;
     }
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -4061,7 +4055,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     fold->w        = w;
     fold->n_rows   = ggml_nrows(mul);
     fold->q8_bytes = fold->n_rows * (GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
-    fold->has_q8_reader = has_q8_reader && !(ggml_cuda_fuse_off_mask() & 4194304);
+    fold->has_q8_reader = has_q8_reader && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_FOLD_QUANTIZE);
     memcpy(&fold->eps, norm->op_params, sizeof(float));
     ctx->norm_folds[mul] = fold;
     for (const ggml_tensor * v : views) {
@@ -4204,7 +4198,7 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
     }
 
     // the fold comes first: the add alone, the norm and multiply into its readers
-    if (!(ggml_cuda_fuse_off_mask() & 256) && ggml_cuda_try_norm_fold(&ctx, cgraph, i + 1)) {
+    if (!(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NORM_FOLD) && ggml_cuda_try_norm_fold(&ctx, cgraph, i + 1)) {
         GGML_ASSERT(ggml_cuda_compute_forward(ctx, add));
         if (ggml_cuda_norm_fold_diag()) {
             ggml_cuda_norm_fold_materialize(ctx, mul);
@@ -4232,7 +4226,7 @@ static bool ggml_cuda_mm_epi_lean_t1() {
         const char * e = getenv("GGML_CUDA_LEAN_T1");
         return e != nullptr && atoi(e) != 0;
     }();
-    return on && !(ggml_cuda_fuse_off_mask() & 524288);
+    return on && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MM_EPILOGUE_T1);
 }
 
 // where operand o, read at chain node n, sits over the matvec's output index: its offset must be
@@ -4294,7 +4288,7 @@ static bool ggml_cuda_mm_epi_arg_of(const ggml_tensor * mm, const ggml_tensor * 
 // dry_run only reports how many nodes it would take
 static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, const bool dry_run = false) {
     const ggml_tensor * mm = cgraph->nodes[i];
-    if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 262144)) {
+    if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MM_EPILOGUE)) {
         return 0;
     }
     const ggml_tensor * src0 = mm->src[0];
@@ -4450,7 +4444,7 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
 // gate and up the fused gate kernel declines: the gate into scratch, then the up with its bias and the GLU as epilogue
 static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * up_mm,
         const ggml_tensor * gate_b, const ggml_tensor * up_b, ggml_tensor * glu) {
-    if (!ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576)) {
+    if (!ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GATE_UP)) {
         return false;
     }
     if (gate_mm->op != GGML_OP_MUL_MAT || up_mm->op != GGML_OP_MUL_MAT || gate_mm->src[1] != up_mm->src[1] ||
@@ -4550,7 +4544,7 @@ static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggm
 // a merged gate_up weight and a GLU over the two halves of its product: the fused gate kernel over the two row halves
 static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     const ggml_tensor * gu = cgraph->nodes[i];
-    if ((gu->op != GGML_OP_MUL_MAT && gu->op != GGML_OP_MUL_MAT_ID) || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576) ||
+    if ((gu->op != GGML_OP_MUL_MAT && gu->op != GGML_OP_MUL_MAT_ID) || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GATE_UP) ||
         (gu->flags & GGML_TENSOR_FLAG_OUTPUT) || gu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gu) || gu->ne[0] % 2 != 0) {
         return 0;
     }
@@ -4643,7 +4637,7 @@ static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_
 
 // {gate, up, GLU} or {gate, bias, up, bias, GLU} over one activation that the fused gate kernel declined
 static int ggml_cuda_try_glu_pair_at(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576)) {
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GATE_UP)) {
         return 0;
     }
     for (const bool with_bias : { false, true }) {
@@ -4715,10 +4709,9 @@ static bool ggml_cuda_mmvq_pair_member_ok(const ggml_tensor * mm, int cc) {
 }
 
 // two quantized matvecs over one activation, one after the other (views between them do nothing): one launch.
-// GGML_CUDA_FUSE_OFF bit 2048 turns it off
 static int ggml_cuda_try_mmvq_pair(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     static const bool multi_stream = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
-    if (multi_stream || (ggml_cuda_fuse_off_mask() & 2048)) {
+    if (multi_stream || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MMV_PAIRS)) {
         return 0;
     }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
@@ -4759,14 +4752,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     // a residual add folded into the norm that reads it
-    if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & 256)) {
+    if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NORM_FOLD)) {
         const int nodes_to_skip = ggml_cuda_try_add_rms_norm_mul(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
     }
 
-    if (node->op == GGML_OP_GET_ROWS && !(ggml_cuda_fuse_off_mask() & (1ull << 34))) {
+    if (node->op == GGML_OP_GET_ROWS && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GET_ROWS_CPY)) {
         const int nodes_to_skip = ggml_cuda_try_get_rows_cpy(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
@@ -5491,7 +5484,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // rms_norm > mul(weight) read only by quantized matvecs: neither is
     // launched, the matvecs apply the norm while quantizing their input
-    if (node->op == GGML_OP_RMS_NORM && !(ggml_cuda_fuse_off_mask() & 256) && ggml_cuda_try_norm_fold(cuda_ctx, cgraph, i)) {
+    if (node->op == GGML_OP_RMS_NORM && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NORM_FOLD) && ggml_cuda_try_norm_fold(cuda_ctx, cgraph, i)) {
         if (ggml_cuda_norm_fold_diag()) {
             ggml_cuda_norm_fold_materialize(*cuda_ctx, cgraph->nodes[i + 1]);
         }
@@ -5520,14 +5513,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // rms_norm > scale > mul: a constant between the norm and its weight
-    if (!((ggml_cuda_fuse_off_mask() & 8) || getenv("GGML_CUDA_FUSE_NSCALE") == nullptr) && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
+    if (!((ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NSCALE) || getenv("GGML_CUDA_FUSE_NSCALE") == nullptr) && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
             ggml_cuda_should_fuse_rms_norm_scale_mul(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
         ggml_cuda_op_rms_norm_fused_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 
     // the expert combine: a chain of ADDs over one tensor's rows, as one sum
-    if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & 4)) {
+    if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_EXPERT_SUM)) {
         const ggml_tensor * experts = nullptr;
         const int n_adds = ggml_cuda_match_expert_sum(cgraph, i, &experts);
         if (n_adds > 0) {
@@ -5538,7 +5531,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // two l2_norms over adjacent views of one tensor (q and k after the
     // conv in a delta-net layer): one launch covering both row ranges
-    if (node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes && !(ggml_cuda_fuse_off_mask() & 2) &&
+    if (node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_L2_PAIR) &&
             ggml_cuda_should_fuse_l2_norm_pair(node, cgraph->nodes[i + 1])) {
         ggml_cuda_op_l2_norm_pair(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -5838,7 +5831,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // a node with no elements has nothing to compute; recurrent
                 // models emit several per layer when only one sequence is live
-                if (ggml_is_empty(node) && !(ggml_cuda_fuse_off_mask() & 1)) {
+                if (ggml_is_empty(node) && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_EMPTY_SKIP)) {
                     continue;
                 }
 

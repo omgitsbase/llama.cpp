@@ -976,7 +976,7 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     const int64_t s2 = rope->nb[2] / ts_dst;
     const int64_t s3 = rope->nb[3] / ts_dst;
 
-    const bool w_pre = !(ggml_cuda_fuse_off_mask() & 16384) && ggml_cuda_tensor_is_constant(mul_src);
+    const bool w_pre = !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NORM_WEIGHT_EARLY) && ggml_cuda_tensor_is_constant(mul_src);
 
     cudaStream_t stream = ctx.stream();
 

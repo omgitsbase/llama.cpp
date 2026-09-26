@@ -485,7 +485,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.delayed_softmax   = args.delayed_softmax;
 
     const int  cc    = ggml_cuda_info().devices[ctx.device].cc;
-    const bool redux = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && !(ggml_cuda_fuse_off_mask() & 8589934592ull);
+    const bool redux = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_TOPK_REDUX);
 
     if (bias) {
         if (redux) {

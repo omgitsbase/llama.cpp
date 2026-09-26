@@ -740,8 +740,8 @@ void quantize_row_q8_1_rms_cuda(
     const ggml_cuda_l2_pf pf_k = ggml_cuda_kernel_uses_pdl((const void *) quantize_q8_1_rms<256>) ? ggml_cuda_l2_pf{} : pf;
 
     const uint64_t fuse_off = ggml_cuda_fuse_off_mask();
-    const bool     w_pre    = w_const && !(fuse_off & 16384);
-    const bool     reg      = !(fuse_off & 4294967296ull);
+    const bool     w_pre    = w_const && !(fuse_off & GGML_CUDA_FUSE_NORM_WEIGHT_EARLY);
+    const bool     reg      = !(fuse_off & GGML_CUDA_FUSE_Q8_IN_REGISTERS);
 
     if (ne00 < 1024) {
         const dim3 num_blocks((nblk + 8 - 1) / 8, ne1, ne2*ne3);

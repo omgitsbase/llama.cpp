@@ -818,11 +818,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     const uint64_t fo = ggml_cuda_fuse_off_mask();
-    if (!ids && !(fo & 4096) && ggml_cuda_tensor_is_constant(src0) &&
+    if (!ids && !(fo & GGML_CUDA_FUSE_MMV_PREFETCH) && ggml_cuda_tensor_is_constant(src0) &&
             (fusion == nullptr || fusion->gate == nullptr || ggml_cuda_tensor_is_constant(fusion->gate))) {
         fusion_local.pf.bytes = ne00*ts_src0; // at most a whole row; the launch sizes it to its grid
     }
-    fusion_local.release = !(fo & 8192);
+    fusion_local.release = !(fo & GGML_CUDA_FUSE_MMV_RELEASE);
 
     switch (src0->type) {
         case GGML_TYPE_F32: {

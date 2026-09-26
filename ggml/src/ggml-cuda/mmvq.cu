@@ -1238,7 +1238,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     // several rows per warp when a row takes a fraction of it; only worth it while the launch is more than a wave
     static const int force_lane_groups = mmvq_force_env("GGML_CUDA_MMVQ_LANE_GROUPS");
-    const int lane_groups = shape_ok && !(fo & 131072) && has_ids ? mmvq_lane_groups<type>(ncols_x, nrows_x, warp_size) : 1;
+    const int lane_groups = shape_ok && !(fo & GGML_CUDA_FUSE_MMV_LANE_GROUPS) && has_ids ? mmvq_lane_groups<type>(ncols_x, nrows_x, warp_size) : 1;
     const auto moe_waves_over_one = [&](const int ncols) {
         const void * kernel = has_gate ? (const void *) mul_mat_vec_q_moe<type, 2, 1, true> : (const void *) mul_mat_vec_q_moe<type, 2, 1, false>;
         return (int64_t) ((nrows_x + 1)/2)*nchannels_dst > (int64_t) nsm*ggml_cuda_max_active_blocks(kernel, warp_size*ncols, 0);
@@ -1312,7 +1312,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // one row per block when two-row blocks fill at most half a wave and one-row blocks still fit in one
         if constexpr (ncols > 1 && !small_k) {
             bool one_row = false;
-            if (shape_ok && !(fo & 65536)) {
+            if (shape_ok && !(fo & GGML_CUDA_FUSE_MMV_ONE_ROW)) {
                 if (force_one_row >= 0) {
                     one_row = force_one_row > 0;
                 } else {
@@ -1594,7 +1594,7 @@ void ggml_cuda_mul_mat_vec_q(
         static const bool   pf_producer = [] { const char * e = getenv("GGML_CUDA_PF_PRODUCER"); return e && atoi(e) != 0; }();
         const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
         const int           nsm  = ggml_cuda_info().devices[ctx.device].nsm;
-        if (pf_producer && !ids && ne02 == 1 && ne03 == 1 && !(ggml_cuda_fuse_off_mask() & (1ull << 38)) &&
+        if (pf_producer && !ids && ne02 == 1 && ne03 == 1 && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MMV_PRODUCER_PF) &&
                 GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ctx.device].cc) &&
                 ggml_cuda_tensor_is_constant(src0) && (gate == nullptr || ggml_cuda_tensor_is_constant(gate))) {
             const int     nstreams  = gate ? 2 : 1;
@@ -1661,11 +1661,11 @@ void ggml_cuda_mul_mat_vec_q(
     // expert ids are final before this launch's wait when an earlier matvec on this stream read them after its
     // own: every kernel after that one started after its wait returned, so their producer had completed
     const uint64_t fo        = ggml_cuda_fuse_off_mask();
-    const bool     ids_early = ids && ncols_dst == 1 && !(fo & (1ull << 37)) &&
+    const bool     ids_early = ids && ncols_dst == 1 && !(fo & GGML_CUDA_FUSE_MMV_IDS_EARLY) &&
         ctx.ids_ready == ids && ctx.ids_ready_stream == ctx.curr_stream_no;
-    const bool     pf_ok     = (!ids || ids_early) && !(fo & 4096) && ggml_cuda_tensor_is_constant(src0) &&
+    const bool     pf_ok     = (!ids || ids_early) && !(fo & GGML_CUDA_FUSE_MMV_PREFETCH) && ggml_cuda_tensor_is_constant(src0) &&
         (fusion == nullptr || fusion->gate == nullptr || ggml_cuda_tensor_is_constant(fusion->gate));
-    const bool     release   = !(fo & 8192);
+    const bool     release   = !(fo & GGML_CUDA_FUSE_MMV_RELEASE);
 
     if (!ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_mma_supported(src0->type, ggml_cuda_info().devices[ctx.device].cc, ncols_dst)) {

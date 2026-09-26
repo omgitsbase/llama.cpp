@@ -107,19 +107,15 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // state. 0 restores one step per decode.
 LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, int32_t n);
 
-// tokens of a sequence the target produced (prompt, samples, accepted drafts), noted on the drafter's context: it
-// drafts through the full LM head while the sequence's text is mostly outside its reduced one, and the counts rank
-// the reduced head's rows at the next load (LLAMA_DRAFT_VOCAB sets where they are kept, "off" keeps none)
+// tokens the target produced for seq, noted on the drafter's context; their counts rank the reduced draft head's rows
+// at the next load (LLAMA_DRAFT_VOCAB sets where they are kept, "off" keeps none)
 LLAMA_API void llama_draft_note_tokens(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens);
 
 // ids drafted by the last chained MTP decode, n of them
 LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx, int32_t * n);
 
-// One sequence of a chained MTP round over several, in the order the round's batch holds them: its replay rows,
-// then one row per chain step. The host route gives the target's sampled ids and hidden rows for the verify batch;
-// the device route (c_ids == nullptr) takes them from the target context's last graph, where the verify's rows start
-// at tgt_row and its outputs at tgt_out (llama_get_last_rows). h_pend nullptr takes the hidden row the sequence's
-// last chained round left on the device.
+// one sequence of a chained MTP round: its replay rows, then one row per chain step. With c_ids nullptr the verify's
+// ids and hidden rows come from the target's last graph (llama_get_last_rows); h_pend nullptr reuses the last round's
 struct llama_mtp_round_seq {
     llama_seq_id    seq_id  = 0;
     const int32_t * c_ids   = nullptr; // [n_chain + 1]
@@ -147,10 +143,8 @@ LLAMA_API bool llama_sampler_on_backend(struct llama_context * ctx, llama_seq_id
 // the target context a chained MTP context takes its rounds' inputs from
 LLAMA_API void llama_set_mtp_round_target(struct llama_context * ctx, struct llama_context * ctx_tgt);
 
-// The next llama_decode on ctx takes the rows of seq at positions pos0 + 1 .. pos0 + n from the sequence's column
-// col of the ids ctx_src's last chained MTP draft left on the device: a verify queued behind the draft graph before
-// its ids are read back. Several sequences can be armed for one decode. A decode of more than one ubatch reads the
-// ids back and uploads them with the batch. False, and nothing armed, when ctx_src has fewer than n drafted ids.
+// the next llama_decode on ctx takes seq's positions pos0 + 1 .. pos0 + n from column col of the ids ctx_src's last
+// chained MTP draft left on the device, for any number of sequences; false when ctx_src drafted fewer than n
 LLAMA_API bool llama_set_tokens_device_seq(struct llama_context * ctx, struct llama_context * ctx_src, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t col);
 
 // Decode chain: a decode queued before the host has read the tokens of the one before it.

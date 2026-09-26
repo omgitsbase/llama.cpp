@@ -205,9 +205,8 @@ struct llama_tokens_dev_state {
     std::vector<llama_tokens_dev_span> spans;   // empty: the host uploads every row
     int32_t                n_batch   = 0;       // tokens of the decode in flight
 
-    // Once a handoff has been asked for, a decode of up to n_max tokens in one ubatch reads them from tok_dev: as a
-    // host-buffer graph input, a copy from the drafter would synchronize it first. Its host rows are written on the
-    // stream that reads them. A decode of several ubatches uploads the drafted ids from the host instead.
+    // a decode of up to n_max tokens in one ubatch reads the drafted ids from tok_dev, so a copy from the drafter does
+    // not synchronize; a decode of several ubatches uploads them from the host
     int32_t                n_max     = 16;
     bool                   enabled   = false;
     ggml_context         * ctx_dev   = nullptr;

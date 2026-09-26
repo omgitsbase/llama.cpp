@@ -1465,7 +1465,35 @@ struct ggml_cuda_stream_context {
     }
 };
 
-// GGML_CUDA_FUSE_OFF, one bit per path that can be turned off for an A/B (table next to its definition)
+// the paths GGML_CUDA_FUSE_OFF can turn off, one bit each
+enum ggml_cuda_fuse_path : uint64_t {
+    GGML_CUDA_FUSE_EMPTY_SKIP         = 1ull << 0,
+    GGML_CUDA_FUSE_L2_PAIR            = 1ull << 1,
+    GGML_CUDA_FUSE_EXPERT_SUM         = 1ull << 2,
+    GGML_CUDA_FUSE_NSCALE             = 1ull << 3,
+    GGML_CUDA_FUSE_ELT_CHAIN          = 1ull << 7,
+    GGML_CUDA_FUSE_NORM_FOLD          = 1ull << 8,
+    GGML_CUDA_FUSE_FOLD_F32_READER    = 1ull << 9,
+    GGML_CUDA_FUSE_FOLD_Q8_READER     = 1ull << 10,
+    GGML_CUDA_FUSE_MMV_PAIRS          = 1ull << 11,
+    GGML_CUDA_FUSE_MMV_PREFETCH       = 1ull << 12,
+    GGML_CUDA_FUSE_MMV_RELEASE        = 1ull << 13,
+    GGML_CUDA_FUSE_NORM_WEIGHT_EARLY  = 1ull << 14,
+    GGML_CUDA_FUSE_MMV_ONE_ROW        = 1ull << 16,
+    GGML_CUDA_FUSE_MMV_LANE_GROUPS    = 1ull << 17,
+    GGML_CUDA_FUSE_MM_EPILOGUE        = 1ull << 18,
+    GGML_CUDA_FUSE_MM_EPILOGUE_T1     = 1ull << 19,
+    GGML_CUDA_FUSE_GATE_UP            = 1ull << 20,
+    GGML_CUDA_FUSE_FOLD_QUANTIZE      = 1ull << 22,
+    GGML_CUDA_FUSE_MROPE              = 1ull << 26,
+    GGML_CUDA_FUSE_STATE_FOLD         = 1ull << 30,
+    GGML_CUDA_FUSE_Q8_IN_REGISTERS    = 1ull << 32,
+    GGML_CUDA_FUSE_TOPK_REDUX         = 1ull << 33,
+    GGML_CUDA_FUSE_GET_ROWS_CPY       = 1ull << 34,
+    GGML_CUDA_FUSE_MMV_IDS_EARLY      = 1ull << 37,
+    GGML_CUDA_FUSE_MMV_PRODUCER_PF    = 1ull << 38,
+};
+
 uint64_t ggml_cuda_fuse_off_mask();
 
 // ggml_is_constant's rule: the data cannot change while graphs run, so a kernel may read it before its PDL wait
