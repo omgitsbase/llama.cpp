@@ -115,6 +115,32 @@ LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx
 // 1 once the rounds read the target's tensors on the device)
 LLAMA_API void llama_set_mtp_round_host(struct llama_context * ctx, const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off);
 
+// One sequence of a chained MTP round over several, in the order the round's batch holds them: its replay rows,
+// then one row per chain step. The host route gives the target's sampled ids and hidden rows for the verify batch;
+// the device route (c_ids == nullptr) takes them from the target context's last graph, where the verify's rows start
+// at tgt_row and its outputs at tgt_out (llama_get_last_rows). h_pend nullptr takes the hidden row the sequence's
+// last chained round left on the device.
+struct llama_mtp_round_seq {
+    llama_seq_id    seq_id  = 0;
+    const int32_t * c_ids   = nullptr; // [n_chain + 1]
+    const float   * h_tgt   = nullptr; // [n_embd, n_chain + 1]
+    const float   * h_pend  = nullptr; // [n_embd]
+    int32_t         off     = 0;       // 1 in a normal round, 0 in the first one
+    int32_t         tgt_row = 0;
+    int32_t         tgt_out = 0;
+};
+
+// the sequences of the next chained decode; its batch holds n*(2*n_chain + 1) rows. After the decode every sequence
+// takes the device route with off 1, as a single round does
+LLAMA_API void llama_set_mtp_round_seqs(struct llama_context * ctx, const struct llama_mtp_round_seq * seqs, int32_t n);
+
+// sequences of the last chained decode: llama_get_mtp_chain_ids returns n_chain + 1 rows of that many ids
+LLAMA_API int32_t llama_get_mtp_chain_n_seq(const struct llama_context * ctx);
+
+// Whether the last ubatch of the last decode holds n rows of seq at positions pos0 .. pos0 + n - 1 in a row, all
+// of them outputs; row0 and out0 receive the first one's ubatch row and output row.
+LLAMA_API bool llama_get_last_rows(const struct llama_context * ctx, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t * row0, int32_t * out0);
+
 // whether the sequence's sampler runs on the backend, so its samples are on the device
 LLAMA_API bool llama_sampler_on_backend(struct llama_context * ctx, llama_seq_id seq_id);
 
@@ -125,6 +151,11 @@ LLAMA_API void llama_set_mtp_round_target(struct llama_context * ctx, struct lla
 // the device, rather than from the batch: a verify queued behind the draft graph before its ids are read back. The
 // batch's own values for those rows are never uploaded. False, and nothing armed, when ctx_src has fewer pending ids.
 LLAMA_API bool llama_set_tokens_device(struct llama_context * ctx, struct llama_context * ctx_src, int32_t i0, int32_t n);
+
+// The same keyed on the sequence: the next llama_decode on ctx takes the rows of seq at positions pos0 + 1 ..
+// pos0 + n from the sequence's column col of ctx_src's pending chained ids. Several sequences can be armed for one
+// decode. A decode of more than one ubatch reads the ids back and uploads them with the batch.
+LLAMA_API bool llama_set_tokens_device_seq(struct llama_context * ctx, struct llama_context * ctx_src, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t col);
 
 // the decode loop on the device: n_max greedy steps from token0 at pos0 into
 // out, each step fed by the last; needs flash attention, n_rs_seq 0 and a
@@ -140,6 +171,9 @@ LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);
 // Whether this context runs attention through the flash-attention path. The
 // chained MTP round is written against it and cannot be built without it.
 LLAMA_API bool llama_context_flash_attn(const struct llama_context * ctx);
+
+// Whether this context keeps every sequence in one KV stream. A chained MTP round over several sequences needs it.
+LLAMA_API bool llama_context_kv_unified(const struct llama_context * ctx);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

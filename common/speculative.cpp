@@ -178,6 +178,8 @@ struct common_speculative_impl {
     // draft once the verify that takes them there is queued
     virtual llama_context * ids_pending(llama_seq_id /*seq_id*/) const { return nullptr; }
     virtual bool resolve_ids(llama_seq_id /*seq_id*/) { return false; }
+    // (optional) the next decode on ctx_tgt takes those ids for the rows of seq at pos0 + 1 .. pos0 + n, on the device
+    virtual bool arm_verify(llama_context * /*ctx_tgt*/, llama_seq_id /*seq_id*/, llama_pos /*pos0*/, int32_t /*n*/) { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1327,144 +1329,244 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
     int32_t n_chain       = 0;       // > 0: the whole draft round runs as one graph, see draft_chained()
-    // a chained round replays the verify batch the server hands to process()
-    // and drafts from the row the target accepted last. The decode is launched
-    // right there when the target samples on the device, its inputs taken
-    // from the target's graph, and collected when the server asks for the
-    // draft; the first round of a request, a short verify batch and a target
-    // sampling on the host go through the host instead, see chain_launch()
-    std::vector<llama_token> replay_tok;
-    std::vector<llama_pos>   replay_pos;
-    int32_t                  replay_n       = 0;
-    int32_t                  last_accepted  = 0;
-    bool                     chain_started  = false; // a chained decode ran for this request
-    bool                     chain_launched = false; // one is in flight
-    llama_pos                chain_base     = 0;     // position of its replay row 0
-    int32_t                  chain_off      = 1;     // the anchor sits at chain_base + n_acc + chain_off
-    llama_pos                chain_expect   = -1;    // where the next verify batch starts, -1 when none is due
-    bool                     defer_last     = false; // the last batch was a verify batch this drafter did not decode
-    std::vector<int32_t>     round_c;               // the host route's inputs
-    std::vector<float>       round_h;
-    // a draft left on the device for the verify to take there (llama_set_tokens_device): the draft holds
-    // placeholders until resolve_ids() reads the ids, which the host then waits for behind nothing but the draft
-    // graph. LLAMA_NO_DRAFT_HANDOFF=1 reads them before the verify is queued, as before
-    llama_tokens *           ids_result     = nullptr;
-    llama_pos                ids_n_past     = -1;
 
-    // The whole round in one decode: n_chain positions on the draft context,
-    // the anchor token and the target's hidden state in position 0 and the
-    // rest chosen inside the graph. The graph picks every token by argmax, so
-    // reading the logits back is only to learn what it picked.
-    // one chained decode: V = n_chain+1 replay rows at base, then the anchor
-    // and the chain. On the host route the round's inputs are built here: the
-    // target's samples as far as the server accepted them, a mismatch past
-    // that, and the target's hidden rows; the device route leaves them to the
-    // target's graph
-    void chain_launch(bool host_route, llama_pos base, llama_token id_last) {
+    // a chained round replays the verify batch of every drafting sequence in one decode, launched in process() right
+    // behind the verify when its inputs can come from the target's graph and from the host otherwise, see chain_launch()
+    struct chain_seq {
+        std::vector<llama_token> replay_tok;
+        std::vector<llama_pos>   replay_pos;
+        std::vector<float>       replay_h;               // the target's hidden rows of the replay
+        int32_t                  replay_n      = 0;
+        int32_t                  last_accepted = 0;
+        bool                     started       = false;  // a chained decode ran for this request
+        llama_pos                base          = 0;      // position of its replay row 0
+        int32_t                  off           = 1;      // the anchor sits at base + n_acc + off
+        llama_pos                expect        = -1;     // where the next verify batch starts, -1 when none is due
+        bool                     defer_last    = false;  // the last batch was a verify batch this drafter did not decode
+        int32_t                  col           = -1;     // its column in the chained decode in flight
+        // a draft left on the device for the verify to take there (llama_set_tokens_device_seq): the draft holds
+        // placeholders until resolve_ids() reads the ids, which the host then waits for behind nothing but the
+        // draft graph. LLAMA_NO_DRAFT_HANDOFF=1 reads them before the verify is queued, as before
+        llama_tokens *           ids_result    = nullptr;
+        int32_t                  ids_col       = -1;
+        llama_pos                ids_n_past    = -1;
+    };
+    std::vector<chain_seq> chain;
+    bool chain_launched = false; // a chained decode no draft has taken yet is in flight
+
+    std::vector<int32_t>             round_c; // the host route's inputs
+    std::vector<float>               round_h;
+    std::vector<llama_mtp_round_seq> round_seqs;
+
+    void chain_reset(llama_seq_id seq) {
+        auto & cs = chain[seq];
+        cs.started    = false;
+        cs.expect     = -1;
+        cs.replay_n   = 0;
+        cs.defer_last = false;
+        cs.col        = -1;
+        chain_launched = false;
+        for (const auto & c : chain) {
+            chain_launched = chain_launched || c.col >= 0;
+        }
+    }
+
+    // One chained decode over seqs: per sequence V = n_chain+1 replay rows at its base, then the chain rows step by
+    // step. On the host route the round's inputs are built here: the target's samples as far as the server accepted
+    // them, a mismatch past that, and the target's hidden rows; the device route leaves them to the target's graph
+    void chain_launch(const std::vector<llama_seq_id> & seqs, bool host_route, const common_speculative_draft_params_vec * dparams) {
         auto * ctx_dft = params.ctx_dft;
         auto * ctx_tgt = params.ctx_tgt;
         const int K = n_chain;
         const int V = n_chain + 1;
+        const int S = (int) seqs.size();
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        const bool first = !chain_started || replay_n == 0;
 
         common_batch_clear(batch);
+        round_seqs.assign(S, llama_mtp_round_seq());
         if (host_route) {
-            round_c.assign(V, -1);
-            round_h.assign((size_t) n_embd * V, 0.0f);
-            if (first) {
-                // nothing to replay: junk rows the chain never sees, the anchor at base
-                for (int k = 0; k < V; ++k) {
-                    common_batch_add(batch, k == 0 ? id_last : 1, base + k, { 0 }, false);
+            round_c.assign((size_t) S*V, -1);
+            round_h.assign((size_t) S*V*n_embd, 0.0f);
+        }
+        for (int s = 0; s < S; ++s) {
+            const llama_seq_id seq = seqs[s];
+            auto & cs = chain[seq];
+            auto & q  = round_seqs[s];
+            q.seq_id = seq;
+            if (host_route) {
+                const auto & dp = (*dparams)[seq];
+                const bool first = !cs.started || cs.replay_n == 0;
+                // rows past the replay: never equal to what the round compares them with
+                const llama_token junk = dp.id_last == 1 ? 2 : 1;
+                int32_t * c = round_c.data() + (size_t) s*V;
+                float   * h = round_h.data() + (size_t) s*V*n_embd;
+                if (first) {
+                    // nothing to replay: junk rows the chain never sees, the anchor at base
+                    cs.base = dp.n_past;
+                    for (int k = 0; k < V; ++k) {
+                        common_batch_add(batch, k == 0 ? dp.id_last : junk, cs.base + k, { seq }, false);
+                    }
+                    c[0] = dp.id_last;
+                    std::memcpy(h, pending_h[seq].data(), row_bytes);
+                    q.h_pend = pending_h[seq].data();
+                    q.off    = 0;
+                } else {
+                    cs.base = cs.replay_pos[0];
+                    for (int k = 0; k < V; ++k) {
+                        const bool real = k < cs.replay_n;
+                        common_batch_add(batch, real ? cs.replay_tok[k] : junk,
+                                real ? cs.replay_pos[k] : cs.replay_pos[cs.replay_n - 1] + (k - cs.replay_n + 1), { seq }, false);
+                    }
+                    for (int i = 0; i < K; ++i) {
+                        c[i] = i < cs.last_accepted ? cs.replay_tok[i + 1] : -1;
+                    }
+                    c[std::min(cs.last_accepted, K)] = dp.id_last;
+                    GGML_ASSERT(cs.replay_h.size() >= (size_t) cs.replay_n*n_embd);
+                    std::memcpy(h, cs.replay_h.data(), row_bytes * cs.replay_n);
+                    // replay row 0 pairs with the row the sequence's last round left on the device
+                    q.h_pend = nullptr;
+                    q.off    = 1;
                 }
-                round_c[0] = id_last;
-                std::memcpy(round_h.data(), pending_h[0].data(), row_bytes);
-                chain_off = 0;
+                q.c_ids = c;
+                q.h_tgt = h;
             } else {
+                cs.base = cs.replay_pos[0];
                 for (int k = 0; k < V; ++k) {
-                    const bool real = k < replay_n;
-                    common_batch_add(batch, real ? replay_tok[k] : 1, real ? replay_pos[k] : replay_pos[replay_n - 1] + (k - replay_n + 1), { 0 }, false);
+                    common_batch_add(batch, cs.replay_tok[k], cs.replay_pos[k], { seq }, false);
                 }
-                for (int i = 0; i < K; ++i) {
-                    round_c[i] = i < last_accepted ? replay_tok[i + 1] : -1;
-                }
-                round_c[std::min(last_accepted, K)] = id_last;
-                for (int k = 0; k < replay_n; ++k) {
-                    std::memcpy(round_h.data() + (size_t) k * n_embd, llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[0] + k), row_bytes);
-                }
-                chain_off = 1;
+                q.off = 1;
+                const bool ok = llama_get_last_rows(ctx_tgt, seq, cs.replay_pos[0], V, &q.tgt_row, &q.tgt_out);
+                GGML_ASSERT(ok);
             }
-            llama_set_mtp_round_host(ctx_dft, round_c.data(), round_h.data(), pending_h[0].data(), chain_off);
-        } else {
-            for (int k = 0; k < V; ++k) {
-                common_batch_add(batch, replay_tok[k], replay_pos[k], { 0 }, false);
-            }
-            chain_off = 1;
+            cs.off = q.off;
         }
         for (int j = 0; j < K; ++j) {
-            common_batch_add(batch, 0, base + V + j, { 0 }, false);
+            for (int s = 0; s < S; ++s) {
+                common_batch_add(batch, 0, chain[seqs[s]].base + V + j, { seqs[s] }, false);
+            }
         }
-        std::memset(batch.embd, 0, row_bytes * (V + K));
+        std::memset(batch.embd, 0, row_bytes * batch.n_tokens);
 
-        SPC_DBG("chain_launch: host_route %d first %d base %d replay_n %d last_accepted %d id_last %d\n", (int) host_route, (int) first, (int) base, (int) replay_n, (int) last_accepted, (int) id_last);
+        for (int s = 0; s < S; ++s) {
+            const auto & cs = chain[seqs[s]];
+            SPC_DBG("chain_launch: seq %d host_route %d base %d replay_n %d last_accepted %d\n",
+                    (int) seqs[s], (int) host_route, (int) cs.base, (int) cs.replay_n, (int) cs.last_accepted);
+            // the cache goes back to base: the last round's chain and the replay rows it did not accept live there
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seqs[s], cs.base, -1);
+        }
 
-        // the cache goes back to base: the last round's chain and the replay
-        // rows it did not accept live there
-        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, base, -1);
-        chain_base = base;
-
+        llama_set_mtp_round_seqs(ctx_dft, round_seqs.data(), S);
         llama_set_mtp_chain(ctx_dft, n_chain);
         const int ret = llama_decode(ctx_dft, batch);
         llama_set_mtp_chain(ctx_dft, 0);
 
+        for (auto & c : chain) {
+            c.col = -1;
+        }
         if (ret != 0) {
-            SPC_ERR("llama_decode(chained, n=%d) returned %d\n", n_chain, ret);
+            SPC_ERR("llama_decode(chained, n=%d, n_seq=%d) returned %d\n", n_chain, S, ret);
             chain_launched = false;
             return;
         }
         chain_launched = true;
-        chain_started  = true;
-        replay_n = 0;
+        for (int s = 0; s < S; ++s) {
+            auto & cs = chain[seqs[s]];
+            cs.col      = s;
+            cs.started  = true;
+            cs.replay_n = 0;
+        }
     }
 
     llama_context * ids_pending(llama_seq_id seq_id) const override {
-        return ids_result != nullptr && seq_id == 0 ? params.ctx_dft : nullptr;
+        return seq_id >= 0 && seq_id < (llama_seq_id) chain.size() && chain[seq_id].ids_result != nullptr ? params.ctx_dft : nullptr;
     }
 
-    bool resolve_ids(llama_seq_id seq_id) override {
-        if (ids_result == nullptr || seq_id != 0) {
+    bool arm_verify(llama_context * ctx_tgt, llama_seq_id seq_id, llama_pos pos0, int32_t n) override {
+        if (ids_pending(seq_id) == nullptr) {
             return false;
         }
-        llama_tokens * result = ids_result;
-        ids_result = nullptr;
+        return llama_set_tokens_device_seq(ctx_tgt, params.ctx_dft, seq_id, pos0, n, chain[seq_id].ids_col);
+    }
+
+    // The ids column col of the last chained decode drafted: written over result's placeholders (fill), or appended
+    // when the round drafted for where the server is. False when the round drafted for a place the server has left.
+    bool take_ids(const chain_seq & cs, int32_t col, llama_pos n_past, llama_tokens & result, bool fill) {
         const int K = n_chain;
         int32_t n_ids = 0;
         const llama_token * ids = llama_get_mtp_chain_ids(params.ctx_dft, &n_ids);
-        GGML_ASSERT(n_ids == K + 1);
-        const int32_t n_acc = ids[K];
-        if (ids_n_past != chain_base + n_acc + chain_off) {
-            // drafted for a place the server has left; the verify took them on the device already and rejects
-            // them like any other wrong guess
-            SPC_DBG("chained draft for a stale position: n_past %d, round expected %d\n", (int) ids_n_past,
-                    (int) (chain_base + n_acc + chain_off));
+        const int32_t S = llama_get_mtp_chain_n_seq(params.ctx_dft);
+        GGML_ASSERT(n_ids == (K + 1)*S && col >= 0 && col < S);
+        const int32_t n_acc = ids[K*S + col];
+        const bool here = n_past == cs.base + n_acc + cs.off;
+        if (!here) {
+            SPC_DBG("chained draft for a stale position: n_past %d, round expected %d\n", (int) n_past, (int) (cs.base + n_acc + cs.off));
         }
-        // a draft cut short to what the request has left keeps the chain's first ids
-        const size_t n = std::min<size_t>(K, result->size());
-        std::copy(ids, ids + n, result->begin());
+        if (fill) {
+            // a draft cut short to what the request has left keeps the chain's first ids
+            const size_t n = std::min<size_t>(K, result.size());
+            for (size_t j = 0; j < n; ++j) {
+                result[j] = ids[j*S + col];
+            }
+        } else if (here) {
+            for (int j = 0; j < K; ++j) {
+                result.push_back(ids[j*S + col]);
+            }
+        }
+        return here;
+    }
+
+    bool resolve_ids(llama_seq_id seq_id) override {
+        if (ids_pending(seq_id) == nullptr) {
+            return false;
+        }
+        auto & cs = chain[seq_id];
+        llama_tokens * result = cs.ids_result;
+        cs.ids_result = nullptr;
+        // drafted for a place the server has left, the verify took them on the device already and rejects them
+        // like any other wrong guess
+        take_ids(cs, cs.ids_col, cs.ids_n_past, *result, true);
         return true;
     }
 
+    void resolve_all() {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) chain.size(); ++seq_id) {
+            resolve_ids(seq_id);
+        }
+    }
+
     void draft_chained(common_speculative_draft_params_vec & dparams) {
-        resolve_ids(0);
-        auto & dp = dparams[0];
-        if (!dp.drafting) {
+        resolve_all();
+        const int K = n_chain;
+
+        std::vector<llama_seq_id> want;
+        std::vector<llama_seq_id> rest;
+        for (llama_seq_id seq = 0; seq < (llama_seq_id) n_seq; ++seq) {
+            auto & cs = chain[seq];
+            if (!dparams[seq].drafting) {
+                cs.expect = -1;
+                continue;
+            }
+            want.push_back(seq);
+            cs.expect = dparams[seq].n_past; // the next verify batch starts at the anchor, drafts or not
+            if (!chain_launched || cs.col < 0) {
+                rest.push_back(seq);
+            }
+        }
+        if (want.empty()) {
             return;
         }
-        const int K = n_chain;
-        chain_expect = dp.n_past; // the next verify batch starts at the anchor, drafts or not
 
-        if (!chain_launched) {
-            chain_launch(true, (!chain_started || replay_n == 0) ? dp.n_past : replay_pos[0], dp.id_last);
+        if (!rest.empty()) {
+            if (chain_launched) {
+                // the decode in flight lacks some of them: its drafts are read back before a second decode
+                for (llama_seq_id seq : want) {
+                    const auto & cs = chain[seq];
+                    if (cs.col >= 0) {
+                        take_ids(cs, cs.col, dparams[seq].n_past, *dparams[seq].result, false);
+                    }
+                }
+            }
+            chain_launch(rest, true, &dparams);
             if (!chain_launched) {
                 return;
             }
@@ -1473,38 +1575,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         static const bool no_handoff = getenv("LLAMA_NO_DRAFT_HANDOFF") != nullptr;
         if (!no_handoff) {
-            auto & result = *dp.result;
-            result.insert(result.end(), K, dp.id_last);
-            ids_result = dp.result;
-            ids_n_past = dp.n_past;
+            for (llama_seq_id seq : want) {
+                auto & cs = chain[seq];
+                if (cs.col < 0) {
+                    continue;
+                }
+                auto & dp = dparams[seq];
+                dp.result->insert(dp.result->end(), K, dp.id_last);
+                cs.ids_result = dp.result;
+                cs.ids_col    = cs.col;
+                cs.ids_n_past = dp.n_past;
+                cs.col        = -1;
+            }
             return;
         }
 
         static struct spc_draft_timing {
             bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
-            double ids = 0, rest = 0; int n = 0;
+            double ids = 0; int n = 0;
         } spct;
         const int64_t spc_t0 = spct.on ? ggml_time_us() : 0;
-        int32_t n_ids = 0;
-        const llama_token * ids = llama_get_mtp_chain_ids(params.ctx_dft, &n_ids);
+        for (llama_seq_id seq : want) {
+            auto & cs = chain[seq];
+            if (cs.col < 0) {
+                continue;
+            }
+            // the round put the anchor after the rows it accepted; a server that
+            // moved elsewhere (a restored checkpoint) gets no draft this time
+            take_ids(cs, cs.col, dparams[seq].n_past, *dparams[seq].result, false);
+            cs.col = -1;
+        }
         if (spct.on) {
             spct.ids += (ggml_time_us() - spc_t0) / 1000.0;
             if (++spct.n % 100 == 0) {
                 fprintf(stderr, "[round] draft phase n=%d  read ids %.3f ms per round\n", spct.n, spct.ids / spct.n);
             }
         }
-        GGML_ASSERT(n_ids == K + 1);
-        const int32_t n_acc = ids[K];
-
-        // the round put the anchor after the rows it accepted; a server that
-        // moved elsewhere (a restored checkpoint) gets no draft this time
-        if (dp.n_past != chain_base + n_acc + chain_off) {
-            SPC_DBG("chained draft discarded: n_past %d, round expected %d\n", (int) dp.n_past, (int) (chain_base + n_acc + chain_off));
-            return;
-        }
-
-        auto & result = *dp.result;
-        result.insert(result.end(), ids, ids + K);
     }
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
@@ -1583,28 +1689,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        // one trained head and one sequence: the round's draft steps can run
-        // as a single graph, which saves a host round trip per drafted token.
+        // one trained head: the round's draft steps can run as a single graph,
+        // which saves a host round trip per drafted token, and one graph covers
+        // every drafting sequence when the draft context keeps one KV stream.
         // backend sampling allows one output per sequence and a chained
         // round needs n_max, so the draft reads its logits back instead
         // LLAMA_NO_MTP_CHAIN=1 drafts a token per decode instead, which is what
         // the round costs without a graph of its own: for measuring the two
-        // against each other with one binary
-        static const bool no_chain = getenv("LLAMA_NO_MTP_CHAIN") != nullptr;
-        if (!no_chain && !chain_heads && n_seq == 1 && this->params.n_max >= 2 &&
+        // against each other with one binary. With more than one sequence the
+        // round is chained only under LLAMA_MTP_CHAIN_SEQS=1
+        static const bool no_chain   = getenv("LLAMA_NO_MTP_CHAIN") != nullptr;
+        static const bool chain_seqs = getenv("LLAMA_MTP_CHAIN_SEQS") != nullptr && atoi(getenv("LLAMA_MTP_CHAIN_SEQS")) != 0;
+        const uint32_t n_round_rows = n_seq * (2*this->params.n_max + 1);
+        const bool seqs_ok = n_seq == 1 || (chain_seqs && llama_context_kv_unified(ctx_dft) &&
+                n_round_rows <= llama_n_ubatch(ctx_dft) && n_round_rows <= llama_n_batch(ctx_dft));
+        if (!no_chain && !chain_heads && seqs_ok && this->params.n_max >= 2 &&
                 llama_context_flash_attn(ctx_dft) &&
                 llama_model_has_mtp_chain(llama_get_model(ctx_dft))) {
             n_chain = this->params.n_max;
             llama_set_mtp_round_target(ctx_dft, ctx_tgt);
 
-            if (!backend_chains.empty() && backend_chains[0]) {
-                llama_set_sampler(ctx_dft, 0, nullptr);
-                llama_sampler_free(backend_chains[0]);
-                backend_chains[0] = nullptr;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+                if (backend_chains[seq_id]) {
+                    llama_set_sampler(ctx_dft, seq_id, nullptr);
+                    llama_sampler_free(backend_chains[seq_id]);
+                    backend_chains[seq_id] = nullptr;
+                }
             }
 
-            SPC_TRC("- chained drafting, n=%d\n", n_chain);
+            SPC_TRC("- chained drafting, n=%d, n_seq=%u\n", n_chain, n_seq);
         }
+        chain.assign(n_seq, chain_seq());
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1654,11 +1769,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
-        chain_started  = false;
-        chain_launched = false;
-        chain_expect   = -1;
-        replay_n       = 0;
-        defer_last     = false;
+        if (seq_id >= 0 && seq_id < (llama_seq_id) chain.size()) {
+            chain_reset(seq_id);
+        }
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
@@ -1669,8 +1782,118 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // A chained drafter replays a verify batch in its next round instead of decoding it here. Any other rows go
+    // through the MTP layer now, and their sequences' rounds start over from the host.
+    bool process_chained(const llama_batch & batch_in) {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const int32_t n_tokens  = batch_in.n_tokens;
+        const int     V         = n_chain + 1;
+        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+
+        std::vector<llama_seq_id> deferred;
+        std::vector<bool>         is_deferred(n_seq, false);
+        bool all_deferred = true;
+        for (llama_seq_id seq = 0; seq < (llama_seq_id) n_seq; ++seq) {
+            const int32_t beg = i_batch_beg[seq];
+            if (beg < 0) {
+                continue;
+            }
+            auto & cs = chain[seq];
+            const int32_t n_rows = i_batch_end[seq] - beg + 1;
+            bool ok = n_rows <= V && cs.expect >= 0 && batch_in.pos[beg] == cs.expect;
+            for (int32_t k = beg; ok && k <= i_batch_end[seq]; ++k) {
+                ok = batch_in.seq_id[k][0] == seq && batch_in.pos[k] == batch_in.pos[beg] + (k - beg);
+            }
+            if (!ok) {
+                all_deferred = false;
+                chain_reset(seq);
+                continue;
+            }
+            cs.replay_tok.assign(batch_in.token + beg, batch_in.token + beg + n_rows);
+            cs.replay_pos.assign(batch_in.pos   + beg, batch_in.pos   + beg + n_rows);
+            cs.replay_n   = n_rows;
+            cs.defer_last = true;
+            cs.col        = -1;
+            deferred.push_back(seq);
+            is_deferred[seq] = true;
+        }
+
+        if (!all_deferred) {
+            common_batch_clear(batch);
+
+            // each row pairs with the target's hidden row of its sequence's row before it
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            std::vector<int32_t> prev(n_seq, -1);
+            for (int k = 0; k < n_tokens; ++k) {
+                const llama_seq_id seq = batch_in.seq_id[k][0];
+                if (is_deferred[seq]) {
+                    continue;
+                }
+                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq }, 0);
+                const float * h_row = prev[seq] < 0 ? pending_h[seq].data() : h_tgt + (size_t) prev[seq] * n_embd;
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                prev[seq] = k;
+            }
+
+            const int32_t rc = llama_decode(ctx_dft, batch);
+            if (rc != 0) {
+                SPC_ERR("llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
+                return false;
+            }
+
+            for (llama_seq_id seq = 0; seq < (llama_seq_id) n_seq; ++seq) {
+                if (i_batch_end[seq] < 0 || is_deferred[seq]) {
+                    continue;
+                }
+
+                const int32_t n_rows = i_batch_end[seq] - i_batch_beg[seq] + 1;
+                verify_h_rows[seq] = n_rows;
+                verify_h[seq].resize((size_t) n_rows * n_embd);
+
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq] + i);
+                    std::memcpy(verify_h[seq].data() + (size_t) i * n_embd, h, row_bytes);
+                }
+
+                std::memcpy(pending_h[seq].data(), verify_h[seq].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            }
+        }
+
+        if (deferred.empty()) {
+            return true;
+        }
+
+        // the next round goes on the device right behind this verify when it holds every verify that was due
+        bool dev = all_deferred;
+        for (llama_seq_id seq = 0; dev && seq < (llama_seq_id) n_seq; ++seq) {
+            dev = chain[seq].expect < 0 || is_deferred[seq];
+        }
+        for (llama_seq_id seq : deferred) {
+            const auto & cs = chain[seq];
+            dev = dev && cs.started && cs.replay_n == V && llama_sampler_on_backend(ctx_tgt, seq) &&
+                  llama_get_last_rows(ctx_tgt, seq, cs.replay_pos[0], V, nullptr, nullptr);
+        }
+        if (dev) {
+            chain_launch(deferred, false, nullptr);
+        }
+
+        // the target's hidden rows of each replay: the anchor's for accept(), and a host round's inputs
+        for (llama_seq_id seq : deferred) {
+            auto & cs = chain[seq];
+            const int32_t n_rows = (int32_t) cs.replay_tok.size();
+            cs.replay_h.resize((size_t) n_rows * n_embd);
+            for (int32_t i = 0; i < n_rows; ++i) {
+                std::memcpy(cs.replay_h.data() + (size_t) i * n_embd, llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq] + i), row_bytes);
+            }
+        }
+
+        return true;
+    }
+
     bool process(const llama_batch & batch_in) override {
-        resolve_ids(0);
+        resolve_all();
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1679,11 +1902,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             // the drafter never sees these positions, so a round started before
             // them must not be replayed across the gap
-            chain_started  = false;
-            chain_launched = false;
-            chain_expect   = -1;
-            replay_n       = 0;
-            defer_last     = false;
+            for (llama_seq_id seq = 0; seq < (llama_seq_id) chain.size(); ++seq) {
+                chain_reset(seq);
+            }
             return true;
         }
 
@@ -1706,29 +1927,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        if (n_chain > 0) {
+            return process_chained(batch_in);
+        }
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-
-        const bool defer = n_chain > 0 && n_tokens <= n_chain + 1 && chain_expect >= 0 && batch_in.pos[0] == chain_expect;
-        if (defer) {
-            replay_tok.assign(batch_in.token, batch_in.token + n_tokens);
-            replay_pos.assign(batch_in.pos,   batch_in.pos   + n_tokens);
-            replay_n       = n_tokens;
-            chain_launched = false;
-            defer_last     = true;
-            if (chain_started && n_tokens == n_chain + 1 && llama_sampler_on_backend(ctx_tgt, 0)) {
-                chain_launch(false, replay_pos[0], LLAMA_TOKEN_NULL);
-            }
-            return true;
-        }
-        // any other batch goes through the MTP layer here, and the rounds start over from the host
-        chain_started  = false;
-        chain_launched = false;
-        chain_expect   = -1;
-        replay_n       = 0;
-        defer_last     = false;
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1971,19 +2177,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
-        resolve_ids(0);
+        resolve_all();
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
-        last_accepted = n_accepted;
-        if (defer_last) {
-            // a verify batch this drafter did not decode: the anchor's hidden
-            // row is the target's row after the ones it accepted
-            defer_last = false;
-            const int32_t i_h = std::min<int32_t>(n_accepted, i_batch_end[seq_id] - i_batch_beg[seq_id]);
-            std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(params.ctx_tgt, i_batch_beg[seq_id] + i_h), (size_t) n_embd * sizeof(float));
-            return;
+        if (!chain.empty()) {
+            auto & cs = chain[seq_id];
+            cs.last_accepted = n_accepted;
+            if (cs.defer_last) {
+                // a verify batch this drafter did not decode: the anchor's hidden
+                // row is the target's row after the ones it accepted
+                cs.defer_last = false;
+                const int32_t n_rows = (int32_t) cs.replay_tok.size();
+                const int32_t i_h    = std::min<int32_t>(n_accepted, n_rows - 1);
+                std::memcpy(pending_h[seq_id].data(), cs.replay_h.data() + (size_t) i_h * n_embd, (size_t) n_embd * sizeof(float));
+                return;
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -2913,6 +3123,18 @@ llama_context * common_speculative_ids_pending(common_speculative * spec, llama_
         }
     }
     return nullptr;
+}
+
+bool common_speculative_arm_verify(common_speculative * spec, llama_context * ctx_tgt, llama_seq_id seq_id, llama_pos pos0, int32_t n) {
+    if (spec == nullptr) {
+        return false;
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->ids_pending(seq_id)) {
+            return impl->arm_verify(ctx_tgt, seq_id, pos0, n);
+        }
+    }
+    return false;
 }
 
 bool common_speculative_resolve(common_speculative * spec, llama_seq_id seq_id) {

@@ -68,8 +68,25 @@ static bool can_reuse_kq_mask(
 
 // impl
 
-static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t sched_dst, ggml_tensor * src, ggml_tensor * dst, size_t nbytes, size_t dst_offset);
+static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t sched_dst, ggml_tensor * src, ggml_tensor * dst, size_t nbytes, size_t dst_offset, size_t src_offset = 0);
 static void mtp_round_order(ggml_backend_sched_t sched_dst, ggml_backend_t b_src);
+
+// the drafted step and element a device-filled row takes, or -1 for a row the host fills
+static int32_t tokens_dev_row(const llama_tokens_dev_state & td, const llama_ubatch & ubatch, int32_t r, int32_t & col) {
+    for (const auto & sp : td.spans) {
+        int32_t j = -1;
+        if (sp.seq < 0) {
+            j = r - sp.row0;
+        } else if (ubatch.n_seq_id[r] == 1 && ubatch.seq_id[r][0] == sp.seq) {
+            j = ubatch.pos[r] - sp.pos0 - 1;
+        }
+        if (j >= 0 && j < sp.n) {
+            col = sp.col;
+            return j;
+        }
+    }
+    return -1;
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (device) {
@@ -80,35 +97,46 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         const size_t  es       = ggml_element_size(tokens);
 
         llama_tokens_dev_state * td = tokens_dev;
-        const std::vector<ggml_tensor *> * ids = td && td->n > 0 && td->src ? &td->src->get_mtp_ids_pending() : nullptr;
-        const bool armed = ids && td->i0 >= 0 && td->i0 + td->n <= n_tokens && (int32_t) ids->size() >= td->n;
-        if (armed && dev_tokens) {
+        const bool armed = td && td->src && !td->spans.empty();
+        const std::vector<ggml_tensor *> * ids = armed ? &td->src->get_mtp_ids_pending() : nullptr;
+        if (armed && dev_tokens && !ids->empty()) {
             // the host's rows around the drafter's, which it never writes: a later write of its placeholders would
             // race the copies below. The rows sit on the device, so neither the writes nor the copies wait for the
             // draft graph; the verify's graph does, on the device
-            if (td->i0 > 0) {
-                ggml_backend_tensor_set(tokens, ubatch->token, 0, td->i0*es);
-            }
-            if (td->i0 + td->n < n_tokens) {
-                ggml_backend_tensor_set(tokens, ubatch->token + td->i0 + td->n, (td->i0 + td->n)*es, (n_tokens - td->i0 - td->n)*es);
-            }
+            int32_t r0 = 0;
             ggml_backend_sched_t sched_src = td->src->get_sched();
-            for (int32_t j = 0; j < td->n; ++j) {
-                mtp_round_copy(sched_src, td->sched_dst, (*ids)[j], tokens, es, (size_t) (td->i0 + j)*es);
+            for (int32_t r = 0; r <= n_tokens; ++r) {
+                int32_t col = 0;
+                const int32_t j = r < n_tokens ? tokens_dev_row(*td, *ubatch, r, col) : -1;
+                if (r == n_tokens || j >= 0) {
+                    if (r > r0) {
+                        ggml_backend_tensor_set(tokens, ubatch->token + r0, r0*es, (r - r0)*es);
+                    }
+                    r0 = r + 1;
+                }
+                if (j >= 0) {
+                    GGML_ASSERT(j < (int32_t) ids->size() && (size_t) (col + 1)*es <= ggml_nbytes((*ids)[j]));
+                    mtp_round_copy(sched_src, td->sched_dst, (*ids)[j], tokens, es, (size_t) r*es, (size_t) col*es);
+                }
             }
             mtp_round_order(td->sched_dst, ggml_backend_sched_get_tensor_backend(sched_src, (*ids)[0]));
         } else if (armed) {
             // a batch that did not get the device rows: read the drafted ids back here, and wait for them
+            int32_t n_ids = 0;
+            const llama_token * host_ids = td->src->get_mtp_chain_ids(n_ids);
+            const int32_t n_step = td->src->get_mtp_chain_n_seq() > 0 ? n_ids / td->src->get_mtp_chain_n_seq() : 0;
             std::vector<llama_token> rows(ubatch->token, ubatch->token + n_tokens);
-            for (int32_t j = 0; j < td->n; ++j) {
-                ggml_backend_tensor_get((*ids)[j], &rows[td->i0 + j], 0, sizeof(llama_token));
+            for (int32_t r = 0; r < n_tokens; ++r) {
+                int32_t col = 0;
+                const int32_t j = tokens_dev_row(*td, *ubatch, r, col);
+                if (j >= 0) {
+                    GGML_ASSERT(j < n_step && col < td->src->get_mtp_chain_n_seq());
+                    rows[r] = host_ids[j*td->src->get_mtp_chain_n_seq() + col];
+                }
             }
             ggml_backend_tensor_set(tokens, rows.data(), 0, n_tokens*es);
         } else {
             ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*es);
-        }
-        if (td) {
-            td->n = 0;
         }
     }
 
@@ -128,8 +156,7 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
 
     // the device rows are a different graph from a host input
-    const bool want_dev = !device && params.tokens_dev && params.tokens_dev->enabled && params.ubatch.token &&
-                          params.ubatch.n_tokens <= llama_tokens_dev_state::n_max;
+    const bool want_dev = !device && params.tokens_dev && params.tokens_dev->use_dev(params.ubatch);
     res &= want_dev == dev_tokens;
 
     return res;
@@ -168,34 +195,41 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-// the round's inputs, on the device, for as long as the context lives
-static void mtp_round_ensure_dev(llama_mtp_round_state * st, ggml_backend_buffer_type_t buft, int64_t n_embd, int64_t n_verify) {
-    if (st->ctx_dev && st->n_embd_dev == n_embd && st->n_verify_dev == n_verify) {
-        return;
+// the round's inputs for n_seq sequences, on the device, for as long as the context lives
+static const llama_mtp_round_stage & mtp_round_ensure_dev(llama_mtp_round_state * st, ggml_backend_buffer_type_t buft, int64_t n_embd, int64_t n_verify, int64_t n_seq) {
+    if (st->n_embd_dev != n_embd || st->n_verify_dev != n_verify) {
+        st->free_stages();
+        st->n_embd_dev   = n_embd;
+        st->n_verify_dev = n_verify;
     }
-    if (st->buf_dev) { ggml_backend_buffer_free(st->buf_dev); st->buf_dev = nullptr; }
-    if (st->ctx_dev) { ggml_free(st->ctx_dev); st->ctx_dev = nullptr; }
+    if ((int64_t) st->stages.size() < n_seq) {
+        st->stages.resize(n_seq);
+    }
+    auto & sg = st->stages[n_seq - 1];
+    if (sg.ctx_dev) {
+        return sg;
+    }
 
     ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
-    st->ctx_dev = ggml_init(ip);
-    GGML_ASSERT(st->ctx_dev);
+    sg.ctx_dev = ggml_init(ip);
+    GGML_ASSERT(sg.ctx_dev);
 
-    st->c_ids_dev  = ggml_new_tensor_1d(st->ctx_dev, GGML_TYPE_I32, n_verify);
-    st->h_tgt_dev  = ggml_new_tensor_2d(st->ctx_dev, GGML_TYPE_F32, n_embd, n_verify);
-    st->h_pend_dev = ggml_new_tensor_2d(st->ctx_dev, GGML_TYPE_F32, n_embd, 1);
-    ggml_set_name(st->c_ids_dev,  "mtp_round_c");
-    ggml_set_name(st->h_tgt_dev,  "mtp_round_h");
-    ggml_set_name(st->h_pend_dev, "mtp_round_hpend");
+    sg.c_ids_dev  = ggml_new_tensor_1d(sg.ctx_dev, GGML_TYPE_I32, n_verify*n_seq);
+    sg.h_tgt_dev  = ggml_new_tensor_2d(sg.ctx_dev, GGML_TYPE_F32, n_embd, n_verify*n_seq);
+    sg.h_pend_dev = ggml_new_tensor_2d(sg.ctx_dev, GGML_TYPE_F32, n_embd, n_seq);
+    ggml_set_name(sg.c_ids_dev,  "mtp_round_c");
+    ggml_set_name(sg.h_tgt_dev,  "mtp_round_h");
+    ggml_set_name(sg.h_pend_dev, "mtp_round_hpend");
 
-    st->buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(st->ctx_dev, buft);
-    GGML_ASSERT(st->buf_dev && "failed to allocate the MTP round inputs");
-    st->n_embd_dev   = n_embd;
-    st->n_verify_dev = n_verify;
+    sg.buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(sg.ctx_dev, buft);
+    GGML_ASSERT(sg.buf_dev && "failed to allocate the MTP round inputs");
+    return sg;
 }
 
-// copies n elements from the front of src into dst, on the device, ordered
+// copies nbytes from src at src_offset into dst at dst_offset, on the device, ordered
 // after the graph that wrote src
-static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t sched_dst, ggml_tensor * src, ggml_tensor * dst, size_t nbytes, size_t dst_offset) {
+static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t sched_dst, ggml_tensor * src, ggml_tensor * dst, size_t nbytes, size_t dst_offset, size_t src_offset) {
+    GGML_ASSERT(src_offset + nbytes <= ggml_nbytes(src) && dst_offset + nbytes <= ggml_nbytes(dst));
     ggml_tensor s = *src;
     ggml_tensor d = *dst;
     s.ne[0] = (int64_t) (nbytes / ggml_type_size(src->type)); s.ne[1] = 1; s.ne[2] = 1; s.ne[3] = 1;
@@ -203,11 +237,16 @@ static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t 
     d.ne[0] = s.ne[0]; d.ne[1] = 1; d.ne[2] = 1; d.ne[3] = 1;
     d.nb[1] = nbytes; d.nb[2] = nbytes; d.nb[3] = nbytes;
     d.data = (char *) dst->data + dst_offset;
+    s.data = (char *) src->data + src_offset;
     d.view_src = nullptr;
     s.view_src = nullptr;
     ggml_backend_t b_src = ggml_backend_sched_get_tensor_backend(sched_src, src);
+    if (!b_src && src->view_src) {
+        b_src = ggml_backend_sched_get_tensor_backend(sched_src, src->view_src);
+    }
     ggml_backend_t b_dst = ggml_backend_sched_get_tensor_backend(sched_dst, dst);
-    // a persistent tensor outside any graph shares its peer's backend
+    // a persistent tensor outside any graph shares its peer's backend; a graph's tensor always has its own
+    GGML_ASSERT((b_src || sched_src == sched_dst) && "MTP round: no backend for a tensor of another context's graph");
     if (!b_src) b_src = b_dst;
     if (!b_dst) b_dst = b_src;
     GGML_ASSERT(b_src && b_dst);
@@ -278,64 +317,91 @@ static mtp_round_input_timing & mtp_round_input_timer() { static mtp_round_input
 void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
     const auto * st = state;
+    GGML_ASSERT((int64_t) st->seqs.size() == n_seq);
     const size_t row_bytes = (size_t) n_embd * sizeof(float);
+    const size_t es        = sizeof(int32_t);
     auto & rit = mtp_round_input_timer();
     const int64_t rit0 = rit.on ? ggml_time_us() : 0;
     double rit_copies = 0;
+    bool   any_host   = false;
 
-    if (st->host) {
-        GGML_ASSERT(st->c_ids_host && st->h_tgt_host && st->h_pend_host);
-        ggml_backend_tensor_set(h_tgt,  st->h_tgt_host,  0, row_bytes * n_verify);
-        ggml_backend_tensor_set(h_pend, st->h_pend_host, 0, row_bytes);
-        ggml_backend_tensor_set(c_ids,  st->c_ids_host,  0, ggml_nbytes(c_ids));
-    } else {
-        GGML_ASSERT(st->ctx_tgt && st->hpend_dev);
-        auto * res_tgt = st->ctx_tgt->get_gf_res_prev();
-        ggml_backend_sched_t sched_tgt = st->ctx_tgt->get_sched();
+    llm_graph_result   * res_tgt   = nullptr;
+    ggml_backend_sched_t sched_tgt = nullptr;
+    ggml_tensor        * src_h     = nullptr;
 
-        ggml_tensor * src_h = res_tgt->get_h_nextn();
-        GGML_ASSERT(src_h && src_h->ne[0] == n_embd && src_h->ne[1] >= n_verify && ggml_is_contiguous(src_h));
-        const int64_t rit_c0 = rit.on ? ggml_time_us() : 0;
-        mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, 0);
-
-        GGML_ASSERT((int64_t) res_tgt->t_sampled.size() >= n_verify);
-        auto sampled_id = [&](int64_t i) {
-            ggml_tensor * src_c = res_tgt->t_sampled[i];
-            if (src_c == nullptr && i < (int64_t) res_tgt->t_candidates.size()) {
-                src_c = res_tgt->t_candidates[i]; // the greedy sampler leaves one candidate
+    std::vector<float> offs(n_seq);
+    for (int64_t s = 0; s < n_seq; ++s) {
+        const auto & q = st->seqs[s];
+        offs[s] = (float) q.off;
+        const size_t h_off = (size_t) s*n_verify*row_bytes;
+        const size_t c_off = (size_t) s*n_verify*es;
+        if (q.c_ids) {
+            GGML_ASSERT(q.h_tgt);
+            any_host = true;
+            ggml_backend_tensor_set(h_tgt, q.h_tgt, h_off, row_bytes * n_verify);
+            if (q.h_pend) {
+                ggml_backend_tensor_set(h_pend, q.h_pend, s*row_bytes, row_bytes);
             }
-            GGML_ASSERT(src_c && src_c->type == GGML_TYPE_I32 && "MTP round: the target must sample on the backend");
-            return src_c;
-        };
-        for (int64_t i = 0; i < n_verify; ) {
-            ggml_tensor * src_c = sampled_id(i);
-            // ids that sit back to back in one tensor (the batched greedy rows) go over as one copy
-            int64_t n_run = 1;
-            while (src_c->view_src != nullptr && i + n_run < n_verify && !llama_host_off(LLAMA_HOST_OFF_GREEDY_BATCH)) {
-                const ggml_tensor * next = sampled_id(i + n_run);
-                if (next->view_src != src_c->view_src || next->view_offs != src_c->view_offs + n_run*sizeof(int32_t)) {
-                    break;
+            ggml_backend_tensor_set(c_ids, q.c_ids, c_off, es * n_verify);
+        } else {
+            if (!res_tgt) {
+                GGML_ASSERT(st->ctx_tgt);
+                res_tgt   = st->ctx_tgt->get_gf_res_prev();
+                sched_tgt = st->ctx_tgt->get_sched();
+                src_h     = res_tgt->get_h_nextn();
+                GGML_ASSERT(src_h && src_h->ne[0] == n_embd && ggml_is_contiguous(src_h));
+            }
+            GGML_ASSERT(q.tgt_row >= 0 && q.tgt_row + n_verify <= src_h->ne[1]);
+            GGML_ASSERT(q.tgt_out >= 0 && (int64_t) res_tgt->t_sampled.size() >= q.tgt_out + n_verify);
+            const int64_t rit_c0 = rit.on ? ggml_time_us() : 0;
+            mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, h_off, (size_t) q.tgt_row*row_bytes);
+
+            auto sampled_id = [&](int64_t i) {
+                ggml_tensor * src_c = res_tgt->t_sampled[q.tgt_out + i];
+                if (src_c == nullptr && q.tgt_out + i < (int64_t) res_tgt->t_candidates.size()) {
+                    src_c = res_tgt->t_candidates[q.tgt_out + i]; // the greedy sampler leaves one candidate
                 }
-                n_run++;
+                GGML_ASSERT(src_c && src_c->type == GGML_TYPE_I32 && "MTP round: the target must sample on the backend");
+                return src_c;
+            };
+            for (int64_t i = 0; i < n_verify; ) {
+                ggml_tensor * src_c = sampled_id(i);
+                // ids that sit back to back in one tensor (the batched greedy rows) go over as one copy
+                int64_t n_run = 1;
+                while (src_c->view_src != nullptr && i + n_run < n_verify && !llama_host_off(LLAMA_HOST_OFF_GREEDY_BATCH)) {
+                    const ggml_tensor * next = sampled_id(i + n_run);
+                    if (next->view_src != src_c->view_src || next->view_offs != src_c->view_offs + n_run*sizeof(int32_t)) {
+                        break;
+                    }
+                    n_run++;
+                }
+                if (n_run > 1) {
+                    mtp_round_copy(sched_tgt, sched, src_c->view_src, c_ids, n_run*es, c_off + i*es, src_c->view_offs);
+                } else {
+                    mtp_round_copy(sched_tgt, sched, src_c, c_ids, es, c_off + i*es);
+                }
+                i += n_run;
             }
-            mtp_round_copy(sched_tgt, sched, src_c, c_ids, n_run*sizeof(int32_t), i * sizeof(int32_t));
-            i += n_run;
+            if (rit.on) { rit_copies += (ggml_time_us() - rit_c0) / 1000.0; }
         }
-
-        mtp_round_copy(sched, sched, st->hpend_dev, h_pend, row_bytes, 0);
+        if (!q.h_pend) {
+            GGML_ASSERT(st->hpend_dev && q.seq_id >= 0 && q.seq_id < st->hpend_dev->ne[1]);
+            mtp_round_copy(sched, sched, st->hpend_dev, h_pend, row_bytes, s*row_bytes, (size_t) q.seq_id*row_bytes);
+        }
+    }
+    if (src_h) {
         mtp_round_order(sched, ggml_backend_sched_get_tensor_backend(sched_tgt, src_h));
-        if (rit.on) { rit_copies = (ggml_time_us() - rit_c0) / 1000.0; }
     }
 
-    const float o = (float) st->off;
-    ggml_backend_tensor_set(off, &o, 0, sizeof(o));
-    if (rit.on) { rit.add((ggml_time_us() - rit0) / 1000.0, rit_copies, st->host); }
+    ggml_backend_tensor_set(off, offs.data(), 0, n_seq*sizeof(float));
+    if (rit.on) { rit.add((ggml_time_us() - rit0) / 1000.0, rit_copies, any_host); }
 }
 
 bool llm_graph_input_mtp_round::can_reuse(const llm_graph_params & params) {
     bool res = true;
     res &= params.mtp_round == state;
-    res &= c_ids && c_ids->ne[0] == n_verify;
+    res &= (int64_t) state->stages.size() >= n_seq && state->stages[n_seq - 1].c_ids_dev == c_ids;
+    res &= c_ids && c_ids->ne[0] == n_verify*n_seq;
     return res;
 }
 
@@ -2536,12 +2602,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         GGML_ASSERT(ubatch.token && ubatch.n_tokens <= loop->n_tok && "loop body: more tokens than the loop holds");
         inp->device = true;
         inp->tokens = ggml_view_1d(ctx0, loop->tok, ubatch.n_tokens, 0);
-    } else if (tokens_dev && tokens_dev->enabled && ubatch.token && ubatch.n_tokens <= llama_tokens_dev_state::n_max) {
+    } else if (tokens_dev && tokens_dev->use_dev(ubatch)) {
         if (!tokens_dev->tok_dev) {
             ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
             tokens_dev->ctx_dev = ggml_init(ip);
             GGML_ASSERT(tokens_dev->ctx_dev);
-            tokens_dev->tok_dev = ggml_new_tensor_1d(tokens_dev->ctx_dev, GGML_TYPE_I32, llama_tokens_dev_state::n_max);
+            tokens_dev->tok_dev = ggml_new_tensor_1d(tokens_dev->ctx_dev, GGML_TYPE_I32, tokens_dev->n_max);
             ggml_set_name(tokens_dev->tok_dev, "inp_tokens_dev");
             tokens_dev->buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(tokens_dev->ctx_dev, ggml_backend_buffer_get_type(tok_embd->buffer));
             GGML_ASSERT(tokens_dev->buf_dev && "failed to allocate the device token rows");
@@ -2769,24 +2835,30 @@ const llm_graph_mtp_attn & attn,
         n_embd_h = n_embd;
     }
     const int V = n_chain + 1;
-    GGML_ASSERT(n_tokens == V + K && "MTP round: n_chain+1 replay rows and n_chain chain rows");
+    const int64_t n_seq = n_tokens / (V + K);
+    GGML_ASSERT(n_seq >= 1 && n_tokens == n_seq*(V + K) && "MTP round: n_chain+1 replay rows and n_chain chain rows per sequence");
     GGML_ASSERT(inp_tokens && "MTP round: needs the verify tokens");
     GGML_ASSERT(cparams.flash_attn && "MTP round: needs flash attention");
     GGML_ASSERT(mtp_round && "MTP round: needs the round state");
 
-    mtp_round_ensure_dev(mtp_round, ggml_backend_buffer_get_type(mtp.mtp_embd_weights()->buffer), n_embd_h, V);
+    const auto & sg = mtp_round_ensure_dev(mtp_round, ggml_backend_buffer_get_type(mtp.mtp_embd_weights()->buffer), n_embd_h, V, n_seq);
 
-    auto rinp = std::make_unique<llm_graph_input_mtp_round>(mtp_round, sched, n_embd_h, V);
-    rinp->c_ids  = mtp_round->c_ids_dev;
-    rinp->h_tgt  = mtp_round->h_tgt_dev;
-    rinp->h_pend = mtp_round->h_pend_dev;
-    rinp->off    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+    auto rinp = std::make_unique<llm_graph_input_mtp_round>(mtp_round, sched, n_embd_h, V, n_seq);
+    rinp->c_ids  = sg.c_ids_dev;
+    rinp->h_tgt  = sg.h_tgt_dev;
+    rinp->h_pend = sg.h_pend_dev;
+    rinp->off    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_seq);
     ggml_set_input(rinp->off);    ggml_set_name(rinp->off,    "mtp_round_off");
     ggml_tensor * c_ids  = rinp->c_ids;
     ggml_tensor * h_tgt  = rinp->h_tgt;
     ggml_tensor * h_pend = rinp->h_pend;
     ggml_tensor * off    = rinp->off;
     res->add_input(std::move(rinp));
+
+    if (n_seq > 1) {
+        build_mtp_round_seqs(mtp, attn, tok_embd, inp_tokens, inp_pos, n_chain, n_seq, c_ids, h_tgt, h_pend, off);
+        return;
+    }
 
     // M-RoPE positions are section-major, [n_pos_per_embd][n]: the entries
     // for one row sit n apart
@@ -2899,6 +2971,132 @@ const llm_graph_mtp_attn & attn,
     }
 
     // the accepted count leaves with the ids
+    ggml_build_forward_expand(gf, n_acc_i);
+    ggml_build_forward_expand(gf, anchor_h);
+    res->t_mtp_ids.push_back(n_acc_i);
+}
+
+// the round over n_seq sequences: each one's replay rows in turn, then row n_seq*V + j*n_seq + s is chain step j
+// of sequence s; what a single round keeps per sequence becomes a column
+void llm_graph_context::build_mtp_round_seqs(
+         llm_graph_mtp_i & mtp,
+const llm_graph_mtp_attn & attn,
+             ggml_tensor * tok_embd,
+             ggml_tensor * inp_tokens,
+             ggml_tensor * inp_pos,
+                     int   n_chain,
+                 int64_t   n_seq,
+             ggml_tensor * c_ids,
+             ggml_tensor * h_tgt,
+             ggml_tensor * h_pend,
+             ggml_tensor * off) {
+    const int     K = n_chain;
+    const int     V = n_chain + 1;
+    const int64_t S = n_seq;
+    const int64_t n_embd_h = h_tgt->ne[0];
+
+    const int64_t n_pos = hparams.n_pos_per_embd();
+    const size_t  ps    = inp_pos ? ggml_element_size(inp_pos) : 0;
+    auto pos_rows = [&](int64_t first, int64_t n) -> ggml_tensor * {
+        if (!inp_pos) {
+            return nullptr;
+        }
+        ggml_tensor * p = ggml_view_2d(ctx0, inp_pos, n, n_pos, n_tokens*ps, first*ps);
+        return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n*n_pos);
+    };
+
+    ggml_tensor * hp3 = ggml_reshape_3d(ctx0, h_pend, n_embd_h, 1, S);
+    ggml_tensor * ht3 = ggml_view_3d(ctx0, h_tgt, n_embd_h, K, S, h_tgt->nb[1], V*h_tgt->nb[1], 0);
+    ggml_tensor * h_replay = ggml_reshape_2d(ctx0, ggml_concat(ctx0, hp3, ht3, 1), n_embd_h, V*S);
+    cb(h_replay, "mtp_replay_h", -1);
+    mtp.mtp_step(ggml_view_2d(ctx0, tok_embd, tok_embd->ne[0], V*S, tok_embd->nb[1], 0), h_replay, pos_rows(0, V*S), 0, true, nullptr);
+
+    const size_t is = ggml_element_size(inp_tokens);
+    ggml_tensor * c_f = ggml_cast(ctx0, ggml_view_2d(ctx0, c_ids,      K, S, V*ggml_element_size(c_ids), 0),  GGML_TYPE_F32);
+    ggml_tensor * x_f = ggml_cast(ctx0, ggml_view_2d(ctx0, inp_tokens, K, S, V*is,                       is), GGML_TYPE_F32);
+    ggml_tensor * eq  = ggml_scale_bias(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, c_f, x_f)), 0.0f, 1.0f), -1.0f, 1.0f);
+    eq = ggml_cont(ctx0, ggml_transpose(ctx0, eq)); // [S, K]
+    cb(eq, "mtp_round_eq", -1);
+    ggml_tensor * n_acc = nullptr;
+    ggml_tensor * run   = nullptr;
+    for (int i = 0; i < K; ++i) {
+        ggml_tensor * e = ggml_view_1d(ctx0, eq, S, i*S*ggml_element_size(eq));
+        run   = run   ? ggml_mul(ctx0, run, e)     : e;
+        n_acc = n_acc ? ggml_add(ctx0, n_acc, run) : run;
+    }
+    cb(n_acc, "mtp_round_nacc", -1);
+    ggml_tensor * n_acc_i = ggml_cast(ctx0, n_acc, GGML_TYPE_I32);
+    ggml_set_output(n_acc_i);
+
+    // sequence s's anchor is row s*V + n_acc[s] of the round's inputs
+    ggml_tensor * idx = ggml_cast(ctx0, ggml_add(ctx0, n_acc, ggml_arange(ctx0, 0.0f, (float) (V*S), (float) V)), GGML_TYPE_I32);
+    ggml_tensor * anchor_id = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, c_ids, 1, V*S), idx);
+    ggml_tensor * anchor_h  = ggml_get_rows(ctx0, h_tgt, idx);
+    cb(anchor_h, "mtp_round_anchor_h", -1);
+    ggml_set_output(anchor_h);
+    res->t_mtp_hpend = anchor_h;
+
+    ggml_tensor * tok = ggml_get_rows(ctx0, mtp.mtp_embd_weights(), ggml_reshape_1d(ctx0, anchor_id, S));
+    ggml_tensor * h   = anchor_h;
+
+    // positions [S, K, n_pos]: the sequence's first replay position + n_acc + off, one further per draft
+    ggml_tensor * pos_i = nullptr;
+    if (inp_pos) {
+        ggml_tensor * base_f  = ggml_reshape_1d(ctx0, ggml_cast(ctx0, ggml_view_2d(ctx0, inp_pos, 1, S, V*ps, 0), GGML_TYPE_F32), S);
+        ggml_tensor * start   = ggml_add(ctx0, ggml_add(ctx0, base_f, n_acc), off);
+        ggml_tensor * steps   = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) K, 1.0f), 1, K), S, K, 1, 1);
+        ggml_tensor * pos_f   = ggml_add(ctx0, steps, ggml_reshape_2d(ctx0, start, S, 1));
+        ggml_tensor * pos_all = pos_f;
+        for (int s = 1; s < n_pos; ++s) {
+            pos_all = ggml_concat(ctx0, pos_all, s + 1 == n_pos ? ggml_scale(ctx0, pos_f, 0.0f) : pos_f, 2);
+        }
+        pos_i = ggml_cast(ctx0, pos_all, GGML_TYPE_I32);
+    }
+    auto pos_chain = [&](int j) -> ggml_tensor * {
+        if (!pos_i) {
+            return nullptr;
+        }
+        const size_t pis = ggml_element_size(pos_i);
+        ggml_tensor * p = ggml_view_2d(ctx0, pos_i, S, n_pos, S*K*pis, j*S*pis);
+        return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), S*n_pos);
+    };
+
+    ggml_tensor * kq_mask = attn.kq_mask;
+    ggml_tensor * k_idxs  = attn.k_idxs;
+    const int64_t n_kv    = kq_mask->ne[0];
+    GGML_ASSERT(kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 && "MTP round over several sequences: needs one KV stream");
+    ggml_tensor * thr   = ggml_reshape_2d(ctx0, ggml_scale_bias(ctx0, ggml_add(ctx0, n_acc, off), 1.0f, -0.5f), 1, S);
+    ggml_tensor * ar    = ggml_repeat_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) V, 1.0f), V, S, 1, 1);
+    ggml_tensor * hide  = ggml_scale(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ar, thr)), -30000.0f);
+    ggml_tensor * extra = ggml_reshape_3d(ctx0, ggml_scale(ctx0, ggml_arange(ctx0, 0.0f, (float) (n_kv*S), 1.0f), 0.0f), 1, n_kv, S);
+    const size_t kis = ggml_element_size(k_idxs);
+    extra = ggml_set_rows(ctx0, extra, ggml_reshape_3d(ctx0, hide, 1, V, S), ggml_view_2d(ctx0, k_idxs, V, S, V*kis, 0));
+    extra = ggml_cast(ctx0, ggml_reshape_2d(ctx0, extra, n_kv, S), GGML_TYPE_F16);
+    cb(extra, "mtp_round_mask", -1);
+    auto mask_chain = [&](int j) {
+        ggml_tensor * m = ggml_view_2d(ctx0, kq_mask, n_kv, S, kq_mask->nb[1], (size_t) (S*V + j*S)*kq_mask->nb[1]);
+        return ggml_add(ctx0, m, extra);
+    };
+
+    for (int j = 0; j < K; ++j) {
+        ggml_tensor * h_next = mtp.mtp_step(tok, h, pos_chain(j), (int) (S*V + j*S), false, mask_chain(j));
+        cb(h_next, "mtp_chain_h", j);
+
+        ggml_tensor * logits_j = mtp.mtp_head(h_next);
+        cb(logits_j, "mtp_chain_logits", j);
+
+        ggml_tensor * next = ggml_argmax(ctx0, logits_j);
+        cb(next, "mtp_chain_next", j);
+        ggml_set_output(next);
+        ggml_build_forward_expand(gf, next);
+        res->t_mtp_ids.push_back(next);
+
+        if (j + 1 < K) {
+            tok = ggml_get_rows(ctx0, mtp.mtp_embd_weights(), next);
+            h   = h_next;
+        }
+    }
+
     ggml_build_forward_expand(gf, n_acc_i);
     ggml_build_forward_expand(gf, anchor_h);
     res->t_mtp_ids.push_back(n_acc_i);

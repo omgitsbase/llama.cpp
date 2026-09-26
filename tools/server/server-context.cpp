@@ -11,7 +11,6 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
-#include "../../src/llama-ext.h" // llama_set_tokens_device
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -913,10 +912,9 @@ private:
 
     common_speculative_ptr spec;
 
-    // a lone verify whose drafted ids are still on the device, and the context holding them: the verify takes
-    // them there, queued behind the draft graph, and reads them back only after it is on its way
-    server_slot   * handoff_slot = nullptr;
-    llama_context * handoff_src  = nullptr;
+    // verifies whose drafted ids are still on the device, and the context holding them: the verify takes them
+    // there, queued behind the draft graph, and reads them back only after it is on its way
+    std::vector<server_slot *> handoff_slots;
 
     // the draft's ids, read back, into the draft and into the batch and prompt where its placeholders went
     void resolve_draft(server_slot & slot) {
@@ -2887,29 +2885,19 @@ private:
             pre_decode();
             batch.render();
 
-            // a draft whose ids are on the device goes to the verify there when the batch is that verify alone and
-            // one decode; any other has its ids read back before the batch is decoded
-            handoff_slot = nullptr;
-            handoff_src  = nullptr;
+            // a draft whose ids are on the device goes to its verify there when the batch is one decode; any other
+            // has its ids read back before the batch is decoded
+            handoff_slots.clear();
             if (spec) {
-                std::vector<server_slot *> pending;
+                const bool one_decode = batch.size() <= (int32_t) llama_n_batch(ctx_tgt) && batch.size() <= (int32_t) llama_n_ubatch(ctx_tgt);
                 for (auto & slot : slots) {
-                    if (!slot.spec_draft.empty() && common_speculative_ids_pending(spec.get(), slot.id)) {
-                        pending.push_back(&slot);
+                    if (slot.spec_draft.empty() || !common_speculative_ids_pending(spec.get(), slot.id)) {
+                        continue;
                     }
-                }
-                if (pending.size() == 1) {
-                    server_slot & s = *pending[0];
-                    const int32_t n_rows = (int32_t) s.spec_draft.size() + 1;
-                    if (batch.size() == n_rows && (int32_t) s.spec_i_batch.size() == n_rows && s.spec_i_batch[0] == 0 &&
-                            n_rows <= (int32_t) llama_n_batch(ctx_tgt) && n_rows <= (int32_t) llama_n_ubatch(ctx_tgt)) {
-                        handoff_slot = &s;
-                        handoff_src  = common_speculative_ids_pending(spec.get(), s.id);
-                    }
-                }
-                for (server_slot * s : pending) {
-                    if (s != handoff_slot) {
-                        resolve_draft(*s);
+                    if (one_decode && slot.spec_i_batch.size() == slot.spec_draft.size() + 1) {
+                        handoff_slots.push_back(&slot);
+                    } else {
+                        resolve_draft(slot);
                     }
                 }
             }
@@ -3784,18 +3772,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        server_slot * handoff = nullptr;
-        if (handoff_slot) {
-            server_slot & s = *handoff_slot;
+        std::vector<server_slot *> handoff;
+        for (server_slot * s : handoff_slots) {
+            const llama_pos pos0 = batch.tokens[s->spec_i_batch[0]].pos;
             if (off == 0 && batch_view.n_tokens == batch.size() &&
-                    llama_set_tokens_device(ctx_tgt, handoff_src, 1, (int32_t) s.spec_draft.size())) {
-                handoff = &s;
+                    common_speculative_arm_verify(spec.get(), ctx_tgt, s->id, pos0, (int32_t) s->spec_draft.size())) {
+                handoff.push_back(s);
             } else {
-                resolve_draft(s);
+                resolve_draft(*s);
             }
-            handoff_slot = nullptr;
-            handoff_src  = nullptr;
         }
+        handoff_slots.clear();
         auto & spt = srv_plain_timer();
         queue_tasks.yield_to_queue([&]() {
             {
@@ -3807,8 +3794,8 @@ private:
             }
             // the verify is queued: the drafted ids it took on the device come back to the host now, before
             // anything reads the batch, the draft or the prompt (and before a retry would upload the batch)
-            if (handoff) {
-                resolve_draft(*handoff);
+            for (server_slot * s : handoff) {
+                resolve_draft(*s);
             }
             if (ret == 0 && has_output && !spec) {
                 auto & srt = srv_round_timer();

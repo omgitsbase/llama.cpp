@@ -60,13 +60,22 @@ struct llama_context {
     const llama_token * get_mtp_chain_ids(int32_t & n);
     // the chained draft's id tensors, while its ids have not been read back
     const std::vector<ggml_tensor *> & get_mtp_ids_pending() const { return mtp_ids_pending; }
+    // sequences of the last chained draft: each id tensor holds one id per sequence
+    int32_t get_mtp_chain_n_seq() const { return mtp_ids_n_seq; }
 
     // the next decode takes batch rows [i0, i0 + n) from ctx_src's pending chained ids, on the device
     bool set_tokens_device(llama_context * ctx_src, int32_t i0, int32_t n);
+    // the next decode takes the rows of seq at pos0 + 1 .. pos0 + n from element col of ctx_src's pending chained
+    // ids, on the device; adds to any other sequence's rows armed for it
+    bool set_tokens_device_seq(llama_context * ctx_src, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t col);
+
+    // where the last ubatch holds n rows of seq at pos0 .. pos0 + n - 1, all of them outputs
+    bool get_last_rows(llama_seq_id seq, llama_pos pos0, int32_t n, int32_t & row0, int32_t & out0) const;
 
     // a chained MTP round's host-side inputs (the first round of a request);
     // later rounds read the target context's tensors on the device
     void set_mtp_round_host(const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off);
+    void set_mtp_round_seqs(const llama_mtp_round_seq * seqs, int32_t n);
     void set_mtp_round_target(llama_context * ctx_tgt);
 
     bool has_backend_sampler(llama_seq_id seq_id) const;
@@ -327,6 +336,12 @@ private:
     // ids drafted by a chained MTP graph, one per step, read back on demand
     std::vector<llama_token> mtp_ids;
     std::vector<ggml_tensor *> mtp_ids_pending;
+    int32_t                    mtp_ids_n_seq = 1;
+
+    // the last ubatch of the last decode, row by row: sequence, position and output row (-1: none)
+    std::vector<llama_seq_id> last_rows_seq;
+    std::vector<llama_pos>    last_rows_pos;
+    std::vector<int32_t>      last_rows_out;
 
     // the sampled rows and nextn rows decode reads back, issued by synchronize() rather than behind the graph:
     // there they sat at the head of the copy queue until the graph finished, and a drafter's uploads queued

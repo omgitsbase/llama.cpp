@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-ext.h"
 
 #include <cstdint>
 #include <vector>
@@ -179,22 +180,35 @@ struct llama_loop_state {
 
 // Batch rows of the next decode that another context's chained MTP draft fills on the device: the verify is
 // queued behind the draft graph instead of waiting for its ids to reach the host. Armed for one decode.
+struct llama_tokens_dev_span {
+    llama_seq_id seq  = -1; // -1: batch rows [row0, row0 + n); else the rows of seq at pos0 + 1 .. pos0 + n
+    int32_t      row0 = 0;
+    llama_pos    pos0 = 0;
+    int32_t      n    = 0;
+    int32_t      col  = 0;  // the sequence's element in each of the drafter's id tensors
+};
+
 struct llama_tokens_dev_state {
     llama_context        * src       = nullptr; // the drafter whose last chained ids fill the rows
     ggml_backend_sched_t   sched_dst = nullptr;
-    int32_t                i0        = 0;       // first batch row they fill
-    int32_t                n         = 0;       // 0: the host uploads every row
+    std::vector<llama_tokens_dev_span> spans;   // empty: the host uploads every row
+    int32_t                n_batch   = 0;       // tokens of the decode in flight
 
-    // Once a handoff has been asked for, a batch of up to n_max tokens reads them from tok_dev, on the device. As a
-    // graph input they would sit in a host buffer, and a copy from the device into one synchronizes the drafter
-    // first: the host would wait for the draft graph, which is what the handoff is there to avoid.
-    static constexpr int32_t n_max   = 16;
+    // Once a handoff has been asked for, a decode of up to n_max tokens in one ubatch reads them from tok_dev, on
+    // the device. As a graph input they would sit in a host buffer, and a copy from the device into one
+    // synchronizes the drafter first: the host would wait for the draft graph, which is what the handoff is there
+    // to avoid. A decode of several ubatches uploads them: a later ubatch's upload would race an earlier's read.
+    int32_t                n_max     = 16;
     bool                   enabled   = false;
     ggml_context         * ctx_dev   = nullptr;
     ggml_backend_buffer_t  buf_dev   = nullptr;
     ggml_tensor          * tok_dev   = nullptr; // I32 [n_max], in the token embedding's buffer type
 
-    void disarm() { src = nullptr; sched_dst = nullptr; i0 = 0; n = 0; }
+    void disarm() { src = nullptr; sched_dst = nullptr; spans.clear(); n_batch = 0; }
+
+    bool use_dev(const llama_ubatch & ubatch) const {
+        return enabled && ubatch.token && (int32_t) ubatch.n_tokens <= n_max && (int32_t) ubatch.n_tokens == n_batch;
+    }
 
     llama_tokens_dev_state() = default;
     llama_tokens_dev_state(const llama_tokens_dev_state &) = delete;
@@ -205,13 +219,18 @@ struct llama_tokens_dev_state {
     }
 };
 
-// a chained MTP round takes the target's sampled ids and hidden rows for the
-// verify batch straight from the target context's last graph, plus the hidden
-// row the previous round left for the anchor; the first round of a request
-// gets them from the host
+// the inputs of a round over S sequences
+struct llama_mtp_round_stage {
+    ggml_context          * ctx_dev    = nullptr;
+    ggml_backend_buffer_t   buf_dev    = nullptr;
+    ggml_tensor           * c_ids_dev  = nullptr; // I32 [n_verify*S]
+    ggml_tensor           * h_tgt_dev  = nullptr; // F32 [n_embd, n_verify*S]
+    ggml_tensor           * h_pend_dev = nullptr; // F32 [n_embd, S]
+};
+
 struct llama_mtp_round_state {
     llama_context * ctx_tgt   = nullptr;
-    ggml_tensor   * hpend_dev = nullptr;  // F32 [n_embd], written after every chained decode
+    ggml_tensor   * hpend_dev = nullptr;  // F32 [n_embd, n_seq_max], by sequence id, written after every chained decode
 
     // The round's inputs live on the device for the life of the context. As
     // graph inputs they would sit in a host buffer, and a copy into a host
@@ -219,23 +238,25 @@ struct llama_mtp_round_state {
     // backend first, so every round waited for the target's whole forward pass
     // before the draft graph could even be queued. On the device the same copy
     // is ordered by an event and the host waits for nothing.
-    ggml_context          * ctx_dev      = nullptr;
-    ggml_backend_buffer_t   buf_dev      = nullptr;
-    ggml_tensor           * c_ids_dev    = nullptr; // I32 [n_verify]
-    ggml_tensor           * h_tgt_dev    = nullptr; // F32 [n_embd, n_verify]
-    ggml_tensor           * h_pend_dev   = nullptr; // F32 [n_embd, 1]
-    int64_t                 n_embd_dev   = 0;
-    int64_t                 n_verify_dev = 0;
+    std::vector<llama_mtp_round_stage> stages; // [S - 1], filled on the first round over S sequences
+    int64_t n_embd_dev   = 0;
+    int64_t n_verify_dev = 0;
 
-    ~llama_mtp_round_state() {
-        if (buf_dev) { ggml_backend_buffer_free(buf_dev); }
-        if (ctx_dev) { ggml_free(ctx_dev); }
+    // the next round's sequences; after a round each one takes the device route
+    std::vector<llama_mtp_round_seq> seqs = { llama_mtp_round_seq() };
+
+    void free_stages() {
+        for (auto & st : stages) {
+            if (st.buf_dev) { ggml_backend_buffer_free(st.buf_dev); }
+            if (st.ctx_dev) { ggml_free(st.ctx_dev); }
+        }
+        stages.clear();
     }
-    bool            host       = true;    // the first round: the fields below are the inputs
-    const int32_t * c_ids_host  = nullptr; // [n_verify]
-    const float   * h_tgt_host  = nullptr; // [n_embd, n_verify], the target's hidden rows
-    const float   * h_pend_host = nullptr; // [n_embd], the anchor's hidden row of the previous round
-    int32_t         off        = 0;       // 1 in a normal round, 0 in the first one
+
+    llama_mtp_round_state() = default;
+    llama_mtp_round_state(const llama_mtp_round_state &) = delete;
+    llama_mtp_round_state & operator=(const llama_mtp_round_state &) = delete;
+    ~llama_mtp_round_state() { free_stages(); }
 };
 
 // A model joins the one-trip speculative round by implementing these three
@@ -266,23 +287,24 @@ public:
 
 class llm_graph_input_mtp_round : public llm_graph_input_i {
 public:
-    llm_graph_input_mtp_round(llama_mtp_round_state * state, ggml_backend_sched_t sched, int64_t n_embd, int64_t n_verify)
-        : state(state), sched(sched), n_embd(n_embd), n_verify(n_verify) {}
+    llm_graph_input_mtp_round(llama_mtp_round_state * state, ggml_backend_sched_t sched, int64_t n_embd, int64_t n_verify, int64_t n_seq)
+        : state(state), sched(sched), n_embd(n_embd), n_verify(n_verify), n_seq(n_seq) {}
     virtual ~llm_graph_input_mtp_round() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * c_ids  = nullptr; // I32 [n_verify]
-    ggml_tensor * h_tgt  = nullptr; // F32 [n_embd, n_verify]
-    ggml_tensor * h_pend = nullptr; // F32 [n_embd, 1]
-    ggml_tensor * off    = nullptr; // F32 [1]
+    ggml_tensor * c_ids  = nullptr; // I32 [n_verify*n_seq]
+    ggml_tensor * h_tgt  = nullptr; // F32 [n_embd, n_verify*n_seq]
+    ggml_tensor * h_pend = nullptr; // F32 [n_embd, n_seq]
+    ggml_tensor * off    = nullptr; // F32 [n_seq]
 
     llama_mtp_round_state * state;
     ggml_backend_sched_t sched;
     const int64_t n_embd;
     const int64_t n_verify;
+    const int64_t n_seq;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -1073,8 +1095,8 @@ public:
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
-    std::vector<ggml_tensor *> t_mtp_ids; // I32 [1], one per chained draft step, then the accepted count
-    ggml_tensor * t_mtp_hpend = nullptr;  // F32 [n_embd], the anchor's hidden row for the next round
+    std::vector<ggml_tensor *> t_mtp_ids; // I32 [S], one per chained draft step, then the accepted counts
+    ggml_tensor * t_mtp_hpend = nullptr;  // F32 [n_embd, S], the anchors' hidden rows for the next round
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1304,6 +1326,20 @@ struct llm_graph_context {
                  ggml_tensor * inp_pos,
                          int   n_chain,
                      int64_t   n_embd_h = 0);
+
+    // the round over n_seq > 1 sequences
+    void build_mtp_round_seqs(
+             llm_graph_mtp_i & mtp,
+    const llm_graph_mtp_attn & attn,
+                 ggml_tensor * tok_embd,
+                 ggml_tensor * inp_tokens,
+                 ggml_tensor * inp_pos,
+                         int   n_chain,
+                     int64_t   n_seq,
+                 ggml_tensor * c_ids,
+                 ggml_tensor * h_tgt,
+                 ggml_tensor * h_pend,
+                 ggml_tensor * off);
 
     // one row group of a round: write its K/V rows, then attend against the
     // cache with the round's mask. row is the batch row the group starts at;

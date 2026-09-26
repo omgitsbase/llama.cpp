@@ -78,6 +78,9 @@ void common_speculative_draft(common_speculative * spec);
 // into the draft once that verify is queued. nullptr when the draft already holds its ids.
 llama_context * common_speculative_ids_pending(common_speculative * spec, llama_seq_id seq_id);
 bool common_speculative_resolve(common_speculative * spec, llama_seq_id seq_id);
+// the next llama_decode on ctx_tgt takes the pending ids of seq_id's draft for the rows of seq_id at pos0 + 1 ..
+// pos0 + n, on the device; several sequences can be armed for one decode. False when nothing was armed.
+bool common_speculative_arm_verify(common_speculative * spec, llama_context * ctx_tgt, llama_seq_id seq_id, llama_pos pos0, int32_t n);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
