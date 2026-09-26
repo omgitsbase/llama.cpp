@@ -2287,12 +2287,13 @@ struct test_get_rows : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
-                // rows
-                std::vector<int> data(r*be1*be2);
-                for (int i = 0; i < r*be1*be2; i++) {
+                // rows, or an I32 source whose every value is read
+                const int64_t ne = strcmp(t->name, "in") == 0 ? ggml_nelements(t) : (int64_t) r*be1*be2;
+                std::vector<int> data(ne);
+                for (int64_t i = 0; i < ne; i++) {
                     data[i] = rand() % m;
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
+                ggml_backend_tensor_set(t, data.data(), 0, ne * sizeof(int));
             } else {
                 init_tensor_uniform(t);
             }
@@ -2473,6 +2474,60 @@ struct test_set_rows : public test_case {
             return std::max(test_case::max_nmse_err(backend), 2e-7);
         }
         return test_case::max_nmse_err(backend);
+    }
+};
+
+// GGML_OP_GET_ROWS + GGML_OP_CPY into rows of a larger tensor, as a chained decode keeps its recurrent states
+struct test_get_rows_cpy : public test_case {
+    const int64_t ne0;
+    const int64_t n_rows;
+    const int64_t n_idx;
+    const bool    reader; // a second reader of the gathered rows
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne0, n_rows, n_idx, reader);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_CPY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_get_rows_cpy(int64_t ne0 = 4096, int64_t n_rows = 8, int64_t n_idx = 2, bool reader = false)
+        : ne0(ne0), n_rows(n_rows), n_idx(n_idx), reader(reader) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_rows);
+        ggml_set_name(src, "src");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_idx);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * big = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_idx + 3);
+        ggml_set_name(big, "big");
+
+        ggml_tensor * rows = ggml_get_rows(ctx, src, idx);
+        ggml_tensor * dst  = ggml_view_2d(ctx, big, ne0, n_idx, big->nb[1], 2*big->nb[1]);
+        ggml_tensor * out  = ggml_cpy(ctx, rows, dst);
+        if (reader) {
+            out = ggml_add(ctx, out, ggml_scale(ctx, rows, 0.5f));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & v : data) {
+                    v = rand() % n_rows;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -9085,6 +9140,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool v : {false, true}) {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
         }
+    }
+    for (int64_t ne0 : {4096, 98304, 524288}) {
+        for (int64_t n_idx : {1, 2, 4}) {
+            test_cases.emplace_back(new test_get_rows_cpy(ne0, 8, n_idx, false));
+        }
+    }
+    test_cases.emplace_back(new test_get_rows_cpy(4096, 8, 2, true));
+
+    // the decode chain's token lookup: one id per row out of 2*n_cm
+    for (int n : {1, 3, 8, 16}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1, 2*std::max(n, 8), n, 1, 1, false));
     }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));

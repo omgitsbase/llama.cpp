@@ -3869,6 +3869,40 @@ uint64_t ggml_cuda_fuse_off_mask() {
     return mask;
 }
 
+static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// get_rows at i whose only reader is a copy into a same-typed, same-shaped destination: gather straight into it
+static int ggml_cuda_try_get_rows_cpy(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    int j = i + 1;
+    while (j < cgraph->n_nodes && (ggml_is_empty(cgraph->nodes[j]) || cgraph->nodes[j]->op == GGML_OP_NONE ||
+                                   cgraph->nodes[j]->op == GGML_OP_VIEW || cgraph->nodes[j]->op == GGML_OP_RESHAPE)) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * cpy = cgraph->nodes[j];
+    const ggml_tensor * dst = cpy->src[1];
+    if (cpy->op != GGML_OP_CPY || cpy->src[0] != node || dst == nullptr || dst->type != node->type ||
+            !ggml_are_same_shape(node, dst) || dst->nb[0] != ggml_type_size(dst->type) ||
+            ggml_node_get_use_count(cgraph, i) != 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_cuda_ranges_overlap(dst, node->src[0]) || ggml_cuda_ranges_overlap(dst, node->src[1])) {
+        return 0;
+    }
+    ggml_tensor gather = *node;
+    gather.data  = dst->data;
+    gather.nb[1] = dst->nb[1];
+    gather.nb[2] = dst->nb[2];
+    gather.nb[3] = dst->nb[3];
+    ggml_cuda_op_get_rows(ctx, &gather);
+    return j - i;
+}
+
 // a reader of the normed activation that will take a vector path: quantized
 // weights through mmvq (experts included), float weights through mmvf on a
 // plain 2-D activation
@@ -4726,6 +4760,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // a residual add folded into the norm that reads it
     if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & 256)) {
         const int nodes_to_skip = ggml_cuda_try_add_rms_norm_mul(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_GET_ROWS && !(ggml_cuda_fuse_off_mask() & (1ull << 34))) {
+        const int nodes_to_skip = ggml_cuda_try_get_rows_cpy(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
