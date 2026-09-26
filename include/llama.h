@@ -1268,6 +1268,9 @@ extern "C" {
         struct ggml_tensor * probs;
         struct ggml_tensor * sampled;
         struct ggml_tensor * candidates;
+        // I32 ids the row's sequence takes in before this row within the batch (the inputs of its earlier output
+        // rows after the first), as accepted tokens a sampler with history must count; NULL for a sequence's first row
+        struct ggml_tensor * batch_tokens;
     };
 
     // user code can implement the interface below in order to create custom llama_sampler

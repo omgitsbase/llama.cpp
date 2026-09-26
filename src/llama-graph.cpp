@@ -4573,12 +4573,35 @@ void llm_graph_context::build_sampling() const {
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
+    std::map<llama_seq_id, std::vector<uint32_t>> sampling_toks;
     uint32_t n_rows = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.output[i]) {
             sampling_rows[ubatch.seq_id[i][0]].push_back(n_rows++);
+            sampling_toks[ubatch.seq_id[i][0]].push_back(i);
         }
     }
+
+    // the ids a sequence's row i takes in before it within the batch: the inputs of its output rows 1..i
+    auto batch_tokens = [&](llama_seq_id seq_id, uint32_t i) -> ggml_tensor * {
+        if (i == 0 || res->t_inp_tokens == nullptr) {
+            return nullptr;
+        }
+        const auto & toks = sampling_toks.at(seq_id);
+        bool contiguous = true;
+        for (uint32_t j = 2; j <= i; ++j) {
+            contiguous = contiguous && toks[j] == toks[1] + j - 1;
+        }
+        const size_t es = ggml_element_size(res->t_inp_tokens);
+        if (contiguous) {
+            return ggml_view_1d(ctx0, res->t_inp_tokens, i, toks[1]*es);
+        }
+        ggml_tensor * ids = ggml_view_1d(ctx0, res->t_inp_tokens, 1, toks[1]*es);
+        for (uint32_t j = 2; j <= i; ++j) {
+            ids = ggml_concat(ctx0, ids, ggml_view_1d(ctx0, res->t_inp_tokens, 1, toks[j]*es), 0);
+        }
+        return ids;
+    };
 
     res->t_sampled.resize(n_rows, nullptr);
     res->t_sampled_probs.resize(n_rows, nullptr);
@@ -4650,6 +4673,7 @@ void llm_graph_context::build_sampling() const {
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
                 /*.candidates   =*/ nullptr,
+                /*.batch_tokens =*/ active ? batch_tokens(seq_id, i) : nullptr,
             };
 
             assert(sampler->iface->backend_apply);
