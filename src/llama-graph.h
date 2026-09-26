@@ -140,6 +140,7 @@ public:
 
     llama_tokens_dev_state * tokens_dev = nullptr;
     bool dev_tokens = false; // tokens is a view of tokens_dev->tok_dev
+    ggml_backend_sched_t sched = nullptr;
 
     const int64_t n_embd = 0;
 };
@@ -178,26 +179,25 @@ struct llama_loop_state {
     int32_t       n_rows   = 0;       // window rows
 };
 
-// Batch rows of the next decode that another context's chained MTP draft fills on the device: the verify is
-// queued behind the draft graph instead of waiting for its ids to reach the host. Armed for one decode.
+// the rows of seq at pos0 + 1 .. pos0 + n
 struct llama_tokens_dev_span {
-    llama_seq_id seq  = -1; // -1: batch rows [row0, row0 + n); else the rows of seq at pos0 + 1 .. pos0 + n
-    int32_t      row0 = 0;
+    llama_seq_id seq  = -1;
     llama_pos    pos0 = 0;
     int32_t      n    = 0;
     int32_t      col  = 0;  // the sequence's element in each of the drafter's id tensors
 };
 
+// Batch rows of the next decode that another context's chained MTP draft fills on the device: the verify is
+// queued behind the draft graph instead of waiting for its ids to reach the host. Armed for one decode.
 struct llama_tokens_dev_state {
     llama_context        * src       = nullptr; // the drafter whose last chained ids fill the rows
     ggml_backend_sched_t   sched_dst = nullptr;
     std::vector<llama_tokens_dev_span> spans;   // empty: the host uploads every row
     int32_t                n_batch   = 0;       // tokens of the decode in flight
 
-    // Once a handoff has been asked for, a decode of up to n_max tokens in one ubatch reads them from tok_dev, on
-    // the device. As a graph input they would sit in a host buffer, and a copy from the device into one
-    // synchronizes the drafter first: the host would wait for the draft graph, which is what the handoff is there
-    // to avoid. A decode of several ubatches uploads them: a later ubatch's upload would race an earlier's read.
+    // Once a handoff has been asked for, a decode of up to n_max tokens in one ubatch reads them from tok_dev: as a
+    // host-buffer graph input, a copy from the drafter would synchronize it first. Its host rows are written on the
+    // stream that reads them. A decode of several ubatches uploads the drafted ids from the host instead.
     int32_t                n_max     = 16;
     bool                   enabled   = false;
     ggml_context         * ctx_dev   = nullptr;
@@ -238,7 +238,7 @@ struct llama_mtp_round_state {
     // backend first, so every round waited for the target's whole forward pass
     // before the draft graph could even be queued. On the device the same copy
     // is ordered by an event and the host waits for nothing.
-    std::vector<llama_mtp_round_stage> stages; // [S - 1], filled on the first round over S sequences
+    std::vector<llama_mtp_round_stage> stages; // indexed by S - 1, filled on the first round over S sequences
     int64_t n_embd_dev   = 0;
     int64_t n_verify_dev = 0;
 

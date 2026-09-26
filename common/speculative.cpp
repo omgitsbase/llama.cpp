@@ -1371,9 +1371,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    // One chained decode over seqs: per sequence V = n_chain+1 replay rows at its base, then the chain rows step by
-    // step. On the host route the round's inputs are built here: the target's samples as far as the server accepted
-    // them, a mismatch past that, and the target's hidden rows; the device route leaves them to the target's graph
+    // per sequence V replay rows, then the chain rows step by step; the device route takes the round's inputs from
+    // the target's graph
     void chain_launch(const std::vector<llama_seq_id> & seqs, bool host_route, const common_speculative_draft_params_vec * dparams) {
         auto * ctx_dft = params.ctx_dft;
         auto * ctx_tgt = params.ctx_tgt;
@@ -1689,19 +1688,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        // one trained head: the round's draft steps can run as a single graph,
-        // which saves a host round trip per drafted token, and one graph covers
-        // every drafting sequence when the draft context keeps one KV stream.
-        // backend sampling allows one output per sequence and a chained
-        // round needs n_max, so the draft reads its logits back instead
-        // LLAMA_NO_MTP_CHAIN=1 drafts a token per decode instead, which is what
-        // the round costs without a graph of its own: for measuring the two
-        // against each other with one binary. With more than one sequence the
-        // round is chained only under LLAMA_MTP_CHAIN_SEQS=1
+        // one trained head: a round's draft steps run as one graph, over every drafting sequence.
+        // LLAMA_NO_MTP_CHAIN=1 drafts a token per decode; more than one sequence chains only under LLAMA_MTP_CHAIN_SEQS=1,
+        // and needs a unified target KV: split_equal would reorder the rows the drafts read the target's hidden state by
         static const bool no_chain   = getenv("LLAMA_NO_MTP_CHAIN") != nullptr;
         static const bool chain_seqs = getenv("LLAMA_MTP_CHAIN_SEQS") != nullptr && atoi(getenv("LLAMA_MTP_CHAIN_SEQS")) != 0;
         const uint32_t n_round_rows = n_seq * (2*this->params.n_max + 1);
-        const bool seqs_ok = n_seq == 1 || (chain_seqs && llama_context_kv_unified(ctx_dft) &&
+        const bool seqs_ok = n_seq == 1 || (chain_seqs && llama_context_kv_unified(ctx_dft) && llama_context_kv_unified(ctx_tgt) &&
                 n_round_rows <= llama_n_ubatch(ctx_dft) && n_round_rows <= llama_n_batch(ctx_dft));
         if (!no_chain && !chain_heads && seqs_ok && this->params.n_max >= 2 &&
                 llama_context_flash_attn(ctx_dft) &&
@@ -1709,6 +1702,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_chain = this->params.n_max;
             llama_set_mtp_round_target(ctx_dft, ctx_tgt);
 
+            // backend sampling gives one output per sequence and a chained round needs n_max: read the logits back
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
                 if (backend_chains[seq_id]) {
                     llama_set_sampler(ctx_dft, seq_id, nullptr);
@@ -1840,6 +1834,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t rc = llama_decode(ctx_dft, batch);
             if (rc != 0) {
                 SPC_ERR("llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
+                // the deferred sequences' replay_h was never filled
+                for (llama_seq_id seq : deferred) {
+                    chain_reset(seq);
+                }
                 return false;
             }
 

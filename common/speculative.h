@@ -74,8 +74,8 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 void common_speculative_draft(common_speculative * spec);
 
 // A chained MTP draft can leave its ids on the device: the draft then holds placeholders, the verify takes the
-// ids there (llama_set_tokens_device with the context returned here), and common_speculative_resolve writes them
-// into the draft once that verify is queued. nullptr when the draft already holds its ids.
+// ids there (common_speculative_arm_verify), and common_speculative_resolve writes them into the draft once that
+// verify is queued. nullptr when the draft already holds its ids.
 llama_context * common_speculative_ids_pending(common_speculative * spec, llama_seq_id seq_id);
 bool common_speculative_resolve(common_speculative * spec, llama_seq_id seq_id);
 // the next llama_decode on ctx_tgt takes the pending ids of seq_id's draft for the rows of seq_id at pos0 + 1 ..

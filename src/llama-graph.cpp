@@ -74,12 +74,10 @@ static void mtp_round_order(ggml_backend_sched_t sched_dst, ggml_backend_t b_src
 // the drafted step and element a device-filled row takes, or -1 for a row the host fills
 static int32_t tokens_dev_row(const llama_tokens_dev_state & td, const llama_ubatch & ubatch, int32_t r, int32_t & col) {
     for (const auto & sp : td.spans) {
-        int32_t j = -1;
-        if (sp.seq < 0) {
-            j = r - sp.row0;
-        } else if (ubatch.n_seq_id[r] == 1 && ubatch.seq_id[r][0] == sp.seq) {
-            j = ubatch.pos[r] - sp.pos0 - 1;
+        if (ubatch.n_seq_id[r] != 1 || ubatch.seq_id[r][0] != sp.seq) {
+            continue;
         }
+        const int32_t j = ubatch.pos[r] - sp.pos0 - 1;
         if (j >= 0 && j < sp.n) {
             col = sp.col;
             return j;
@@ -99,6 +97,23 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         llama_tokens_dev_state * td = tokens_dev;
         const bool armed = td && td->src && !td->spans.empty();
         const std::vector<ggml_tensor *> * ids = armed ? &td->src->get_mtp_ids_pending() : nullptr;
+
+        // tok_dev is read on the target's stream: a write from another stream could land while the previous
+        // decode's graph still reads it
+        ggml_backend_t b_tok = nullptr;
+        if (dev_tokens && sched) {
+            b_tok = ggml_backend_sched_get_tensor_backend(sched, tokens);
+            if (!b_tok && tokens->view_src) {
+                b_tok = ggml_backend_sched_get_tensor_backend(sched, tokens->view_src);
+            }
+        }
+        auto set_rows = [&](const void * data, size_t offset, size_t size) {
+            if (b_tok) {
+                ggml_backend_tensor_set_async(b_tok, tokens, data, offset, size);
+            } else {
+                ggml_backend_tensor_set(tokens, data, offset, size);
+            }
+        };
         if (armed && dev_tokens && !ids->empty()) {
             // the host's rows around the drafter's, which it never writes: a later write of its placeholders would
             // race the copies below. The rows sit on the device, so neither the writes nor the copies wait for the
@@ -110,12 +125,13 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
                 const int32_t j = r < n_tokens ? tokens_dev_row(*td, *ubatch, r, col) : -1;
                 if (r == n_tokens || j >= 0) {
                     if (r > r0) {
-                        ggml_backend_tensor_set(tokens, ubatch->token + r0, r0*es, (r - r0)*es);
+                        set_rows(ubatch->token + r0, r0*es, (r - r0)*es);
                     }
                     r0 = r + 1;
                 }
                 if (j >= 0) {
-                    GGML_ASSERT(j < (int32_t) ids->size() && (size_t) (col + 1)*es <= ggml_nbytes((*ids)[j]));
+                    // the last pending tensor holds the accepted count, not a drafted id
+                    GGML_ASSERT(j + 1 < (int32_t) ids->size() && (size_t) (col + 1)*es <= ggml_nbytes((*ids)[j]));
                     mtp_round_copy(sched_src, td->sched_dst, (*ids)[j], tokens, es, (size_t) r*es, (size_t) col*es);
                 }
             }
@@ -130,13 +146,13 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
                 int32_t col = 0;
                 const int32_t j = tokens_dev_row(*td, *ubatch, r, col);
                 if (j >= 0) {
-                    GGML_ASSERT(j < n_step && col < td->src->get_mtp_chain_n_seq());
+                    GGML_ASSERT(j + 1 < n_step && col < td->src->get_mtp_chain_n_seq());
                     rows[r] = host_ids[j*td->src->get_mtp_chain_n_seq() + col];
                 }
             }
-            ggml_backend_tensor_set(tokens, rows.data(), 0, n_tokens*es);
+            set_rows(rows.data(), 0, n_tokens*es);
         } else {
-            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*es);
+            set_rows(ubatch->token, 0, n_tokens*es);
         }
     }
 
@@ -352,6 +368,8 @@ void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
                 GGML_ASSERT(src_h && src_h->ne[0] == n_embd && ggml_is_contiguous(src_h));
             }
             GGML_ASSERT(q.tgt_row >= 0 && q.tgt_row + n_verify <= src_h->ne[1]);
+            // a masked h_nextn holds output rows only; the device route's verify rows are all outputs
+            GGML_ASSERT(!st->ctx_tgt->get_cparams().embeddings_nextn_masked || q.tgt_row == q.tgt_out);
             GGML_ASSERT(q.tgt_out >= 0 && (int64_t) res_tgt->t_sampled.size() >= q.tgt_out + n_verify);
             const int64_t rit_c0 = rit.on ? ggml_time_us() : 0;
             mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, h_off, (size_t) q.tgt_row*row_bytes);
@@ -2615,10 +2633,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         inp->tokens     = ggml_view_1d(ctx0, tokens_dev->tok_dev, ubatch.n_tokens, 0);
         inp->tokens_dev = tokens_dev;
         inp->dev_tokens = true;
+        inp->sched      = sched;
     } else {
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         cb(inp->tokens, "inp_tokens", -1);
         ggml_set_input(inp->tokens);
+        // an armed decode split into several ubatches uploads the drafted ids over the batch's placeholders
+        inp->tokens_dev = tokens_dev;
     }
     res->t_inp_tokens = inp->tokens;
 

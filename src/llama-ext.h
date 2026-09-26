@@ -110,11 +110,6 @@ LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, int32_t n);
 // ids drafted by the last chained MTP decode, n of them
 LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx, int32_t * n);
 
-// the host-side inputs of the first chained round of a request: the target's
-// sampled ids for the verify rows, the anchor's hidden row, and off (0 here,
-// 1 once the rounds read the target's tensors on the device)
-LLAMA_API void llama_set_mtp_round_host(struct llama_context * ctx, const int32_t * c_ids, const float * h_tgt, const float * h_pend, int32_t off);
-
 // One sequence of a chained MTP round over several, in the order the round's batch holds them: its replay rows,
 // then one row per chain step. The host route gives the target's sampled ids and hidden rows for the verify batch;
 // the device route (c_ids == nullptr) takes them from the target context's last graph, where the verify's rows start
@@ -147,14 +142,10 @@ LLAMA_API bool llama_sampler_on_backend(struct llama_context * ctx, llama_seq_id
 // the target context a chained MTP context takes its rounds' inputs from
 LLAMA_API void llama_set_mtp_round_target(struct llama_context * ctx, struct llama_context * ctx_tgt);
 
-// The next llama_decode on ctx takes batch rows [i0, i0 + n) from the ids ctx_src's last chained MTP draft left on
-// the device, rather than from the batch: a verify queued behind the draft graph before its ids are read back. The
-// batch's own values for those rows are never uploaded. False, and nothing armed, when ctx_src has fewer pending ids.
-LLAMA_API bool llama_set_tokens_device(struct llama_context * ctx, struct llama_context * ctx_src, int32_t i0, int32_t n);
-
-// The same keyed on the sequence: the next llama_decode on ctx takes the rows of seq at positions pos0 + 1 ..
-// pos0 + n from the sequence's column col of ctx_src's pending chained ids. Several sequences can be armed for one
-// decode. A decode of more than one ubatch reads the ids back and uploads them with the batch.
+// The next llama_decode on ctx takes the rows of seq at positions pos0 + 1 .. pos0 + n from the sequence's column
+// col of the ids ctx_src's last chained MTP draft left on the device: a verify queued behind the draft graph before
+// its ids are read back. Several sequences can be armed for one decode. A decode of more than one ubatch reads the
+// ids back and uploads them with the batch. False, and nothing armed, when ctx_src has fewer than n drafted ids.
 LLAMA_API bool llama_set_tokens_device_seq(struct llama_context * ctx, struct llama_context * ctx_src, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t col);
 
 // the decode loop on the device: n_max greedy steps from token0 at pos0 into
