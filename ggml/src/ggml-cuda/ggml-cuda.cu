@@ -4254,8 +4254,9 @@ static bool ggml_cuda_mm_epi_arg_of(const ggml_tensor * mm, const ggml_tensor * 
     return true;
 }
 
-// a matvec and the elementwise ops after it, applied in graph order by the matvec's epilogue before the store
-static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+// a matvec and the elementwise ops after it, applied in graph order by the matvec's epilogue before the store;
+// dry_run only reports how many nodes it would take
+static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, const bool dry_run = false) {
     const ggml_tensor * mm = cgraph->nodes[i];
     if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 262144)) {
         return 0;
@@ -4392,6 +4393,9 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
         if (t != nullptr && (const char *) t->data < ob + on && ob < (const char *) t->data + ggml_nbytes(t)) {
             return 0;
         }
+    }
+    if (dry_run) {
+        return last - i;
     }
 
     ggml_tensor dst = *mm;
@@ -4650,6 +4654,62 @@ static int ggml_cuda_try_glu_pair_at(ggml_backend_cuda_context & ctx, const ggml
         if (ggml_cuda_try_mm_glu_pair(ctx, gate_mm, up_mm, gate_b, up_b, glu)) {
             return n_ops - 1;
         }
+        }
+    }
+    return 0;
+}
+
+static bool ggml_cuda_mmvq_pair_member_ok(const ggml_tensor * mm, int cc) {
+    if (mm->op != GGML_OP_MUL_MAT || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) || ggml_is_empty(mm) ||
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            src1->nb[0] != sizeof(float) || !ggml_is_contiguous(src0) || !ggml_is_contiguous(mm) ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (src0->buffer == nullptr || ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    const int64_t ncols = src1->ne[1];
+    return ncols >= 1 && ncols <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_fuse_mul_mat_vec_q(mm) &&
+           ggml_cuda_should_use_mmvq(src0->type, cc, ncols);
+}
+
+// two quantized matvecs over one activation, one after the other (views between them do nothing): one launch.
+// GGML_CUDA_FUSE_OFF bit 2048 turns it off
+static int ggml_cuda_try_mmvq_pair(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool multi_stream = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
+    if (multi_stream || (ggml_cuda_fuse_off_mask() & 2048)) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (!ggml_cuda_mmvq_pair_member_ok(a, cc)) {
+        return 0;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * b = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(b)) {
+            continue;
+        }
+        if (b->op != GGML_OP_MUL_MAT || b->src[1] != a->src[1] || !ggml_cuda_mmvq_pair_member_ok(b, cc) ||
+                !ggml_cuda_mmvq_pair_ok(a, b, ctx.device)) {
+            return 0;
+        }
+        // b's own bias, scale or gate/up fusion saves as much and keeps its epilogue
+        if (ggml_can_fuse(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_ADD }) ||
+                ggml_can_fuse(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_MUL }) ||
+                ggml_cuda_can_fuse(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {}) ||
+                ggml_cuda_try_mm_epilogue(ctx, cgraph, j, true) > 0) {
+            return 0;
+        }
+        ggml_cuda_mul_mat_vec_q_pair(ctx, a, b, ggml_cuda_norm_fold_for(ctx, a->src[1]));
+        ggml_cuda_norm_fold_check_at(ctx, a->src[1]);
+        return j - i;
     }
     return 0;
 }
@@ -5378,6 +5438,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int nodes_to_skip = ggml_cuda_try_mmvq_pair(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
     }
 
     // rms_norm > mul(weight) read only by quantized matvecs: neither is

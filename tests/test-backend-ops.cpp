@@ -6843,6 +6843,65 @@ struct test_mul_mat_glu_pair : public test_case {
     }
 };
 
+// two quantized matvecs over one activation, one after the other, as attention's K and V are: the CUDA backend may run
+// them as one launch
+struct test_mul_mat_pair : public test_case {
+    const ggml_type type;
+    const int64_t m0;
+    const int64_t m1;
+    const int64_t n;
+    const int64_t k;
+    const bool with_norm;
+    ggml_tensor * out0 = nullptr;
+    ggml_tensor * out1 = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m0, m1, n, k, with_norm);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_PAIR";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    test_mul_mat_pair(ggml_type type, int64_t m0, int64_t m1, int64_t n, int64_t k, bool with_norm)
+        : type(type), m0(m0), m1(m1), n(n), k(k), with_norm(with_norm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx_weights, type, k, m0);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx_weights, type, k, m1);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a0, "a0");
+        ggml_set_name(a1, "a1");
+        ggml_set_name(x, "x");
+        if (with_norm) {
+            ggml_tensor * w = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, k);
+            ggml_set_name(w, "w");
+            x = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        }
+        out0 = ggml_mul_mat(ctx, a0, x);
+        out1 = ggml_mul_mat(ctx, a1, x);
+        ggml_set_name(out0, "out0");
+        ggml_set_name(out1, "out1");
+        ggml_tensor * out = ggml_concat(ctx, out0, out1, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out0, out1 }; }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10794,6 +10853,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_norm_fold(GGML_TYPE_F32, GGML_TYPE_Q8_0, 2048, n_tokens));
         test_cases.emplace_back(new test_norm_fold(GGML_TYPE_BF16, GGML_TYPE_Q8_0, 2048, n_tokens));
         test_cases.emplace_back(new test_norm_fold(GGML_TYPE_F16, GGML_TYPE_Q8_0, 2048, n_tokens, true, false, true));
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        for (int n : {1, 2, 4, 8}) {
+            for (auto [m0, m1] : { std::pair<int64_t, int64_t>{32, 32}, {512, 512}, {48, 80}, {13, 50}, {1000, 24} }) {
+                for (int64_t k : {256, 2048, 5120}) {
+                    for (bool with_norm : {false, true}) {
+                        test_cases.emplace_back(new test_mul_mat_pair(type, m0, m1, n, k, with_norm));
+                    }
+                }
+            }
+        }
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
