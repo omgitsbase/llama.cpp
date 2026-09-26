@@ -49,7 +49,6 @@ static __global__ void mul_mat_vec_f(
             if (warp == 0) {
                 ggml_cuda_prefetch_l2_warp((const T *) fusion.pf.x + offset, fusion.pf.bytes, tid % ws);
             }
-            // the gate row goes to the second warp when there is one
             if (has_fusion && fusion.pf.gate != nullptr && warp == (block_size > ws ? 1 : 0)) {
                 ggml_cuda_prefetch_l2_warp((const T *) fusion.pf.gate + offset, fusion.pf.bytes, tid % ws);
             }

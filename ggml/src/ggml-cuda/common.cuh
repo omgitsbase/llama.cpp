@@ -164,7 +164,6 @@ struct ggml_cuda_l2_pf {
     int64_t      row_stride = 0;                    // bytes
 };
 
-// the grid's threads share the lines, the first rows first
 static __device__ __forceinline__ void ggml_cuda_l2_pf_issue(const ggml_cuda_l2_pf & pf) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__)
     const uint32_t lines = (pf.row_bytes + 127) / 128;
@@ -1813,7 +1812,6 @@ static bool ggml_cuda_tensor_is_constant(const ggml_tensor * t) {
         ((t->flags | root->flags) & GGML_TENSOR_FLAG_PARAM) == 0;
 }
 
-// resident blocks per SM of a kernel at a block size, cached per device
 static int ggml_cuda_max_active_blocks(const void * kernel, const int threads, const size_t smem) {
     struct cache_key {
         int          device;

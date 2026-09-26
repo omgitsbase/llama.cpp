@@ -37,7 +37,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     }
 }
 
-static constexpr __device__ int mmvq_type_size(ggml_type type) {
+static constexpr __host__ __device__ int mmvq_type_size(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return sizeof(block_q1_0);
         case GGML_TYPE_Q2_0:    return sizeof(block_q2_0);
@@ -575,6 +575,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    static_assert(mmvq_type_size(type) > 0, "mmvq_type_size lacks this type");
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -587,9 +588,8 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_y;
     uint32_t sample_dst;
 
-    // the weights are constant, so their first bytes can be on their way into L2 while the producer finishes.
-    // With ids the host asks for this only when an earlier kernel on this stream read the same ids after its
-    // own wait, so they are final; they only choose what to prefetch, and are read again below after the wait
+    // constant weights can head into L2 while the producer finishes; an early id is final (an earlier matvec read it
+    // after its own wait) and only steers the hint
 #ifdef GGML_CUDA_PDL_DEVICE
     if (pf.bytes != 0 && threadIdx.y == 0) {
         const uint32_t channel_pf = ncols_dst == 1 && ids ? mmvq_ld_ids_early(ids + channel_dst) : fastdiv(channel_dst, channel_ratio);
@@ -898,8 +898,7 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     // Warp-level reduction only - no shared memory needed.
-    // A lane group skips the steps that would add the other groups' lanes; in a whole warp those lanes
-    // hold +0 for this row, and adding +0 once gives the same bits as adding it at every skipped step
+    // the other groups' lanes would add +0 at the skipped steps; one +0 add gives the same bits
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
         if constexpr (lane_groups > 1) {
@@ -1475,9 +1474,8 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    // without PDL the matvec cannot start before its producer ends, so the quantize ahead of it asks for the
-    // rows its first blocks read: the 32 KB per SM prefetch budget, taken from the first rows.
-    // Opt-in (GGML_CUDA_PF_PRODUCER=1) until it is measured on a card without PDL
+    // without PDL the matvec starts only after its producer ends, so the quantize asks for its first rows
+    // (opt-in with GGML_CUDA_PF_PRODUCER=1 until measured on a card without PDL)
     ggml_cuda_l2_pf l2_pf;
     {
         static const bool   pf_producer = [] { const char * e = getenv("GGML_CUDA_PF_PRODUCER"); return e && atoi(e) != 0; }();
