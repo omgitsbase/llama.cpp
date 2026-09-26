@@ -1381,7 +1381,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         overrides_to_host = overrides_to_host || ggml_backend_buft_is_host(o->buft) ||
             (o_dev && ggml_backend_dev_type(o_dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
     }
-    const bool tok_embd_on_device = (input_env ? atoi(input_env) != 0 : !overrides_to_host) && n_gpu_layers > n_layer_all;
+    // by default only a table whose rows the device decodes to the CPU's bits (a convert or one multiply);
+    // LLAMA_INPUT_ON_DEVICE=1 takes any type
+    const ggml_tensor * tok_embd_meta = ml.get_tensor_meta(LLM_TN(arch)(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
+    bool tok_embd_exact = false;
+    if (tok_embd_meta) {
+        switch (tok_embd_meta->type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+            case GGML_TYPE_Q8_0:
+                tok_embd_exact = true;
+                break;
+            default:
+                break;
+        }
+    }
+    const bool tok_embd_on_device = (input_env ? atoi(input_env) != 0 : !overrides_to_host && tok_embd_exact) && n_gpu_layers > n_layer_all;
     pimpl->dev_tok_embd = tok_embd_on_device ? get_layer_buft_list(0) : pimpl->dev_input;
 
     // assign the repeating layers to the devices according to the splits
