@@ -1615,6 +1615,14 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
 };
+// weight rows a matvec asks for in L2 before its PDL wait. The pointers repeat the kernel's matrix and gate:
+// a prefetch through the kernel's own pointers costs registers in its main loop
+struct ggml_cuda_mv_pf {
+    const void * x     = nullptr;
+    const void * gate  = nullptr;
+    uint32_t     bytes = 0; // per row
+};
+
 struct ggml_cuda_mm_fusion_args_device {
     // the norm fold: y is the pre-norm activation, scaled by norm_scale[row] and norm_w[col] on the way in
     const float * norm_w = nullptr;
@@ -1625,9 +1633,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
-    // mmvf launch hints: weight bytes per row to prefetch before the PDL wait, and releasing dependents right after it
-    uint32_t pf_bytes = 0;
-    bool     release  = false;
+    // mmvf launch hints: weight rows to prefetch before the PDL wait, and releasing dependents right after it
+    ggml_cuda_mv_pf pf;
+    bool            release = false;
 };
 
 struct ggml_cuda_kernel_launch_params {

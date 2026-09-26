@@ -41,17 +41,17 @@ static __global__ void mul_mat_vec_f(
 
 #ifdef GGML_CUDA_PDL_DEVICE
     if constexpr (!is_multi_token_id) {
-        if (fusion.pf_bytes != 0) {
+        if (fusion.pf.bytes != 0) {
             constexpr int ws   = ggml_cuda_get_physical_warp_size();
             const int     warp = tid / ws;
             const int64_t offset = int64_t(fastdiv((uint32_t) blockIdx.z, sample_ratio))*stride_sample_x
                 + int64_t(fastdiv((uint32_t) channel_dst, channel_ratio))*stride_channel_x + int64_t(row)*stride_row;
             if (warp == 0) {
-                ggml_cuda_prefetch_l2_warp(x + offset, fusion.pf_bytes, tid % ws);
+                ggml_cuda_prefetch_l2_warp((const T *) fusion.pf.x + offset, fusion.pf.bytes, tid % ws);
             }
             // the gate row goes to the second warp when there is one
-            if (has_fusion && fusion.gate != nullptr && warp == (block_size > ws ? 1 : 0)) {
-                ggml_cuda_prefetch_l2_warp((const T *) fusion.gate + offset, fusion.pf_bytes, tid % ws);
+            if (has_fusion && fusion.pf.gate != nullptr && warp == (block_size > ws ? 1 : 0)) {
+                ggml_cuda_prefetch_l2_warp((const T *) fusion.pf.gate + offset, fusion.pf.bytes, tid % ws);
             }
         }
     }
@@ -496,9 +496,11 @@ void launch_mul_mat_vec_f_cuda(
     const dim3 block_dims(block_size_best, 1, 1);
 
     ggml_cuda_mm_fusion_args_device fusion_pf = fusion;
-    if (fusion.pf_bytes != 0) {
+    if (fusion.pf.bytes != 0) {
         const bool pdl = ggml_cuda_kernel_uses_pdl((const void *) mul_mat_vec_f<T, type_acc, ncols_dst, 32, false, is_multi_token_id>);
-        fusion_pf.pf_bytes = pdl ? ggml_cuda_mv_prefetch_bytes(fusion.pf_bytes, fusion.gate ? 2 : 1,
+        fusion_pf.pf.x     = x;
+        fusion_pf.pf.gate  = fusion.gate;
+        fusion_pf.pf.bytes = pdl ? ggml_cuda_mv_prefetch_bytes(fusion.pf.bytes, fusion.gate ? 2 : 1,
             (int64_t) nrows*nchannels_dst*nsamples_or_ntokens, ggml_cuda_info().devices[device].nsm) : 0;
     }
     switch (block_size_best) {
@@ -774,7 +776,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const uint64_t fo = ggml_cuda_fuse_off_mask();
     if (!ids && !(fo & 4096) && ggml_cuda_tensor_is_constant(src0) &&
             (fusion == nullptr || fusion->gate == nullptr || ggml_cuda_tensor_is_constant(fusion->gate))) {
-        fusion_local.pf_bytes = ne00*ts_src0; // at most a whole row; the launch sizes it to its grid
+        fusion_local.pf.bytes = ne00*ts_src0; // at most a whole row; the launch sizes it to its grid
     }
     fusion_local.release = !(fo & 8192);
 

@@ -560,7 +560,7 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride, const uint32_t nrows_x, const uint32_t pf_bytes, const bool release, const uint32_t nchannels_x) {
+        const uint32_t ids_stride, const uint32_t nrows_x, const ggml_cuda_mv_pf pf, const bool release, const uint32_t nchannels_x) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -591,22 +591,22 @@ static __global__ void mul_mat_vec_q(
     // With ids the host asks for this only when an earlier kernel on this stream read the same ids after its
     // own wait, so they are final; they only choose what to prefetch, and are read again below after the wait
 #ifdef GGML_CUDA_PDL_DEVICE
-    if (pf_bytes != 0 && threadIdx.y == 0) {
+    if (pf.bytes != 0 && threadIdx.y == 0) {
         const uint32_t channel_pf = ncols_dst == 1 && ids ? mmvq_ld_ids_early(ids + channel_dst) : fastdiv(channel_dst, channel_ratio);
         const int64_t  kb0 = (int64_t) fastdiv(blockIdx.z, sample_ratio)*stride_sample_x
             + (int64_t) channel_pf*stride_channel_x + (int64_t) row0*stride_row_x;
 #pragma unroll
         for (int r = 0; r < rows_per_cuda_block*(has_fusion ? 2 : 1); ++r) {
             const int    i    = r % rows_per_cuda_block;
-            const void * base = has_fusion && r >= rows_per_cuda_block ? fusion.gate : vx;
+            const void * base = has_fusion && r >= rows_per_cuda_block ? pf.gate : pf.x;
             if (base != nullptr && channel_pf < nchannels_x && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x)) {
                 const int64_t kb = kb0 + (int64_t) i*stride_row_x;
-                ggml_cuda_prefetch_l2_warp((const char *) base + kb*mmvq_type_size(type), pf_bytes, threadIdx.x);
+                ggml_cuda_prefetch_l2_warp((const char *) base + kb*mmvq_type_size(type), pf.bytes, threadIdx.x);
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(pf_bytes, nchannels_x);
+    GGML_UNUSED_VARS(pf, nchannels_x);
 #endif // GGML_CUDA_PDL_DEVICE
     ggml_cuda_pdl_sync();
     if (release) {
@@ -958,7 +958,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
-        const uint32_t ids_stride, const uint32_t nrows_x, const uint32_t pf_bytes, const bool release, const uint32_t nchannels_x,
+        const uint32_t ids_stride, const uint32_t nrows_x, const ggml_cuda_mv_pf & pf, const bool release, const uint32_t nchannels_x,
         cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
@@ -969,7 +969,7 @@ static void mul_mat_vec_q_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, one_row>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release, nchannels_x);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf, release, nchannels_x);
             return;
         }
     }
@@ -980,7 +980,7 @@ static void mul_mat_vec_q_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, one_row>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release, nchannels_x);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf, release, nchannels_x);
 }
 
 // lanes a row of this type and width needs, and the lane groups that let several rows share a warp
@@ -1202,16 +1202,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const auto run = [&](auto c_one_row) {
             constexpr bool or1 = decltype(c_one_row)::value;
             const std::pair<dim3, dim3> d = or1 ? calc_launch_params<type>(ncols, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true) : dims;
-            uint32_t pf_bytes = 0;
+            ggml_cuda_mv_pf pf;
             if (pf_ok && ggml_cuda_kernel_uses_pdl((const void *) mul_mat_vec_q<type, ncols, false, small_k>)) {
                 const int rpb = or1 ? 1 : calc_rows_per_block(ncols, table_id, small_k, d.second.y);
-                pf_bytes = ggml_cuda_mv_prefetch_bytes(row_bytes, rpb*(has_gate ? 2 : 1), (int64_t) d.first.x*d.first.y*d.first.z, nsm);
+                pf.x     = vx;
+                pf.gate  = fusion.gate;
+                pf.bytes = ggml_cuda_mv_prefetch_bytes(row_bytes, rpb*(has_gate ? 2 : 1), (int64_t) d.first.x*d.first.y*d.first.z, nsm);
             }
             mul_mat_vec_q_switch_fusion<type, ncols, small_k, or1>(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                 stride_sample_x, stride_sample_y, stride_sample_dst, d.first, d.second, 0, ids_stride, nrows_x,
-                pf_bytes, release, nchannels_x, stream);
+                pf, release, nchannels_x, stream);
         };
         if constexpr (ncols > 1 && !small_k) {
             if (one_row) {
