@@ -3802,6 +3802,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     // a plain view of the product (the experts read it reshaped) is a reader
     // when everything reading the view qualifies; it then shares the record
     std::vector<const ggml_tensor *> views;
+    std::vector<const ggml_tensor *> outs;
     int  found         = 0;
     int  last          = i + 1;
     bool has_q8_reader = false;
@@ -3818,6 +3819,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
         last = j;
         if (ggml_cuda_norm_fold_reader_ok(t, mul, cc)) {
             has_q8_reader |= ggml_is_quantized(t->src[0]->type);
+            outs.push_back(t);
             continue;
         }
         const bool plain_view = (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src == mul && t->view_offs == 0 &&
@@ -3843,6 +3845,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
                 return false;
             }
             has_q8_reader |= ggml_is_quantized(u->src[0]->type);
+            outs.push_back(u);
         }
         if (found_v != n_uses_v || n_uses_v < 1) {
             return false;
@@ -3852,19 +3855,30 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     if (found != n_uses) {
         return false;
     }
-    // the readers take x (and w) where the graph has them read the product: nothing up to
-    // the last reader may write there. An in-place product keeps x's bytes alive itself
-    if (mul->data != x->data) {
-        const ggml_tensor * w_root  = w->view_src ? w->view_src : w;
-        const bool          w_const = w_root->buffer && ggml_backend_buffer_get_usage(w_root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-        for (int j = i + 2; j <= last; ++j) {
-            const ggml_tensor * t = cgraph->nodes[j];
-            if (ggml_cuda_is_view_or_noop(t)) {
-                continue;
-            }
-            if (ggml_cuda_tensors_overlap(t, x) || (!w_const && ggml_cuda_tensors_overlap(t, w))) {
-                return false;
-            }
+    // a reader may fuse with the GLU, bias or scale node after it and write that output while it reads x
+    int end = last;
+    for (int k = last + 1; k < cgraph->n_nodes && k <= last + 4; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            reads |= t->src[s] && std::find(outs.begin(), outs.end(), t->src[s]) != outs.end();
+        }
+        if (reads) {
+            outs.push_back(t);
+            end = k;
+        }
+    }
+    // the readers take x and w where the graph has them read the product: nothing up to the last
+    // reader may write there. x and w are freed after the product unless still used or constant
+    const ggml_tensor * w_root  = w->view_src ? w->view_src : w;
+    const bool          w_const = w_root->buffer && ggml_backend_buffer_get_usage(w_root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    for (int j = i + 2; j <= end; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(t, x) || (!w_const && ggml_cuda_tensors_overlap(t, w))) {
+            return false;
         }
     }
 
