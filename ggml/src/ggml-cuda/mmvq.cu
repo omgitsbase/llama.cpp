@@ -1167,7 +1167,8 @@ static bool mmvq_use_small_k(const int ncols_x, const int ncols_dst, const int c
     const int     blocks_per_row_x      = ncols_x / qk;
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
     const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
-    bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+    // a row the block covers in one iteration, equality included: a warp per row is the same sum in the same order
+    bool          use                   = nwarps > 1 && blocks_per_row_x <= nwarps * blocks_per_iter_1warp;
 
     constexpr std::array<ggml_type, 2> iq_slow_turing = {
         GGML_TYPE_IQ3_XXS,
