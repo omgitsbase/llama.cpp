@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    step_pos.assign(n_seq_max, -1);
 
     cells.clear();
     cells.resize(mem_size);
@@ -145,6 +146,103 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    step_reset(-1);
+    step_restore.clear();
+}
+
+void llama_memory_recurrent::step_reset(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        std::fill(step_pos.begin(), step_pos.end(), -1);
+    } else if ((size_t) seq_id < step_pos.size()) {
+        step_pos[seq_id] = -1;
+    }
+}
+
+bool llama_memory_recurrent::enable_step_rollback() {
+    if (!step_bufs.empty()) {
+        return true;
+    }
+
+    const int32_t n_layer = hparams.n_layer();
+
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
+
+    r_step_l.assign(n_layer, nullptr);
+    s_step_l.assign(n_layer, nullptr);
+
+    for (int32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r_l[il]->buffer);
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = { size_t(2u*n_layer*ggml_tensor_overhead()), nullptr, true };
+            it = ctx_map.emplace(buft, ggml_context_ptr(ggml_init(params))).first;
+        }
+        ggml_context * ctx = it->second.get();
+        r_step_l[il] = ggml_new_tensor_2d(ctx, r_l[il]->type, r_l[il]->ne[0], size);
+        s_step_l[il] = ggml_new_tensor_2d(ctx, s_l[il]->type, s_l[il]->ne[0], size);
+        ggml_format_name(r_step_l[il], "cache_r_step_l%d", il);
+        ggml_format_name(s_step_l[il], "cache_s_step_l%d", il);
+    }
+
+    size_t total = 0;
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate the step rows\n", __func__);
+            step_bufs.clear();
+            r_step_l.clear();
+            s_step_l.clear();
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        total += ggml_backend_buffer_get_size(buf);
+        step_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    LLAMA_LOG_INFO("%s: step rows = %7.2f MiB\n", __func__, total / (1024.0*1024.0));
+
+    return !step_bufs.empty();
+}
+
+ggml_tensor * llama_memory_recurrent::get_step_for(const ggml_tensor * t) const {
+    for (size_t il = 0; il < r_step_l.size(); ++il) {
+        if (t == r_l[il]) {
+            return r_step_l[il];
+        }
+        if (t == s_l[il]) {
+            return s_step_l[il];
+        }
+    }
+    return nullptr;
+}
+
+void llama_memory_recurrent::flush_step_restores(const std::function<void(ggml_tensor *, ggml_tensor *)> & copy) {
+    if (step_restore.empty()) {
+        return;
+    }
+
+    ggml_init_params params = { 4*r_step_l.size()*step_restore.size()*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+
+    auto row = [&](ggml_tensor * t, int32_t cell) {
+        ggml_tensor * v = ggml_view_1d(ctx.get(), t, t->ne[0], cell*t->nb[1]);
+        ggml_backend_view_init(v);
+        return v;
+    };
+
+    for (const int32_t cell : step_restore) {
+        for (size_t il = 0; il < r_step_l.size(); ++il) {
+            if (r_step_l[il] == nullptr) {
+                continue;
+            }
+            copy(row(r_step_l[il], cell), row(r_l[il], cell));
+            copy(row(s_step_l[il], cell), row(s_l[il], cell));
+        }
+    }
+    step_restore.clear();
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -178,6 +276,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
+            // undo the sequence's last chained step: its input states come back from the step rows
+            if (0 < p0 && p1 == std::numeric_limits<llama_pos>::max() && (size_t) seq_id < step_pos.size() &&
+                    step_pos[seq_id] == p0 && cell.pos == p0) {
+                step_restore.push_back(tail_id);
+                step_pos[seq_id] = -1;
+                cell.pos = p0 - 1;
+                return true;
+            }
+            step_reset(seq_id);
+
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
@@ -199,6 +307,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: `seq_id` is negative, so returning false\n");
             return false;
         }
+        step_reset(-1);
     }
 
     for (uint32_t i = 0; i < size; ++i) {
@@ -237,6 +346,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         return;
     }
 
+    step_reset(-1);
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -272,6 +383,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
 
+    step_reset(-1);
+
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
             cells[i].tail = -1;
@@ -306,6 +419,8 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
         return;
     }
 
+    step_reset(seq_id);
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -335,6 +450,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
     if (d == 1) {
         return;
     }
+
+    step_reset(seq_id);
 
     if (p0 < 0) {
         p0 = 0;
@@ -813,6 +930,8 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
 
+    step_reset(seq_id);
+
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
 
@@ -1204,7 +1323,20 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    const auto & ubatch = ubatches[i_next];
+
+    mem->find_slot(ubatch);
+
+    // only a step of one token per sequence can be undone, and only until the next decode touches the sequence
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const bool step = mem->chain_step && ubatch.n_seq_tokens == 1 && ubatch.n_seq_id[i] == 1;
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            const llama_seq_id s = ubatch.seq_id[i][k];
+            if (s >= 0 && (size_t) s < mem->step_pos.size()) {
+                mem->step_pos[s] = step ? ubatch.pos[i] : -1;
+            }
+        }
+    }
 
     return true;
 }
@@ -1241,6 +1373,10 @@ ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     return mem->s_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_step_for(const ggml_tensor * t) const {
+    return mem->get_step_for(t);
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

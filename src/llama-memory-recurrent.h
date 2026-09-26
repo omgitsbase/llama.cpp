@@ -61,6 +61,14 @@ public:
 
     bool get_can_shift() const override;
 
+    bool can_rollback_step() const override { return !step_bufs.empty(); }
+    bool enable_step_rollback() override;
+    void set_chain_step(bool chain_step) override { this->chain_step = chain_step; }
+    void flush_step_restores(const std::function<void(ggml_tensor *, ggml_tensor *)> & copy) override;
+
+    // the rows a chained step gathers its input states into, for the state tensor t (an r_l or s_l); nullptr if none
+    ggml_tensor * get_step_for(const ggml_tensor * t) const;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -112,6 +120,17 @@ public:
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
 
+    // A chained step reads its states from these rows, one per cell, and leaves them there: seq_rm of the step
+    // copies them back over what the step wrote, before the next decode.
+    std::vector<ggml_tensor *> r_step_l;
+    std::vector<ggml_tensor *> s_step_l;
+
+    bool chain_step = false;
+    std::vector<llama_pos> step_pos;     // per seq: the position of its last chained step, -1 when it cannot be undone
+    std::vector<int32_t>   step_restore; // cells whose states go back to their step rows
+
+    void step_reset(llama_seq_id seq_id);
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
@@ -120,6 +139,7 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> step_bufs;
 
     size_t total_size() const;
 
@@ -170,6 +190,8 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+
+    ggml_tensor * get_step_for(const ggml_tensor * t) const;
 
     int32_t s_copy(int i) const;
 

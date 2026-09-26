@@ -58,6 +58,14 @@ public:
 
     bool get_can_shift() const override;
 
+    bool can_rollback_step() const override { return mem_attn->can_rollback_step() && mem_recr->can_rollback_step(); }
+    bool enable_step_rollback() override { return mem_attn->enable_step_rollback() && mem_recr->enable_step_rollback(); }
+    void set_chain_step(bool chain_step) override { mem_attn->set_chain_step(chain_step); mem_recr->set_chain_step(chain_step); }
+    void flush_step_restores(const std::function<void(ggml_tensor *, ggml_tensor *)> & copy) override {
+        mem_attn->flush_step_restores(copy);
+        mem_recr->flush_step_restores(copy);
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

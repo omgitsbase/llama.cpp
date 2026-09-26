@@ -131,6 +131,9 @@ public:
 
     bool get_can_shift() const override;
 
+    // a step only fills empty cells unless SWA lets it take a masked one, whose K/V seq_rm cannot bring back
+    bool can_rollback_step() const override { return swa_type == LLAMA_SWA_TYPE_NONE && other == nullptr; }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

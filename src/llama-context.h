@@ -75,6 +75,12 @@ struct llama_context {
 
     bool has_backend_sampler(llama_seq_id seq_id) const;
 
+    // decode chain: see llama_decode_chain_enable and friends in llama-ext.h
+    bool decode_chain_enable();
+    bool set_tokens_sampled(const int32_t * rows, const int32_t * idxs, int32_t n);
+    void outputs_wait();
+    void outputs_advance();
+
     llm_graph_result * get_gf_res_prev() const;
 
     // the decode loop on the device: n_max steps from token0 at pos0, each
@@ -353,6 +359,34 @@ private:
 
     llama_mtp_round_state mtp_round;
     llama_tokens_dev_state tokens_dev;
+
+    llama_decode_chain_state chain;
+    struct decode_chain_info {
+        bool enabled = false;
+
+        // the rows the next decode takes on the device: (batch row, batch index of the last decode)
+        std::vector<std::pair<int32_t, int32_t>> arm;
+
+        // the last decode, when it can feed an armed one: its batch layout and where each index's id went
+        bool                      prev_ok = false;
+        std::vector<llama_seq_id> prev_seq;     // [n_tokens] the sequence of every batch index
+        std::vector<int32_t>      prev_row;     // [n_tokens] its output row, the row of tok_io its id is in
+        std::vector<uint8_t>      prev_sampled; // [n_outputs] the row's id was sampled on the device
+
+        // an armed decode is queued and the last one's outputs are the ones the accessors read
+        bool                  inflight  = false;
+        bool                  read_done = false;
+        ggml_backend_event_t  ev        = nullptr;
+        ggml_backend_t        ev_backend = nullptr;
+        int32_t               n_inflight  = 0;
+        int64_t               t_queued_us = 0;
+    } chain_info;
+
+    bool decode_chain_check(const llama_batch & batch, const std::vector<std::pair<int32_t, int32_t>> & arm) const;
+    void decode_chain_record(const llama_batch & batch, const llm_graph_result * res);
+
+    // the recurrent states a seq_rm of a chained step put back, copied on the stream ahead of the next graph
+    void flush_step_restores();
 
     llama_loop_state          loop;
     bool                      loop_on_device = false; // the last loop ran as one device graph

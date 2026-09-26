@@ -100,6 +100,18 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // a 1-token-per-sequence step can be undone exactly with seq_rm of its positions, before the next decode
+    virtual bool can_rollback_step() const { return false; }
+
+    // keeps what a chained step overwrites, so that can_rollback_step holds; false when it cannot
+    virtual bool enable_step_rollback() { return can_rollback_step(); }
+
+    // the ubatches applied next are chained steps, which seq_rm may undo
+    virtual void set_chain_step(bool chain_step) { GGML_UNUSED(chain_step); }
+
+    // the state copies a seq_rm of a chained step left: copy(src, dst) must run before the next graph, in stream order
+    virtual void flush_step_restores(const std::function<void(ggml_tensor * src, ggml_tensor * dst)> & copy) { GGML_UNUSED(copy); }
+
     //
     // ops
     //

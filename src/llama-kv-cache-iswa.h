@@ -65,6 +65,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool can_rollback_step() const override { return kv_base->can_rollback_step() && kv_swa->can_rollback_step(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

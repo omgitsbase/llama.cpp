@@ -90,7 +90,19 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (device) {
         return;
     }
-    if (ubatch->token) {
+    if (ubatch->token && tok_in) {
+        const int64_t n_tokens = ubatch->n_tokens;
+
+        std::vector<int32_t> buf(2*n_tokens);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id s = ubatch->seq_id[i][0];
+            const int32_t      r = s >= 0 && s < (llama_seq_id) chain->seq_row.size() ? chain->seq_row[s] : -1;
+
+            buf[i]            = ubatch->token[i];
+            buf[n_tokens + i] = r >= 0 ? r : chain->n_cm + (int32_t) i;
+        }
+        ggml_backend_tensor_set(tok_in, buf.data(), 0, buf.size()*sizeof(int32_t));
+    } else if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
         const size_t  es       = ggml_element_size(tokens);
 
@@ -174,6 +186,10 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     // the device rows are a different graph from a host input
     const bool want_dev = !device && params.tokens_dev && params.tokens_dev->use_dev(params.ubatch);
     res &= want_dev == dev_tokens;
+
+    const bool want_chain = !device && !want_dev && params.chain && params.chain->n_cm > 0 && params.ubatch.token &&
+                            params.ubatch.n_tokens <= (uint32_t) params.chain->n_cm;
+    res &= want_chain == (tok_in != nullptr);
 
     return res;
 }
@@ -1619,6 +1635,9 @@ void llm_graph_result::reset() {
     t_mtp_ids.clear();
     t_mtp_hpend = nullptr;
 
+    chain_ok  = false;
+    chain_bad = false;
+
     params = {};
 
     inputs.clear();
@@ -1781,6 +1800,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     mtp_round        (params.mtp_round),
     tokens_dev       (params.tokens_dev),
+    chain            (params.chain),
     loop             (params.loop),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2634,6 +2654,26 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         inp->tokens_dev = tokens_dev;
         inp->dev_tokens = true;
         inp->sched      = sched;
+    } else if (is_chain_form()) {
+        const int64_t n  = ubatch.n_tokens;
+        ggml_tensor * io = chain->tok_io;
+
+        inp->chain  = chain;
+        inp->tok_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2*n);
+        cb(inp->tok_in, "inp_tok_in", -1);
+        ggml_set_input(inp->tok_in);
+
+        // the host ids land in tok_io first, so one gather serves host and device rows alike
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+                    ggml_view_1d(ctx0, inp->tok_in, n, 0),
+                    ggml_view_1d(ctx0, io, n, chain->n_cm*ggml_element_size(io))));
+
+        ggml_tensor * ids = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, io, 1, 2*chain->n_cm),
+                ggml_view_1d(ctx0, inp->tok_in, n, n*ggml_element_size(inp->tok_in)));
+        inp->tokens = ggml_reshape_1d(ctx0, ids, n);
+        cb(inp->tokens, "inp_tokens", -1);
+
+        res->chain_ok = true;
     } else {
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         cb(inp->tokens, "inp_tokens", -1);
@@ -2717,6 +2757,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_build_forward_expand(gf, cur);
 
     return cur;
+}
+
+bool llm_graph_context::is_chain_form() const {
+    return chain && chain->n_cm > 0 && !loop && ubatch.token && ubatch.n_tokens <= (uint32_t) chain->n_cm &&
+           !(tokens_dev && tokens_dev->enabled && ubatch.n_tokens <= llama_tokens_dev_state::n_max);
 }
 
 llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv * inp) {
@@ -4144,7 +4189,8 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+        ggml_tensor * step) const {
 
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
@@ -4158,6 +4204,16 @@ ggml_tensor * llm_graph_context::build_rs(
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
     // {state_size, rs_size} -> {state_size, n_seqs}
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
+
+    // a chained step keeps the states it reads in the step rows of their cells, for seq_rm to put back
+    if (step) {
+        ggml_tensor * step_rows = ggml_view_2d(ctx0, step, state_size, n_seqs, step->nb[1], rs_head*step->nb[1]);
+        if (output_states->op == GGML_OP_GET_ROWS && output_states->src[0] == states && output_states->src[1] == state_copy_main) {
+            output_states = ggml_cpy(ctx0, output_states, step_rows);
+        } else {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_get_rows(ctx0, states, state_copy_main), step_rows));
+        }
+    }
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
@@ -4208,9 +4264,18 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
+    ggml_tensor * step = nullptr;
+    if (is_chain_form()) {
+        step = kv_state->get_step_for(s);
+        res->chain_bad |= step == nullptr || step->ne[0] != state_size;
+        if (res->chain_bad) {
+            step = nullptr;
+        }
+    }
+
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    get_state_rows, step);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
@@ -4553,6 +4618,21 @@ void llm_graph_context::build_sampling() const {
                 outs[1] = data.candidates;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
+        }
+    }
+
+    // in the chain form every sampled id goes to its output row of tok_io, where the next decode can take it
+    if (res->chain_ok) {
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            ggml_tensor * t = res->t_sampled[r];
+            if (t == nullptr) {
+                continue;
+            }
+            if (ggml_nelements(t) != 1 || t->type != GGML_TYPE_I32) {
+                res->chain_ok = false;
+                break;
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, t, ggml_view_1d(ctx0, chain->tok_io, 1, r*ggml_element_size(chain->tok_io))));
         }
     }
 

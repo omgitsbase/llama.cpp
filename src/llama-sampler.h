@@ -38,9 +38,13 @@ struct llama_sampler_chain {
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 std::string llama_sampler_backend_signature(const llama_sampler * sampler);
-void llama_sampler_backend_begin(llama_sampler * sampler);
+// chained: the decode was queued before the host accepted the last decode's token
+void llama_sampler_backend_begin(llama_sampler * sampler, bool chained = false);
 // the sampler's backend part is one greedy argmax over the raw logits
 bool llama_sampler_is_backend_greedy(const llama_sampler * sampler);
+
+// the backend part reads no token history from the host, so a decode can be queued before the last token is read
+bool llama_sampler_backend_chainable(const llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

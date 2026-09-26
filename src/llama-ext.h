@@ -148,6 +148,21 @@ LLAMA_API void llama_set_mtp_round_target(struct llama_context * ctx, struct lla
 // ids back and uploads them with the batch. False, and nothing armed, when ctx_src has fewer than n drafted ids.
 LLAMA_API bool llama_set_tokens_device_seq(struct llama_context * ctx, struct llama_context * ctx_src, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t col);
 
+// Decode chain: a decode queued before the host has read the tokens of the one before it.
+// Turns the chain form on for the context's small decodes. False, and nothing changes, when the context cannot chain.
+LLAMA_API bool llama_decode_chain_enable(struct llama_context * ctx);
+
+// Arms the next llama_decode: its batch row rows[k] takes, on the device, the token the backend sampler drew for batch
+// index idxs[k] of the last decode. The armed batch must have the last one's layout, every row armed. llama_decode
+// returns 3, and queues nothing, when it cannot run armed. False, and nothing armed, when the last decode cannot feed it.
+LLAMA_API bool llama_set_tokens_sampled(struct llama_context * ctx, const int32_t * rows, const int32_t * idxs, int32_t n);
+
+// Waits for the outputs the accessors read: while an armed decode is queued, those of the decode before it.
+LLAMA_API void llama_outputs_wait(struct llama_context * ctx);
+
+// The accessors move on to the outputs of the queued armed decode.
+LLAMA_API void llama_outputs_advance(struct llama_context * ctx);
+
 // the decode loop on the device: n_max greedy steps from token0 at pos0 into
 // out, each step fed by the last; needs flash attention, n_rs_seq 0 and a
 // backend sampler on sequence 0. Returns the count, or a negative on failure.

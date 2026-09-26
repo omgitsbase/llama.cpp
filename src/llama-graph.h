@@ -93,6 +93,7 @@ struct llama_cross {
 
 struct llm_graph_params;
 struct llama_tokens_dev_state;
+struct llama_decode_chain_state;
 
 //
 // llm_graph_input
@@ -117,6 +118,10 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // an input whose host data depends on the batch's token ids; a decode that takes its ids on the device
+    // cannot upload them to it
+    virtual bool reads_token_ids() const { return true; }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -141,6 +146,10 @@ public:
     llama_tokens_dev_state * tokens_dev = nullptr;
     bool dev_tokens = false; // tokens is a view of tokens_dev->tok_dev
     ggml_backend_sched_t sched = nullptr;
+
+    // chain form: I32 [2*n_tokens], the host ids and then the row map into chain->tok_io
+    const llama_decode_chain_state * chain = nullptr;
+    ggml_tensor * tok_in = nullptr;
 
     const int64_t n_embd = 0;
 };
@@ -228,6 +237,26 @@ struct llama_mtp_round_stage {
     ggml_tensor           * h_pend_dev = nullptr; // F32 [n_embd, S]
 };
 
+// tok_io rows [0, n_cm): the ids the last small decode sampled, by output row; rows [n_cm, 2*n_cm): the host's ids.
+// A row map uploaded with the host ids picks one of the two for every batch row.
+struct llama_decode_chain_state {
+    int32_t                n_cm   = 0;       // 0: no decode takes the chain form
+    ggml_context         * ctx_io = nullptr;
+    ggml_backend_buffer_t  buf_io = nullptr;
+    ggml_tensor          * tok_io = nullptr; // I32 [2*n_cm], on the output device
+
+    // for the decode being built: the output row of the last decode each sequence takes its token from, or -1
+    std::vector<int32_t>   seq_row;
+
+    llama_decode_chain_state() = default;
+    llama_decode_chain_state(const llama_decode_chain_state &) = delete;
+    llama_decode_chain_state & operator=(const llama_decode_chain_state &) = delete;
+    ~llama_decode_chain_state() {
+        if (buf_io) { ggml_backend_buffer_free(buf_io); }
+        if (ctx_io) { ggml_free(ctx_io); }
+    }
+};
+
 struct llama_mtp_round_state {
     llama_context * ctx_tgt   = nullptr;
     ggml_tensor   * hpend_dev = nullptr;  // F32 [n_embd, n_seq_max], by sequence id, written after every chained decode
@@ -312,6 +341,8 @@ public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
     virtual ~llm_graph_input_pos() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -330,6 +361,8 @@ public:
         : n_attn_temp_floor_scale(n_attn_temp_floor_scale), f_attn_temp_scale(f_attn_temp_scale), f_attn_temp_offset(f_attn_temp_offset) {}
     virtual ~llm_graph_input_attn_temp() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * attn_scale = nullptr; // F32 [n_batch]
@@ -344,6 +377,8 @@ public:
     llm_graph_input_pos_bucket(const llama_hparams & hparams) : hparams(hparams) {}
     virtual ~llm_graph_input_pos_bucket() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * pos_bucket = nullptr; // I32 [n_batch, n_batch]
@@ -357,6 +392,8 @@ public:
             const llama_hparams & hparams,
             const llama_kv_cache_context * mctx) : hparams(hparams), mctx(mctx) {}
     virtual ~llm_graph_input_pos_bucket_kv() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -375,6 +412,8 @@ public:
             uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
     virtual ~llm_graph_input_out_ids() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -392,6 +431,8 @@ public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
     virtual ~llm_graph_input_mean() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * mean; // F32 [n_batch, n_batch]
@@ -403,6 +444,8 @@ class llm_graph_input_cls : public llm_graph_input_i {
 public:
     llm_graph_input_cls(const llama_cparams & cparams, const llm_arch arch) : cparams(cparams), arch(arch) {}
     virtual ~llm_graph_input_cls() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -416,6 +459,8 @@ class llm_graph_input_rs : public llm_graph_input_i {
 public:
     llm_graph_input_rs(const llama_memory_recurrent_context * mctx) : mctx(mctx) {}
     virtual ~llm_graph_input_rs() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -441,6 +486,8 @@ public:
             const llama_cross * cross) : cross(cross) {}
     virtual ~llm_graph_input_cross_embd() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
@@ -455,6 +502,8 @@ public:
         cparams(cparams) {
     }
     ~llm_graph_input_attn_no_cache() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -482,6 +531,8 @@ public:
         mctx(mctx) {
     }
     ~llm_graph_input_attn_kv() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -527,6 +578,8 @@ public:
     }
     ~llm_graph_input_attn_k() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -557,6 +610,8 @@ public:
         mctx(mctx) {
     }
     ~llm_graph_input_attn_k_dsa() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -616,6 +671,8 @@ public:
     }
     ~llm_graph_input_attn_kv_iswa() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -661,6 +718,8 @@ public:
         mctx(mctx) {
     }
     ~llm_graph_input_attn_k_iswa() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -764,6 +823,8 @@ public:
     }
     ~llm_graph_input_dsv4() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -789,6 +850,8 @@ public:
     llm_graph_input_attn_cross(const llama_cross * cross) : cross(cross) {}
     ~llm_graph_input_attn_cross() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * get_kq_mask_cross() const { return cross_kq_mask_cnv; }
@@ -811,6 +874,8 @@ public:
         cparams(cparams),
         mctx(mctx) { }
     virtual ~llm_graph_input_mem_hybrid() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -840,6 +905,8 @@ public:
         mctx(mctx) { }
     virtual ~llm_graph_input_mem_hybrid_k() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -868,6 +935,8 @@ public:
         mctx(mctx) { }
     virtual ~llm_graph_input_mem_hybrid_iswa() = default;
 
+    bool reads_token_ids() const override { return false; }
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -888,6 +957,8 @@ public:
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
         samplers(std::move(samplers)) { }
     virtual ~llm_graph_input_sampling() = default;
+
+    bool reads_token_ids() const override { return false; }
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
@@ -931,6 +1002,7 @@ struct llm_graph_params {
     llama_mtp_round_state  * mtp_round;
     llama_tokens_dev_state * tokens_dev;
     const llama_loop_state       * loop;
+    const llama_decode_chain_state * chain;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1098,6 +1170,13 @@ public:
     std::vector<ggml_tensor *> t_mtp_ids; // I32 [S], one per chained draft step, then the accepted counts
     ggml_tensor * t_mtp_hpend = nullptr;  // F32 [n_embd, S], the anchors' hidden rows for the next round
 
+    // the token ids come in the chain form, every sampled id goes to tok_io, and no other input reads token ids
+    bool chain_ok  = false;
+    // a recurrent state this graph reads could not be kept for a rollback
+    bool chain_bad = false;
+    // the recurrent states gathered into their step rows
+    int32_t n_step_states = 0;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1184,6 +1263,7 @@ struct llm_graph_context {
     llama_mtp_round_state  * mtp_round;
     llama_tokens_dev_state * tokens_dev;
     const llama_loop_state       * loop;
+    const llama_decode_chain_state * chain;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1308,6 +1388,9 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+
+    // the token ids of this graph come through the decode chain's tok_io
+    bool is_chain_form() const;
     ggml_tensor * build_inp_pos() const;
 
     // the loop body's step, as an index
@@ -1523,7 +1606,8 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
+            ggml_tensor * step = nullptr) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 

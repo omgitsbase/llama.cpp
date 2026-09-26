@@ -1454,7 +1454,7 @@ bool llama_sampler_is_backend_greedy(const llama_sampler * sampler) {
     return greedy;
 }
 
-void llama_sampler_backend_begin(llama_sampler * sampler) {
+void llama_sampler_backend_begin(llama_sampler * sampler, bool chained) {
     GGML_ASSERT(sampler != nullptr);
 
     if (sampler->iface == &llama_sampler_chain_i) {
@@ -1463,11 +1463,12 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
             if (!entry.is_backend) {
                 break;
             }
-            llama_sampler_backend_begin(entry.ptr);
+            llama_sampler_backend_begin(entry.ptr, chained);
         }
     } else if (sampler->iface == &llama_sampler_dist_i) {
         auto * ctx = (llama_sampler_dist *) sampler->ctx;
-        if (ctx->backend_transactional) {
+        // a chained decode draws after the last one's uncommitted draw, as the serial decode would once accepted
+        if (ctx->backend_transactional && !chained) {
             ctx->rng_backend = ctx->rng;
             ctx->n_backend_draws_generated = 0;
             ctx->n_backend_draws_committed = 0;
@@ -4469,4 +4470,26 @@ std::string llama_sampler_backend_signature(const llama_sampler * smpl) {
         return "logit_bias:" + std::to_string(((const llama_sampler_logit_bias *) smpl->ctx)->logit_bias.size());
     }
     return "";
+}
+
+bool llama_sampler_backend_chainable(const llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+        for (const auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            if (!llama_sampler_backend_chainable(entry.ptr)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (smpl->iface == &llama_sampler_penalties_i) {
+        return ((const llama_sampler_penalties *) smpl->ctx)->is_disabled();
+    }
+    return true;
 }

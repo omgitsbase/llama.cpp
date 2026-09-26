@@ -916,6 +916,14 @@ private:
     // there, queued behind the draft graph, and reads them back only after it is on its way
     std::vector<server_slot *> handoff_slots;
 
+    // Decode chain: a decode of generation rows alone is queued without a wait, and the next one is queued behind it,
+    // taking its tokens on the device, before the host reads them. A stop read one step late undoes the extra step.
+    bool    chain_on      = false; // the context chains
+    bool    chain_start   = false; // the batch being decoded may start a chain: its decode is not waited on
+    bool    chain_pending = false; // a decode of chain_n rows is queued and unread; its slots' i_batch are its rows
+    bool    chain_armed   = false; // while its outputs are read, the next decode is queued behind it
+    int32_t chain_n       = 0;
+
     // the draft's ids, read back, into the draft and into the batch and prompt where its placeholders went
     void resolve_draft(server_slot & slot) {
         if (!common_speculative_resolve(spec.get(), slot.id)) {
@@ -1345,6 +1353,13 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        {
+            // LLAMA_DECODE_CHAIN=1 turns the chain on
+            const char * env = getenv("LLAMA_DECODE_CHAIN");
+            chain_on = !spec && params_base.sampling.backend_sampling && env && atoi(env) != 0 &&
+                       llama_decode_chain_enable(ctx_tgt);
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2867,6 +2882,9 @@ private:
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
 
+                // a queued decode whose slots all left: nobody reads it
+                chain_pending = false;
+
                 metrics_flush_idle();
 
                 return; // skip further processing
@@ -2878,6 +2896,18 @@ private:
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
+        }
+
+        if (chain_pending) {
+            try {
+                chain_step();
+            } catch (const std::exception & e) {
+                SRV_ERR("chain_step() failed: %s\n", e.what());
+                chain_pending = false;
+                chain_armed   = false;
+                abort_all_slots("chain_step() failed: " + std::string(e.what()));
+            }
+            return;
         }
 
         try {
@@ -2933,6 +2963,9 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+
+        chain_start = chain_on && chain_can_start(n_batch);
+
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -2957,8 +2990,25 @@ private:
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
+                chain_start = false;
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+
+            const bool chain_now = chain_start && off == 0 && n_tokens == batch.size();
+            chain_start = false;
+            if (chain_now) {
+                chain_pending = true;
+                chain_n       = n_tokens;
+                try {
+                    chain_step();
+                } catch (const std::exception & e) {
+                    SRV_ERR("chain_step() failed: %s\n", e.what());
+                    chain_pending = false;
+                    chain_armed   = false;
+                    abort_all_slots("chain_step() failed: " + std::string(e.what()));
+                }
+                break;
             }
 
             try {
@@ -3797,7 +3847,7 @@ private:
             for (server_slot * s : handoff) {
                 resolve_draft(*s);
             }
-            if (ret == 0 && has_output && !spec) {
+            if (ret == 0 && has_output && !spec && !chain_start) {
                 auto & srt = srv_round_timer();
                 const int64_t t0 = srt.on ? ggml_time_us() : 0;
                 llama_synchronize(ctx_tgt);
@@ -3906,6 +3956,102 @@ private:
         return true;
     }
 
+    // the batch is one row per generating slot and nothing else, and no slot waits for a prompt to be processed
+    bool chain_can_start(int32_t n_batch) const {
+        if (batch.size() == 0 || batch.size() > n_batch || batch.has_embd) {
+            return false;
+        }
+        int32_t n_gen = 0;
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_GENERATING || slot.i_batch < 0 || slot.i_batch >= batch.size() ||
+                    !slot.spec_draft.empty() || !slot.inp_embd.empty() || !slot.smpl) {
+                return false;
+            }
+            const auto & t = batch.tokens[slot.i_batch];
+            if (t.id_slot != slot.id || !t.output || t.is_prompt) {
+                return false;
+            }
+            n_gen++;
+        }
+        return n_gen == batch.size();
+    }
+
+    // The queued decode D's rows are its slots' i_batch. Queue the next decode behind it, taking D's tokens on the
+    // device, then read D; or, when the chain cannot go on, read D and leave the next step to the serial path.
+    void chain_step() {
+        GGML_ASSERT(chain_pending && chain_n > 0);
+
+        std::vector<server_slot *> rows(chain_n, nullptr);
+        bool arm = true;
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.i_batch >= 0 && slot.i_batch < chain_n) {
+                rows[slot.i_batch] = &slot;
+            } else if (slot.is_processing()) {
+                arm = false;
+            }
+        }
+        for (const server_slot * s : rows) {
+            // a slot that left, one whose last token is the one D samples, or one that would run out of context
+            arm = arm && s != nullptr && (s->n_remaining() == -1 || s->n_remaining() > 1) &&
+                  s->prompt.n_tokens() + 2 < s->n_ctx;
+        }
+
+        if (arm) {
+            batch.clear();
+            std::vector<int32_t> idx(chain_n);
+            for (int32_t r = 0; r < chain_n; ++r) {
+                // the row's token is a placeholder: the decode takes the one D samples
+                batch.add(rows[r]->id, rows[r]->sampled, rows[r]->prompt.tokens.pos_next(), true, false);
+                idx[r] = r;
+            }
+            batch.render();
+            llama_batch view = batch.get_view(0, chain_n);
+
+            int ret = 3;
+            if (llama_set_tokens_sampled(ctx_tgt, idx.data(), idx.data(), chain_n)) {
+                ret = llama_decode(ctx_tgt, view);
+            }
+            if (ret != 0 && ret != 3) {
+                SRV_WRN("the chained decode failed (ret = %d); the step runs serially\n", ret);
+            }
+            arm = ret == 0;
+        }
+
+        chain_armed = arm;
+        queue_tasks.yield_to_queue([&]() {
+            llama_outputs_wait(ctx_tgt);
+        });
+
+        llama_batch view = batch.get_view(0, chain_n);
+        {
+            scoped_timer t(t_post_decode, n_post_decode);
+            post_decode(chain_n, 0, view);
+        }
+        chain_armed = false;
+
+        if (!arm) {
+            chain_pending = false;
+            return;
+        }
+
+        // the queued decode consumes the tokens just read
+        bool any = false;
+        for (int32_t r = 0; r < chain_n; ++r) {
+            server_slot & s = *rows[r];
+            if (s.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+            s.prompt.tokens.push_back(s.sampled);
+            s.i_batch = r;
+            any = true;
+        }
+        llama_outputs_advance(ctx_tgt);
+        chain_pending = any;
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
@@ -4011,6 +4157,12 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
+                if (chain_armed) {
+                    // the step queued past the stop never happened
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                        slot.prompt_clear();
+                    }
+                }
                 checkpoint_after_generation(slot);
                 slot.release();
 
