@@ -39,6 +39,8 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 std::string llama_sampler_backend_signature(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
+// the sampler's backend part is one greedy argmax over the raw logits
+bool llama_sampler_is_backend_greedy(const llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

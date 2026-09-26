@@ -1427,6 +1427,33 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     );
 }
 
+bool llama_sampler_is_backend_greedy(const llama_sampler * sampler) {
+    if (sampler == nullptr) {
+        return false;
+    }
+    if (sampler->iface == &llama_sampler_greedy_i) {
+        return true;
+    }
+    if (sampler->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    bool greedy = false;
+    for (const auto & entry : chain->samplers) {
+        if (!entry.is_backend) {
+            break;
+        }
+        if (entry.ptr->iface->backend_apply == nullptr) {
+            continue;
+        }
+        if (greedy || !llama_sampler_is_backend_greedy(entry.ptr)) {
+            return false;
+        }
+        greedy = true;
+    }
+    return greedy;
+}
+
 void llama_sampler_backend_begin(llama_sampler * sampler) {
     GGML_ASSERT(sampler != nullptr);
 

@@ -773,7 +773,7 @@ void llama_context::flush_outputs() {
     }
     llama_work_queued();
     for (const auto & c : outputs_pending) {
-        ggml_backend_tensor_get_async(c.backend, c.tensor, c.dst, 0, c.size);
+        ggml_backend_tensor_get_async(c.backend, c.tensor, c.dst, c.offset, c.size);
     }
     outputs_pending.clear();
 }
@@ -1730,18 +1730,37 @@ static void copy_tensor_async_rows(
 
         const uint32_t row = row_offset + i;
         const size_t n_elements = ggml_nelements(tensor);
+        const size_t nbytes     = ggml_nbytes(tensor);
         GGML_ASSERT(ggml_is_contiguous(tensor) && "sampling tensor must be contiguous for async copy");
         GGML_ASSERT(n_elements <= stride);
-        GGML_ASSERT((size_t) row * stride + n_elements <= dst.size);
+
+        // views of one tensor that sit back to back, going to back-to-back rows, come back as one copy
+        size_t n_run = 1;
+        if (tensor->view_src != nullptr && stride*sizeof(T) == nbytes && !llama_host_off(LLAMA_HOST_OFF_GREEDY_BATCH)) {
+            while (i + n_run < tensors.size() && tensors[i + n_run] != nullptr &&
+                   tensors[i + n_run]->view_src  == tensor->view_src &&
+                   tensors[i + n_run]->view_offs == tensor->view_offs + n_run*nbytes &&
+                   ggml_nbytes(tensors[i + n_run]) == nbytes) {
+                n_run++;
+            }
+        }
+        GGML_ASSERT((size_t) (row + n_run - 1) * stride + n_elements <= dst.size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         T * row_ptr = dst.data + (size_t) row * stride;
-        issue(backend, tensor, row_ptr, ggml_nbytes(tensor));
+        if (n_run > 1) {
+            issue(backend, tensor->view_src, row_ptr, n_run*nbytes, tensor->view_offs);
+        } else {
+            issue(backend, tensor, row_ptr, nbytes, 0);
+        }
 
         if (counts) {
-            GGML_ASSERT(row < counts->size());
-            (*counts)[row] = n_elements;
+            GGML_ASSERT(row + n_run - 1 < counts->size());
+            for (size_t k = 0; k < n_run; ++k) {
+                (*counts)[row + k] = n_elements;
+            }
         }
+        i += n_run - 1;
     }
 }
 
@@ -2143,7 +2162,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                outputs_pending.push_back({backend_h, t_h_nextn, embd_nextn_out, n_rows*n_embd*sizeof(float)});
+                outputs_pending.push_back({backend_h, t_h_nextn, embd_nextn_out, n_rows*n_embd*sizeof(float), 0});
             }
         }
 
@@ -2176,7 +2195,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (has_samplers) {
             const auto stride = n_vocab;
-            const auto defer  = [this](ggml_backend_t b, ggml_tensor * t, void * d, size_t n) { outputs_pending.push_back({b, t, d, n}); };
+            const auto defer  = [this](ggml_backend_t b, ggml_tensor * t, void * d, size_t n, size_t offs) { outputs_pending.push_back({b, t, d, n, offs}); };
 
             // a candidate that is the sampled tensor itself (greedy) is not read back: its row is filled from the sampled id
             const std::vector<ggml_tensor *> * t_candidates = &res->t_candidates;

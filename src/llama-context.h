@@ -331,7 +331,7 @@ private:
     // the sampled rows and nextn rows decode reads back, issued by synchronize() rather than behind the graph:
     // there they sat at the head of the copy queue until the graph finished, and a drafter's uploads queued
     // behind them waited for the whole verify
-    struct output_copy { ggml_backend_t backend; ggml_tensor * tensor; void * dst; size_t size; };
+    struct output_copy { ggml_backend_t backend; ggml_tensor * tensor; void * dst; size_t size; size_t offset; };
     std::vector<output_copy> outputs_pending;
     // rows whose bytes equal another output's row, filled on the host once that row has arrived
     struct output_fill { void * dst; const void * src; size_t size; };

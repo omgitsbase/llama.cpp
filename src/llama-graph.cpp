@@ -299,13 +299,27 @@ void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
         mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, 0);
 
         GGML_ASSERT((int64_t) res_tgt->t_sampled.size() >= n_verify);
-        for (int64_t i = 0; i < n_verify; ++i) {
+        auto sampled_id = [&](int64_t i) {
             ggml_tensor * src_c = res_tgt->t_sampled[i];
             if (src_c == nullptr && i < (int64_t) res_tgt->t_candidates.size()) {
                 src_c = res_tgt->t_candidates[i]; // the greedy sampler leaves one candidate
             }
             GGML_ASSERT(src_c && src_c->type == GGML_TYPE_I32 && "MTP round: the target must sample on the backend");
-            mtp_round_copy(sched_tgt, sched, src_c, c_ids, sizeof(int32_t), i * sizeof(int32_t));
+            return src_c;
+        };
+        for (int64_t i = 0; i < n_verify; ) {
+            ggml_tensor * src_c = sampled_id(i);
+            // ids that sit back to back in one tensor (the batched greedy rows) go over as one copy
+            int64_t n_run = 1;
+            while (src_c->view_src != nullptr && i + n_run < n_verify && !llama_host_off(LLAMA_HOST_OFF_GREEDY_BATCH)) {
+                const ggml_tensor * next = sampled_id(i + n_run);
+                if (next->view_src != src_c->view_src || next->view_offs != src_c->view_offs + n_run*sizeof(int32_t)) {
+                    break;
+                }
+                n_run++;
+            }
+            mtp_round_copy(sched_tgt, sched, src_c, c_ids, n_run*sizeof(int32_t), i * sizeof(int32_t));
+            i += n_run;
         }
 
         mtp_round_copy(sched, sched, st->hpend_dev, h_pend, row_bytes, 0);
@@ -4226,15 +4240,44 @@ void llm_graph_context::build_sampling() const {
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
-    // add a dummy row to keep the single-output graph static regardless of active samplers
-    // multi-output graphs can still vary with the number of output rows
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
-
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
             entry.second->iface->backend_reset(entry.second);
         }
     }
+
+    // every row takes the argmax of its own logits: one argmax over all rows and one gather of the chosen logits.
+    // The argmax kernel treats each row alone, so the ids and logits are the ones the per-row graphs give
+    bool greedy_rows = n_rows > 0 && !llama_host_off(LLAMA_HOST_OFF_GREEDY_BATCH) &&
+        res->t_logits->ne[1] == n_rows && ggml_is_contiguous(res->t_logits);
+    uint32_t n_rows_sampled = 0;
+    for (const auto & [seq_id, sampler] : samplers) {
+        const auto it = sampling_rows.find(seq_id);
+        greedy_rows = greedy_rows && it != sampling_rows.end() && llama_sampler_is_backend_greedy(sampler);
+        n_rows_sampled += it != sampling_rows.end() ? it->second.size() : 0;
+    }
+    if (greedy_rows && n_rows_sampled == n_rows) {
+        const int64_t n_vocab = res->t_logits->ne[0];
+        ggml_tensor * ids = ggml_argmax(ctx0, res->t_logits);
+        ggml_set_name(ids, "greedy_argmax");
+        ggml_tensor * lgs = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, res->t_logits, 1, n_vocab, n_rows), ggml_reshape_2d(ctx0, ids, 1, n_rows));
+        ggml_set_name(lgs, "greedy_logit");
+        ggml_build_forward_expand(gf, lgs);
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            ggml_tensor * id = ggml_view_1d(ctx0, ids, 1, r*ids->nb[0]);
+            ggml_tensor * lg = ggml_view_1d(ctx0, lgs, 1, r*lgs->nb[2]);
+            ggml_build_forward_expand(gf, id);
+            ggml_build_forward_expand(gf, lg);
+            res->t_sampled[r]        = id;
+            res->t_candidates[r]     = id;
+            res->t_sampled_logits[r] = lg;
+        }
+        return;
+    }
+
+    // add a dummy row to keep the single-output graph static regardless of active samplers
+    // multi-output graphs can still vary with the number of output rows
+    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     static const std::vector<uint32_t> dummy_row = { 0 };
 

@@ -83,10 +83,11 @@ struct time_meas {
     int64_t & t_acc;
 };
 
-// LLAMA_HOST_OFF=<mask> turns host-side paths off for A/B: 1 sync once, 2 greedy candidates dedupe
+// LLAMA_HOST_OFF=<mask> turns host-side paths off for A/B: 1 sync once, 2 greedy candidates dedupe, 4 batched greedy rows
 enum llama_host_off_bit : uint32_t {
     LLAMA_HOST_OFF_SYNC_ONCE     = 1,
     LLAMA_HOST_OFF_CAND_DEDUPE   = 2,
+    LLAMA_HOST_OFF_GREEDY_BATCH  = 4,
 };
 
 bool llama_host_off(uint32_t bit);
