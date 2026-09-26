@@ -4212,10 +4212,11 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
 }
 
 // the matvec epilogue, the gate/up pairs and the merged gate_up GLU run only with GGML_CUDA_MM_EPI=1
+// on by default for one-column matvecs; GGML_CUDA_MM_EPI=0 turns the matvec epilogue and the gate/up pairs off
 static bool ggml_cuda_mm_epi_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MM_EPI");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return on;
 }
@@ -4293,8 +4294,9 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
     }
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
+    // a verify of several columns already has each row's loads well covered, and the epilogue's own cost it
     if (src0->type == GGML_TYPE_NVFP4 || mm->type != GGML_TYPE_F32 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-        !ggml_is_contiguous(mm) || mm->ne[1] > MMVQ_MAX_BATCH_SIZE || src0->buffer == nullptr ||
+        !ggml_is_contiguous(mm) || mm->ne[1] != 1 || src0->buffer == nullptr ||
         ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return 0;
     }
@@ -4464,7 +4466,7 @@ static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggm
     for (const ggml_tensor * mm : { gate_mm, up_mm }) {
         const ggml_tensor * src0 = mm->src[0];
         if (!ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_NVFP4 || src0->buffer == nullptr ||
-            !ggml_is_contiguous(mm) || mm->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+            !ggml_is_contiguous(mm) || mm->ne[1] != 1 ||
             ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
             !ggml_cuda_should_fuse_mul_mat_vec_q(mm) || !ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
             return false;
