@@ -1502,6 +1502,20 @@ struct ggml_cuda_norm_fold {
     bool    scale_ready = false;
 };
 
+// a single-row gather of a recurrent state cache, read in place by its only reader
+struct ggml_cuda_state_fold {
+    const float *   base = nullptr; // the cache
+    const int32_t * ids  = nullptr; // the row, one per sequence
+    int64_t         row  = 0;       // floats between rows
+    bool            pre  = false;   // no earlier node of the graph writes the cache, so the row may be read before the wait
+};
+
+struct ggml_cuda_state_writer {
+    int          node;
+    const char * begin;
+    const char * end;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1522,6 +1536,11 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * ids_ready        = nullptr;
     int                 ids_ready_stream = -1;
 
+    // keyed by a recurrent state gather left unlaunched, whose reader takes the cache row in place;
+    // state_writers lists the graph's nodes that write outside compute buffers, built on first use
+    std::unordered_map<const ggml_tensor *, ggml_cuda_state_fold> state_folds;
+    std::vector<ggml_cuda_state_writer> state_writers;
+    bool state_writers_ready = false;
 
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };

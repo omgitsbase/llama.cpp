@@ -3252,6 +3252,125 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+static bool ggml_cuda_ranges_overlap(const void * a, size_t na, const void * b, size_t nb) {
+    return (const char *) a < (const char *) b + nb && (const char *) b < (const char *) a + na;
+}
+
+// a single-row gather from a recurrent state cache whose only reader is a gated_delta_net: the
+// reader takes the cache row in place and the gather is not launched
+static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int g) {
+    static const bool disabled = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION"))) ||
+                                 (getenv("GGML_CUDA_GRAPH_OPT") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1);
+    if (disabled || (ggml_cuda_fuse_off_mask() & 1073741824)) {
+        return false;
+    }
+
+    const ggml_tensor * node = cgraph->nodes[g];
+    const ggml_tensor * src  = node->src[0];
+    const ggml_tensor * ids  = node->src[1];
+    if (node->op != GGML_OP_GET_ROWS || node->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+        (node->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(node) || ggml_nelements(ids) != 1 ||
+        src->ne[2] != 1 || src->ne[3] != 1 || src->nb[0] != sizeof(float) || src->nb[1] % sizeof(float) != 0 ||
+        src->data == nullptr || ids->data == nullptr) {
+        return false;
+    }
+    // the cache is only written by graph nodes, and the id is uploaded before the graph starts
+    const ggml_tensor * cache    = src->view_src ? src->view_src : src;
+    const ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
+    if (cache->buffer == nullptr || ggml_backend_buffer_get_usage(cache->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+        !(ids_base->flags & GGML_TENSOR_FLAG_INPUT)) {
+        return false;
+    }
+
+    // the only reader, reached through offset-0 contiguous views each read once
+    const ggml_tensor * state     = node;
+    int                 state_idx = g;
+    int                 c         = g + 1;
+    for (; c < cgraph->n_nodes; ++c) {
+        const ggml_tensor * n = cgraph->nodes[c];
+        if (std::find(n->src, n->src + GGML_MAX_SRC, state) == n->src + GGML_MAX_SRC) {
+            continue;
+        }
+        if (ggml_node_get_use_count(cgraph, state_idx) != 1) {
+            return false;
+        }
+        if ((n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) && n->view_offs == 0 && ggml_is_contiguous(n)) {
+            state     = n;
+            state_idx = c;
+            continue;
+        }
+        break;
+    }
+    if (c >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * reader = cgraph->nodes[c];
+    if (!(reader->flags & GGML_TENSOR_FLAG_COMPUTE) || ggml_is_empty(reader) || reader->type != GGML_TYPE_F32 ||
+        ggml_nelements(state) != src->ne[0]) {
+        return false;
+    }
+    if (reader->op == GGML_OP_GATED_DELTA_NET) {
+        if (reader->src[5] != state || reader->src[2]->ne[3] != 1) {
+            return false;
+        }
+        for (int s = 0; s < 5; ++s) {
+            if (reader->src[s] == state) {
+                return false;
+            }
+        }
+    } else {
+        return false;
+    }
+
+    if (!ctx.state_writers_ready) {
+        ctx.state_writers.clear();
+        for (int k = 0; k < cgraph->n_nodes; ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (ggml_cuda_is_view_or_noop(n) || !(n->flags & GGML_TENSOR_FLAG_COMPUTE) || n->data == nullptr || n->buffer == nullptr ||
+                ggml_backend_buffer_get_usage(n->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                continue;
+            }
+            ctx.state_writers.push_back({ k, (const char *) n->data, (const char *) n->data + ggml_nbytes(n) });
+        }
+        ctx.state_writers_ready = true;
+    }
+
+    // nothing may write the cache between the gather and its reader; a write before the gather
+    // only keeps the reader from loading the row before its wait
+    bool pre = true;
+    for (const ggml_cuda_state_writer & w : ctx.state_writers) {
+        if (w.node >= c) {
+            break;
+        }
+        if (ggml_cuda_ranges_overlap(w.begin, w.end - w.begin, src->data, ggml_nbytes(src))) {
+            if (w.node > g) {
+                return false;
+            }
+            pre = false;
+        }
+    }
+
+    // the id must outlive its last reader: no node up to the reader, the fused cache copy included,
+    // may take its memory
+    ggml_cuda_gated_delta_net_fused_cache unused;
+    const int last = c + ggml_cuda_try_gdn_cache_fusion(cgraph, c, unused);
+    for (int k = g + 1; k <= last; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (!ggml_cuda_is_view_or_noop(n) && n->data != nullptr &&
+            ggml_cuda_ranges_overlap(n->data, ggml_nbytes(n), ids->data, sizeof(int32_t))) {
+            return false;
+        }
+    }
+
+    ggml_cuda_state_fold & fold = ctx.state_folds[node];
+    fold.base = (const float *) src->data;
+    fold.ids  = (const int32_t *) ids->data;
+    fold.row  = src->nb[1] / sizeof(float);
+    fold.pre  = pre;
+    GGML_LOG_DEBUG("%s: %s read in place by %s%s\n", __func__, node->name, reader->name, pre ? " before its wait" : "");
+    return true;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -5547,6 +5666,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->norm_folds.clear();
             cuda_ctx->norm_fold_order.clear();
             cuda_ctx->ids_ready = nullptr;
+            cuda_ctx->state_folds.clear();
+            cuda_ctx->state_writers_ready = false;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 // GGML_CUDA_TRACE_OPS=1: every op before its launch, for a synchronous fault hunt
@@ -5626,6 +5747,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_state_fold(*cuda_ctx, cgraph, i)) {
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 // GGML_CUDA_TRACE_LAUNCH=1: what the graph actually launches,
@@ -5698,6 +5823,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->norm_fold_order.clear();
             cuda_ctx->norm_folds.clear();
             cuda_ctx->ids_ready = nullptr;
+            GGML_ASSERT(cuda_ctx->state_folds.empty() && "a recurrent state gather was folded into a reader that never ran");
+            cuda_ctx->state_writers_ready = false;
             if (op_stats) { ggml_cuda_op_timer_get().flush(cuda_ctx->stream(), cgraph->n_nodes); }
         }
 
