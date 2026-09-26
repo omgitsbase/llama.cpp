@@ -3994,6 +3994,16 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
     return 2;
 }
 
+// the matvec epilogue, the gate/up pairs and the merged gate_up GLU: opt in with GGML_CUDA_MM_EPI=1 until their
+// decode A/B passes (a contended MTP run on a 27B IQ model measured them slower)
+static bool ggml_cuda_mm_epi_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MM_EPI");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
 // the lean epilogue at one column: off until measured, GGML_CUDA_LEAN_T1=1 turns it on
 static bool ggml_cuda_mm_epi_lean_t1() {
     static const bool on = [] {
@@ -4064,7 +4074,7 @@ static bool ggml_cuda_mm_epi_arg_of(const ggml_tensor * mm, const ggml_tensor * 
 // 1-8 columns, float weights at one column
 static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     const ggml_tensor * mm = cgraph->nodes[i];
-    if (mm->op != GGML_OP_MUL_MAT || (ggml_cuda_fuse_off_mask() & 262144)) {
+    if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 262144)) {
         return 0;
     }
     const ggml_tensor * src0 = mm->src[0];
@@ -4222,7 +4232,7 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
 // quantized activation
 static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * up_mm,
         const ggml_tensor * gate_b, const ggml_tensor * up_b, ggml_tensor * glu) {
-    if (ggml_cuda_fuse_off_mask() & 1048576) {
+    if (!ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576)) {
         return false;
     }
     if (gate_mm->op != GGML_OP_MUL_MAT || up_mm->op != GGML_OP_MUL_MAT || gate_mm->src[1] != up_mm->src[1] ||
@@ -4323,7 +4333,7 @@ static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggm
 // through two views or as a single-tensor GLU: the fused gate kernel over the halves as two weight matrices
 static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     const ggml_tensor * gu = cgraph->nodes[i];
-    if ((gu->op != GGML_OP_MUL_MAT && gu->op != GGML_OP_MUL_MAT_ID) || (ggml_cuda_fuse_off_mask() & 1048576) ||
+    if ((gu->op != GGML_OP_MUL_MAT && gu->op != GGML_OP_MUL_MAT_ID) || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576) ||
         (gu->flags & GGML_TENSOR_FLAG_OUTPUT) || gu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gu) || gu->ne[0] % 2 != 0) {
         return 0;
     }
