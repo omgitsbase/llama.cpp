@@ -732,6 +732,26 @@ static __device__ __forceinline__ void fwht_quant_q8_0(float * row, block_q8_0 *
     }
 }
 
+// the Q rows: the same rotation, written back as floats
+template <int N>
+static __device__ __forceinline__ void fwht_row_f32(const float * row, float * dst, const float scale, const int lane) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int el_w      = N / warp_size;
+
+    float reg[el_w];
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        reg[i] = row[i*warp_size + lane] * scale;
+    }
+
+    fwht_warp<N>(reg, lane);
+
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        dst[i*warp_size + lane] = reg[i];
+    }
+}
+
 // fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
 // one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns
 template <int block_size, bool has_ff, bool mrope, typename D>
@@ -809,8 +829,12 @@ static __global__ void rms_norm_mul_rope_f32(
     }
     dst += idst;
 
+    // a nonzero hscale rotates a float row the same way, in place of the rope output
+    constexpr bool f32    = std::is_same<D, float>::value;
+    const bool     staged = q8 || (f32 && hscale != 0.0f);
+
     float * s_row = s_sum + 32;
-    E *     out   = q8 ? (E *) s_row : (E *) dst;
+    E *     out   = staged ? (E *) s_row : (E *) dst;
 
     for (int i0 = 2*tid; i0 < ncols; i0 += 2*block_size) {
         int ix0;
@@ -863,6 +887,21 @@ static __global__ void rms_norm_mul_rope_f32(
             }
         }
     }
+
+    if constexpr (f32) {
+        if (hscale != 0.0f) {
+            __syncthreads();
+            if (tid < ggml_cuda_get_physical_warp_size()) {
+                switch (ncols) {
+                    case  64: fwht_row_f32< 64>(s_row, (float *) dst, hscale, tid); break;
+                    case 128: fwht_row_f32<128>(s_row, (float *) dst, hscale, tid); break;
+                    case 256: fwht_row_f32<256>(s_row, (float *) dst, hscale, tid); break;
+                    case 512: fwht_row_f32<512>(s_row, (float *) dst, hscale, tid); break;
+                    default: break;
+                }
+            }
+        }
+    }
 }
 
 template <int block_size, bool mrope, typename D>
@@ -884,7 +923,7 @@ static void rms_norm_mul_rope_launch(
         const bool is_neox, const mrope_sections sections, const bool is_imrope,
         const bool w_pre, const float hscale) {
     constexpr bool q8 = std::is_same<D, block_q8_0>::value;
-    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(block_size, 1, 1), (32 + (q8 ? ncols : 0))*sizeof(float), stream};
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(block_size, 1, 1), (32 + (q8 || hscale != 0.0f ? ncols : 0))*sizeof(float), stream};
     if (freq_factors == nullptr) {
         ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<block_size, false, mrope, D>, launch_params,
             x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
@@ -1027,13 +1066,21 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     const int64_t s2 = rope->nb[2] / ts_dst;
     const int64_t s3 = rope->nb[3] / ts_dst;
 
-    // the K cache: blocks per head, and the same scale the standalone rotation uses
-    float hscale = 1.0f;
-    if (dst_type == GGML_TYPE_Q8_0) {
+    // a Hadamard rotation of each head, with the scale the standalone rotation uses: into the K cache as
+    // q8_0 blocks, or as floats into the rotation's own output when the rope output has no other reader
+    float hscale = 0.0f;
+    if (hadamard != nullptr) {
         const int n = x->ne[0];
-        GGML_ASSERT(hadamard != nullptr && n % 64 == 0 && n <= 512);
-        s1     = n / QK8_0;
+        GGML_ASSERT(n % 64 == 0 && n <= 512);
         hscale = 1 / sqrtf(n);
+        if (dst_type == GGML_TYPE_Q8_0) {
+            s1 = n / QK8_0;
+        } else {
+            GGML_ASSERT(dst_type == GGML_TYPE_F32 && set_rows == nullptr && ggml_is_contiguous(rope) && ggml_is_contiguous(hadamard));
+            dst_d = hadamard->data;
+        }
+    } else {
+        GGML_ASSERT(dst_type != GGML_TYPE_Q8_0);
     }
 
     const bool w_pre = !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NORM_WEIGHT_EARLY) && ggml_cuda_tensor_is_constant(mul_src);

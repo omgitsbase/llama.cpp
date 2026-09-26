@@ -2859,33 +2859,40 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
-// the K path of a quantized cache: rope > reshape > mul_mat(rotation) > reshape > view > set_rows(q8_0),
-// one head per rotation at the widths the rotation kernel has
-static bool ggml_cuda_should_fuse_rope_hadamard_set_rows(const ggml_tensor * rope,
-                                                         const ggml_tensor * mm,
-                                                         const ggml_tensor * view,
-                                                         const ggml_tensor * set_rows) {
-    if (rope->op != GGML_OP_ROPE || mm->op != GGML_OP_MUL_MAT || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
-        return false;
-    }
-    if (rope->src[0]->ne[3] != 1) {
-        return false;
-    }
-    if (set_rows->type != GGML_TYPE_Q8_0 || set_rows->src[1]->type != GGML_TYPE_I64) {
+// rope > reshape > mul_mat(rotation): one Hadamard rotation per head, at the widths the rotation kernel has
+static bool ggml_cuda_should_fuse_rope_hadamard(const ggml_tensor * rope, const ggml_tensor * mm) {
+    if (rope->op != GGML_OP_ROPE || mm->op != GGML_OP_MUL_MAT || rope->src[0]->ne[3] != 1) {
         return false;
     }
 
     const int64_t n = rope->ne[0];
     if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD || mm->src[0]->ne[0] != n || mm->src[0]->ne[1] != n ||
-            n % 64 != 0 || n > 512 || mm->src[1]->ne[0] != n || !ggml_is_contiguous(mm->src[1]) || !ggml_is_contiguous(mm)) {
-        return false;
-    }
-    if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1] || view->ne[1] != rope->ne[2]) {
+            n % 64 != 0 || n > 512 || mm->src[1]->ne[0] != n || mm->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(mm->src[1]) || !ggml_is_contiguous(mm) || !ggml_is_contiguous(rope) ||
+            ggml_nelements(mm) != ggml_nelements(rope)) {
         return false;
     }
 
     const int mode = ((const int32_t *) rope->op_params)[2];
     if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && !ggml_cuda_fuse_multi_rope(mode)) {
+        return false;
+    }
+
+    return true;
+}
+
+// the K path of a quantized cache: the rotation, then reshape > view > set_rows(q8_0)
+static bool ggml_cuda_should_fuse_rope_hadamard_set_rows(const ggml_tensor * rope,
+                                                         const ggml_tensor * mm,
+                                                         const ggml_tensor * view,
+                                                         const ggml_tensor * set_rows) {
+    if (!ggml_cuda_should_fuse_rope_hadamard(rope, mm) || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    if (set_rows->type != GGML_TYPE_Q8_0 || set_rows->src[1]->type != GGML_TYPE_I64) {
+        return false;
+    }
+    if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1] || view->ne[1] != rope->ne[2]) {
         return false;
     }
 
@@ -3696,6 +3703,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope) &&
             ggml_cuda_should_fuse_rope_hadamard_set_rows(rope, mm, view, set_rows)) {
             int out_nodes[] = { node_idx + 7 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+    }
+
+    std::initializer_list<enum ggml_op> rms_norm_mul_rope_hadamard_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
+    if (is_equal(rms_norm_mul_rope_hadamard_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * rope     = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * mm       = cgraph->nodes[node_idx + 4];
+
+        if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 1, 3}}) &&
+            ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope) &&
+            ggml_cuda_should_fuse_rope_hadamard(rope, mm)) {
+            int out_nodes[] = { node_idx + 4 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
     }
@@ -5549,6 +5572,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 7], cgraph->nodes[i + 4]);
         return 7;
+    }
+
+    if (!(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_ROPE_HADAMARD) &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, {})) {
+        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 4]);
+        return 4;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {

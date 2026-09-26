@@ -2706,15 +2706,16 @@ struct test_rms_norm_mul_rope : public test_case {
 
         ggml_tensor * out;
 
+        ggml_tensor * src = rope;
+        if (hadamard) {
+            ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[0]);
+            ggml_set_name(rot, "rot");
+            src = ggml_mul_mat(ctx, rot, ggml_reshape_2d(ctx, rope, ne[0], ne[1]*ne[2]));
+            ggml_mul_mat_set_hint(src, GGML_HINT_SRC0_IS_HADAMARD);
+            src = ggml_reshape_4d(ctx, src, ne[0], ne[1], ne[2], 1);
+        }
+
         if (set_rows) {
-            ggml_tensor * src = rope;
-            if (hadamard) {
-                ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[0]);
-                ggml_set_name(rot, "rot");
-                src = ggml_mul_mat(ctx, rot, ggml_reshape_2d(ctx, rope, ne[0], ne[1]*ne[2]));
-                ggml_mul_mat_set_hint(src, GGML_HINT_SRC0_IS_HADAMARD);
-                src = ggml_reshape_4d(ctx, src, ne[0], ne[1], ne[2], 1);
-            }
             ggml_tensor * view = ggml_view_2d(ctx, src, ne[0] * ne[1], ne[2], src->nb[2], 0);
 
             ggml_tensor * dst = ggml_new_tensor_4d(ctx, hadamard ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
@@ -2726,7 +2727,7 @@ struct test_rms_norm_mul_rope : public test_case {
             out = ggml_set_rows(ctx, dst, view, row_idxs);
             ggml_set_name(out, "out");
         } else {
-            out = rope;
+            out = src;
         }
 
         return out;
@@ -9817,8 +9818,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
 
-    // the K path of a quantized cache: rope, one Hadamard rotation per head, q8_0 set_rows
+    // rope and one Hadamard rotation per head: the Q path as floats, the K path of a quantized cache as q8_0 set_rows
     for (auto rope : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE}) {
+        test_cases.emplace_back(new test_rms_norm_mul_rope({256, 24, 5, 1}, 1e-6f, false, false, true,  rope,  64, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({128,  8, 3, 1}, 1e-6f, false, false, true,  rope,  64, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({ 64,  4, 2, 1}, 1e-6f, false, false, false, rope,  32, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({512,  2, 3, 1}, 1e-6f, false, false, true,  rope, 128, false, true));
         test_cases.emplace_back(new test_rms_norm_mul_rope({256, 4, 5, 1}, 1e-6f, false, true, true,  rope,  64, false, true));
         test_cases.emplace_back(new test_rms_norm_mul_rope({128, 2, 3, 1}, 1e-6f, false, true, true,  rope,  64, false, true));
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 64, 8, 2, 1}, 1e-6f, false, true, false, rope,  32, false, true));
