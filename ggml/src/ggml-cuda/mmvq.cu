@@ -1555,9 +1555,9 @@ void ggml_cuda_mul_mat_vec_q(
         // the first quantized reader quantizes, and writes the row factors for any float reader.
         // src1 may be a plain view of the product, so its own strides walk the norm's input
         if (!fold->q8_ready) {
-            const bool w_early = !(ggml_cuda_fuse_off_mask() & 16384) && ggml_cuda_tensor_is_constant(fold->w);
-            quantize_row_q8_1_rms_cuda((const float *) fold->x->data, (const float *) fold->w->data, fold->eps, fold->q8, fold->scale,
-                ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, w_early, l2_pf, stream);
+            quantize_row_q8_1_rms_cuda((const float *) fold->x->data, (const float *) fold->w->data,
+                ggml_cuda_tensor_is_constant(fold->w), fold->eps, fold->q8, fold->scale,
+                ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, l2_pf, stream);
             fold->q8_ready    = true;
             fold->scale_ready = true;
         }

@@ -631,8 +631,103 @@ static __global__ void quantize_q8_1_rms(
     }
 }
 
-void quantize_row_q8_1_rms_cuda(
+// quantize_q8_1_rms for rows of at most nper*block_size values: each thread loads its nper values of the row
+// once, sums their squares in the loop kernel's order, and quantizes the one of them that falls in its block.
+// With w_pre the thread's weight, a constant, is read before waiting on the producer of x.
+template <int block_size, int nper, bool w_pre>
+__launch_bounds__(block_size, 1)
+static __global__ void quantize_q8_1_rms_reg(
+        const float * x_ptr, const float * w_ptr, const float eps, void * vy_ptr, float * scale_out_ptr,
+        const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int ne0, const int ne1, const uint3 ne2) {
+    ggml_cuda_pdl_lc();
+    constexpr int nwarps = block_size / WARP_SIZE;
+    const int i1  = blockIdx.y;
+    const int i3  = fastdiv(blockIdx.z, ne2);
+    const int i2  = blockIdx.z - i3*ne2.z;
+    const int tid = threadIdx.x;
+    const int col = blockIdx.x*block_size + tid;
+    const int64_t row = ((int64_t) i3*ne2.z + i2) * ne1 + i1;
+
+    const float * GGML_CUDA_RESTRICT x         = x_ptr + i3*s03 + i2*s02 + i1*s01;
+    const float * GGML_CUDA_RESTRICT w         = w_ptr;
+    float       * GGML_CUDA_RESTRICT scale_out = scale_out_ptr;
+    block_q8_1  * GGML_CUDA_RESTRICT y         = (block_q8_1 *) vy_ptr + row * (ne0 / QK8_1);
+
+    float wv = 0.0f;
+    if constexpr (w_pre) {
+        wv = col < ne00 ? w[col] : 0.0f;
+    }
+    ggml_cuda_pdl_sync();
+    if constexpr (!w_pre) {
+        wv = col < ne00 ? w[col] : 0.0f;
+    }
+
+    float xv[nper];
+#pragma unroll
+    for (int k = 0; k < nper; ++k) {
+        xv[k] = tid + k*block_size < ne00 ? x[tid + k*block_size] : 0.0f;
+    }
+    // the padding adds +0.0f to a sum that is at least +0.0f, so the sum is the loop kernel's
+    float tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < nper; ++k) {
+        tmp += xv[k] * xv[k];
+    }
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float scale = ggml_cuda_rms_scale(tmp, ne00, eps);
+
+    if (scale_out && blockIdx.x == 0 && tid == 0) {
+        scale_out[row] = scale;
+    }
+
+    const int lane = tid % WARP_SIZE;
+    const int ib   = blockIdx.x*nwarps + tid / WARP_SIZE;
+    if (ib >= ne0 / QK8_1) {
+        return;
+    }
+    // this thread's column is its load k == blockIdx.x; blocks past the row only write padding
+    float xc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < nper; ++k) {
+        xc = blockIdx.x == k ? xv[k] : xc;
+    }
+    const float xi = col < ne00 ? scale * xc * wv : 0.0f;
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y[ib].qs[lane] = q;
+    if (lane == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
+template <int block_size, int nper>
+static void quantize_q8_1_rms_reg_launch(
+        const dim3 num_blocks, const bool w_pre, cudaStream_t stream,
         const float * x, const float * w, const float eps, void * vy, float * scale_out,
+        const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int ne0, const int ne1, const uint3 ne2) {
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(block_size, 1, 1), 0, stream);
+    if (w_pre) {
+        ggml_cuda_kernel_launch(quantize_q8_1_rms_reg<block_size, nper, true>, launch_params,
+            x, w, eps, vy, scale_out, ne00, s01, s02, s03, ne0, ne1, ne2);
+    } else {
+        ggml_cuda_kernel_launch(quantize_q8_1_rms_reg<block_size, nper, false>, launch_params,
+            x, w, eps, vy, scale_out, ne00, s01, s02, s03, ne0, ne1, ne2);
+    }
+}
+
+void quantize_row_q8_1_rms_cuda(
+        const float * x, const float * w, const bool w_const, const float eps, void * vy, float * scale_out,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const bool w_early,
         const ggml_cuda_l2_pf & pf, cudaStream_t stream) {
@@ -643,12 +738,46 @@ void quantize_row_q8_1_rms_cuda(
     // with PDL the matvec prefetches its own rows while it waits
     const ggml_cuda_l2_pf pf_k = ggml_cuda_kernel_uses_pdl((const void *) quantize_q8_1_rms<256>) ? ggml_cuda_l2_pf{} : pf;
 
+    const uint64_t fuse_off = ggml_cuda_fuse_off_mask();
+    const bool     w_pre    = w_const && !(fuse_off & 16384);
+    const bool     reg      = !(fuse_off & 4294967296ull);
+
     if (ne00 < 1024) {
         const dim3 num_blocks((nblk + 8 - 1) / 8, ne1, ne2*ne3);
+        if (reg) {
+            const int nper = (ne00 + 255) / 256;
+#define QUANTIZE_RMS_REG(nper) quantize_q8_1_rms_reg_launch<256, nper>(num_blocks, w_pre, stream, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv)
+            switch (nper) {
+                case 1: QUANTIZE_RMS_REG(1); break;
+                case 2: QUANTIZE_RMS_REG(2); break;
+                case 3: QUANTIZE_RMS_REG(3); break;
+                case 4: QUANTIZE_RMS_REG(4); break;
+                default: GGML_ABORT("fatal error");
+            }
+#undef QUANTIZE_RMS_REG
+            return;
+        }
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(256, 1, 1), 0, stream);
         ggml_cuda_kernel_launch(quantize_q8_1_rms<256>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early, pf_k);
     } else {
         const dim3 num_blocks((nblk + 32 - 1) / 32, ne1, ne2*ne3);
+        if (reg && ne00 <= 8*1024) {
+            const int nper = (ne00 + 1023) / 1024;
+#define QUANTIZE_RMS_REG(nper) quantize_q8_1_rms_reg_launch<1024, nper>(num_blocks, w_pre, stream, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv)
+            switch (nper) {
+                case 1: QUANTIZE_RMS_REG(1); break;
+                case 2: QUANTIZE_RMS_REG(2); break;
+                case 3: QUANTIZE_RMS_REG(3); break;
+                case 4: QUANTIZE_RMS_REG(4); break;
+                case 5: QUANTIZE_RMS_REG(5); break;
+                case 6: QUANTIZE_RMS_REG(6); break;
+                case 7: QUANTIZE_RMS_REG(7); break;
+                case 8: QUANTIZE_RMS_REG(8); break;
+                default: GGML_ABORT("fatal error");
+            }
+#undef QUANTIZE_RMS_REG
+            return;
+        }
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(1024, 1, 1), 0, stream);
         ggml_cuda_kernel_launch(quantize_q8_1_rms<1024>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early, pf_k);
     }

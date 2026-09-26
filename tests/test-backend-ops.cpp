@@ -2685,6 +2685,51 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL read only by quantized matrix-vector products, which the CUDA backend
+// folds into the quantization of their input
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type;
+    const int64_t ne00;
+    const int64_t n_tokens;
+    const bool weights; // the norm weight lives in a weights buffer
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne00, n_tokens, weights);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_mul_mat(ggml_type type, int64_t ne00, int64_t n_tokens, bool weights)
+        : type(type), ne00(ne00), n_tokens(n_tokens), weights(weights) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("needs a weights context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne00, n_tokens);
+        ggml_tensor * w  = ggml_new_tensor_1d(weights ? ctx_weights : ctx, GGML_TYPE_F32, ne00);
+        ggml_tensor * m  = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx_weights, type, ne00, 64);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx_weights, type, ne00, 64);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a0, m), ggml_mul_mat(ctx, a1, m));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -9422,6 +9467,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // every row length of the register-resident kernels (up to 4 x 256 and 8 x 1024 values) and the loop kernel above
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t ne00 : {256, 768, 1024, 2048, 2560, 5120, 8192, 12288}) {
+            for (int64_t n_tokens : {1, 3, 8}) {
+                for (bool weights : {false, true}) {
+                    test_cases.emplace_back(new test_rms_norm_mul_mat(type, ne00, n_tokens, weights));
+                }
+            }
+        }
+    }
+
     for (auto set_rows : {false, true}) {
         for (auto weights : {false, true}) {
             for (int rope : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
