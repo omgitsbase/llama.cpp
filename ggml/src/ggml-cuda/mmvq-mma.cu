@@ -50,13 +50,15 @@ template <> struct mmvq_mma_traits<GGML_TYPE_IQ3_XXS> {
     }
 };
 
-template <ggml_type type, int ncols_dst, bool has_fusion>
+// fusion_mode as in mul_mat_vec_q: 0 none, 1 the lean epilogue, 2 gate and bias
+template <ggml_type type, int ncols_dst, int fusion_mode>
 __launch_bounds__(mmvq_mma_nwarps*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q_mma(
         const void * vx_ptr, const block_q8_1 * y_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr, const int nblocks_row, const int nrows_x, const int stride_row_x, const int stride_col_y,
-        const int stride_col_dst) {
+        const int stride_col_dst, const ggml_cuda_mm_epilogue_t<fusion_mode> epi) {
 #if defined(TURING_MMA_AVAILABLE)
+    constexpr bool has_fusion = fusion_mode == 2;
     const void       * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const block_q8_1 * GGML_CUDA_RESTRICT y   = y_ptr;
     float            * GGML_CUDA_RESTRICT dst = dst_ptr;
@@ -148,6 +150,26 @@ static __global__ void mul_mat_vec_q_mma(
     }
     ggml_cuda_pdl_lc();
 
+    // warp 0 loads the epilogue's operands for its four outputs while the other warps store their sums
+    [[maybe_unused]] float epi_arg[GGML_CUDA_MM_EPI_MAX_ARGS][4] = {{0.0f}};
+    if constexpr (fusion_mode == 1) {
+        if (warp == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = row0 + g + 8*(i/2);
+                const int col = (i % 2) ? j1 : j0;
+                if (row < nrows_x && col < ncols_dst) {
+#pragma unroll
+                    for (int k = 0; k < GGML_CUDA_MM_EPI_MAX_ARGS; ++k) {
+                        if (k < epi.n_args) {
+                            epi_arg[k][i] = ggml_cuda_mm_epi_load(epi.arg[k], row, col, 0, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     __shared__ float red[mmvq_mma_nwarps - 1][4][WARP_SIZE];
     [[maybe_unused]] __shared__ float red_gate[has_fusion ? mmvq_mma_nwarps - 1 : 1][4][WARP_SIZE];
     if (warp > 0) {
@@ -207,17 +229,20 @@ static __global__ void mul_mat_vec_q_mma(
                 }
             }
         }
+        if constexpr (fusion_mode == 1) {
+            result = ggml_cuda_mm_epi_apply(epi, result, epi_arg[0][i], epi_arg[1][i], epi_arg[2][i]);
+        }
         dst[col*stride_col_dst + row] = result;
     }
 #else
-    GGML_UNUSED_VARS(vx_ptr, y_ptr, fusion, dst_ptr, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
+    GGML_UNUSED_VARS(vx_ptr, y_ptr, fusion, dst_ptr, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst, epi);
     NO_DEVICE_CODE;
 #endif // defined(TURING_MMA_AVAILABLE)
 }
 
 template <ggml_type type, int ncols_dst>
 static void mmvq_mma_launch(
-        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device fusion, const ggml_cuda_mm_epilogue * epi, float * dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         cudaStream_t stream) {
     const dim3 block_nums((nrows_x + 15)/16, 1, 1);
@@ -226,11 +251,17 @@ static void mmvq_mma_launch(
     const int nblocks_row = ncols_x / QK_K;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_mma<type, ncols_dst, true>, launch_params,
-            vx, (const block_q8_1 *) vy, fusion, dst, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
+        GGML_ASSERT(epi == nullptr);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_mma<type, ncols_dst, 2>, launch_params,
+            vx, (const block_q8_1 *) vy, fusion, dst, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+            ggml_cuda_mm_epilogue_none{});
+    } else if (epi != nullptr) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_mma<type, ncols_dst, 1>, launch_params,
+            vx, (const block_q8_1 *) vy, fusion, dst, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst, *epi);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_mma<type, ncols_dst, false>, launch_params,
-            vx, (const block_q8_1 *) vy, fusion, dst, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_mma<type, ncols_dst, 0>, launch_params,
+            vx, (const block_q8_1 *) vy, fusion, dst, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+            ggml_cuda_mm_epilogue_none{});
     }
 }
 
@@ -251,15 +282,15 @@ bool ggml_cuda_mmvq_mma_supported(ggml_type type, int cc, int64_t ncols_dst) {
 }
 
 void ggml_cuda_mmvq_mma(
-        const void * vx, ggml_type type, const void * vy, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const void * vx, ggml_type type, const void * vy, const ggml_cuda_mm_fusion_args_device fusion, const ggml_cuda_mm_epilogue * epi, float * dst,
         int ncols_x, int nrows_x, int ncols_dst, int stride_row_x, int stride_col_y, int stride_col_dst, cudaStream_t stream) {
     GGML_ASSERT(ncols_x % QK_K == 0 && ncols_dst == 8);
     switch (type) {
         case GGML_TYPE_IQ3_S:
-            mmvq_mma_launch<GGML_TYPE_IQ3_S, 8>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+            mmvq_mma_launch<GGML_TYPE_IQ3_S, 8>(vx, vy, fusion, epi, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            mmvq_mma_launch<GGML_TYPE_IQ3_XXS, 8>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+            mmvq_mma_launch<GGML_TYPE_IQ3_XXS, 8>(vx, vy, fusion, epi, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
             break;
         default:
             GGML_ABORT("fatal error");

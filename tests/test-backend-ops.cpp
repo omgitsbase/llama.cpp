@@ -6354,6 +6354,111 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// a matvec and the elementwise tail after it, which the CUDA backend applies before the matvec's store
+enum test_mm_epi_tail {
+    MM_EPI_BIAS,          // + b[m]
+    MM_EPI_RESIDUAL,      // + r
+    MM_EPI_RESIDUAL_LHS,  // r + mm
+    MM_EPI_RESHAPE_RES,   // reshape to 2-D, then + r
+    MM_EPI_SUB_BOTH,      // r - mm, then - r2
+    MM_EPI_SOFTPLUS,      // + b[m], softplus, * w[m]
+    MM_EPI_SIGMOID,
+    MM_EPI_SCALE_SILU,    // scale(s, b), silu
+    MM_EPI_RES2,          // + r1 + r2
+    MM_EPI_SCALAR_BIAS,   // * s[1] + b[m] + r
+    MM_EPI_ROW_SPLIT,     // reshape splitting the rows, then + r of that shape
+    MM_EPI_COL_GATE,      // * g[1, n] (a gate per token), then + r
+    MM_EPI_COUNT,
+};
+
+struct test_mul_mat_epi : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int tail;
+    const std::array<int64_t, 2> bs;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m, n, k, tail, bs);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_EPI";
+    }
+
+    double max_nmse_err() override {
+        return 1e-3; // the 1-2 bit types reach 5e-4 against the CPU at K=5120
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_epi(ggml_type type, int64_t m, int64_t n, int64_t k, int tail, std::array<int64_t, 2> bs = {1, 1})
+        : type(type), m(m), n(n), k(k), tail(tail), bs(bs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k, n, bs[0], bs[1]);
+        ggml_tensor * cur = ggml_mul_mat(ctx, a, b);
+        auto like = [&](const ggml_tensor * t) {
+            return ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, t->ne);
+        };
+        switch (tail) {
+            case MM_EPI_BIAS:
+                cur = ggml_add(ctx, cur, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m));
+                break;
+            case MM_EPI_RESIDUAL:
+                cur = ggml_add(ctx, cur, like(cur));
+                break;
+            case MM_EPI_RESIDUAL_LHS:
+                cur = ggml_add(ctx, like(cur), cur);
+                break;
+            case MM_EPI_RESHAPE_RES:
+                cur = ggml_reshape_2d(ctx, cur, m, n*bs[0]*bs[1]);
+                cur = ggml_add(ctx, cur, like(cur));
+                break;
+            case MM_EPI_SUB_BOTH:
+                cur = ggml_sub(ctx, like(cur), cur);
+                cur = ggml_sub(ctx, cur, like(cur));
+                break;
+            case MM_EPI_SOFTPLUS:
+                cur = ggml_add(ctx, cur, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m));
+                cur = ggml_softplus(ctx, cur);
+                cur = ggml_mul(ctx, cur, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m));
+                break;
+            case MM_EPI_SIGMOID:
+                cur = ggml_sigmoid(ctx, cur);
+                break;
+            case MM_EPI_SCALE_SILU:
+                cur = ggml_scale_bias(ctx, cur, 0.125f, 0.5f);
+                cur = ggml_silu(ctx, cur);
+                break;
+            case MM_EPI_RES2:
+                cur = ggml_add(ctx, cur, like(cur));
+                cur = ggml_add(ctx, cur, like(cur));
+                break;
+            case MM_EPI_SCALAR_BIAS:
+                cur = ggml_mul(ctx, cur, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1));
+                cur = ggml_add(ctx, cur, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m));
+                cur = ggml_add(ctx, cur, like(cur));
+                break;
+            case MM_EPI_ROW_SPLIT:
+                cur = ggml_reshape_4d(ctx, cur, m/2, 2, n, bs[0]*bs[1]);
+                cur = ggml_add(ctx, cur, like(cur));
+                break;
+            case MM_EPI_COL_GATE:
+                cur = ggml_mul(ctx, cur, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n, bs[0], bs[1]));
+                cur = ggml_add(ctx, cur, like(cur));
+                break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10101,6 +10206,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         false, 1, 1, false, with_bias, true, false, {1, 1}));
                 }
             }
+        }
+    }
+
+    // the matvec epilogue: every quantized type, every column count the vector kernel takes
+    for (ggml_type type : all_types) {
+        if (!ggml_is_quantized(type) || type == GGML_TYPE_TQ2_0) {
+            continue;
+        }
+        for (int n = 1; n <= 8; ++n) {
+            for (int tail = 0; tail < MM_EPI_COUNT; ++tail) {
+                test_cases.emplace_back(new test_mul_mat_epi(type, 64, n, 256, tail));
+            }
+            test_cases.emplace_back(new test_mul_mat_epi(type, 272, n, 9*ggml_blck_size(type), MM_EPI_RES2));
+            test_cases.emplace_back(new test_mul_mat_epi(type, 13, n, 20*ggml_blck_size(type), MM_EPI_SOFTPLUS));
+        }
+        test_cases.emplace_back(new test_mul_mat_epi(type, 64, 2, 1024, MM_EPI_RESIDUAL, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat_epi(type, 64, 2, 1024, MM_EPI_COL_GATE, {2, 2}));
+    }
+    // float weights: the epilogue at one column
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int tail = 0; tail < MM_EPI_COUNT; ++tail) {
+            test_cases.emplace_back(new test_mul_mat_epi(type, 64, 1, 256, tail));
+            test_cases.emplace_back(new test_mul_mat_epi(type, 48, 1, 2048, tail));
+        }
+        test_cases.emplace_back(new test_mul_mat_epi(type, 64, 1, 1024, MM_EPI_RESIDUAL, {2, 1}));
+    }
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
+        for (int n : {1, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_epi(type, 5120, n, 6144, MM_EPI_RESIDUAL));
+            test_cases.emplace_back(new test_mul_mat_epi(type, 2048, n, 4096, MM_EPI_RESHAPE_RES));
+            test_cases.emplace_back(new test_mul_mat_epi(type, 32, n, 2048, MM_EPI_SOFTPLUS));
         }
     }
 

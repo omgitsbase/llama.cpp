@@ -11,5 +11,5 @@
 bool ggml_cuda_mmvq_mma_supported(ggml_type type, int cc, int64_t ncols_dst);
 
 void ggml_cuda_mmvq_mma(
-        const void * vx, ggml_type type, const void * vy, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const void * vx, ggml_type type, const void * vy, const ggml_cuda_mm_fusion_args_device fusion, const ggml_cuda_mm_epilogue * epi, float * dst,
         int ncols_x, int nrows_x, int ncols_dst, int stride_row_x, int stride_col_y, int stride_col_dst, cudaStream_t stream);

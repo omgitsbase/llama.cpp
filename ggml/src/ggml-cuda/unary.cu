@@ -1,119 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
 
-static __device__ __forceinline__ float op_abs(float x) {
-    return fabsf(x);
-}
-
-static __device__ __forceinline__ float op_sgn(float x) {
-    return (x > 0.f ? 1.f : ((x < 0.f ? -1.f : 0.f)));
-}
-
-static __device__ __forceinline__ float op_neg(float x) {
-    return -x;
-}
-
-static __device__ __forceinline__ float op_step(float x) {
-    return x > 0.0f;
-}
-
-static __device__ __forceinline__ float op_gelu(float x) {
-    return ggml_cuda_op_gelu_single(x);
-}
-
-static __device__ __forceinline__ float op_gelu_erf(float x) {
-    const float SQRT_2_INV = 0.70710678118654752440084436210484f;
-
-    return 0.5f*x*(1.0f + erff(x*SQRT_2_INV));
-}
-
-static __device__ __forceinline__ float op_gelu_quick(float x) {
-    const float GELU_QUICK_COEF = -1.702f;
-
-    return x * (1.0f / (1.0f + expf(GELU_QUICK_COEF * x)));
-}
-
-static __device__ __forceinline__ float op_silu(float x) {
-    return ggml_cuda_op_silu_single(x);
-}
-
-static __device__ __forceinline__ float op_tanh(float x) {
-    return tanhf(x);
-}
-
-static __device__ __forceinline__ float op_relu(float x) {
-    return fmaxf(x, 0);
-}
-
-static __device__ __forceinline__ float op_sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
-static __device__ __forceinline__ float op_hardsigmoid(float x) {
-    return fminf(1.0f, fmaxf(0.0f, (x + 3.0f) / 6.0f));
-}
-
-static __device__ __forceinline__ float op_hardswish(float x) {
-    return x * fminf(1.0f, fmaxf(0.0f, (x + 3.0f) / 6.0f));
-}
-
-static __device__ __forceinline__ float op_exp(float x) {
-    return expf(x);
-}
-
-static __device__ __forceinline__ float op_sqr(float x) {
-    return x * x;
-}
-
-static __device__ __forceinline__ float op_relu_sqr(float x) {
-    const float r = fmaxf(x, 0.0f);
-    return r * r;
-}
-
-static __device__ __forceinline__ float op_sqrt(float x) {
-    return sqrtf(x);
-}
-
-static __device__ __forceinline__ float op_sin(float x) {
-    return sinf(x);
-}
-
-static __device__ __forceinline__ float op_cos(float x) {
-    return cosf(x);
-}
-
-static __device__ __forceinline__ float op_log(float x) {
-    return logf(x);
-}
-
-static __device__ __forceinline__ float op_expm1(float x) {
-    return expm1f(x);
-}
-
-static __device__ __forceinline__ float op_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
-}
-
-static __device__ __forceinline__ float op_elu(float x) {
-    return (x > 0.f) ? x : expm1f(x);
-}
-
-static __device__ __forceinline__ float op_floor(float x) {
-    return floorf(x);
-}
-
-static __device__ __forceinline__ float op_ceil(float x) {
-    return ceilf(x);
-}
-
-static __device__ __forceinline__ float op_round(float x) {
-    return round(x);
-}
-
-static __device__ __forceinline__ float op_trunc(float x) {
-    return trunc(x);
-}
-
 template <float (*op)(float), typename T>
 static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     ggml_cuda_pdl_lc();
@@ -645,33 +532,6 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
     }
 }
 
-static __device__ __forceinline__ float ggml_cuda_chain_unary(int op, float x) {
-    switch (op) {
-        case GGML_UNARY_OP_ABS:         return op_abs(x);
-        case GGML_UNARY_OP_SGN:         return op_sgn(x);
-        case GGML_UNARY_OP_NEG:         return op_neg(x);
-        case GGML_UNARY_OP_STEP:        return op_step(x);
-        case GGML_UNARY_OP_TANH:        return op_tanh(x);
-        case GGML_UNARY_OP_ELU:         return op_elu(x);
-        case GGML_UNARY_OP_RELU:        return op_relu(x);
-        case GGML_UNARY_OP_SIGMOID:     return op_sigmoid(x);
-        case GGML_UNARY_OP_GELU:        return op_gelu(x);
-        case GGML_UNARY_OP_GELU_QUICK:  return op_gelu_quick(x);
-        case GGML_UNARY_OP_SILU:        return op_silu(x);
-        case GGML_UNARY_OP_HARDSWISH:   return op_hardswish(x);
-        case GGML_UNARY_OP_HARDSIGMOID: return op_hardsigmoid(x);
-        case GGML_UNARY_OP_EXP:         return op_exp(x);
-        case GGML_UNARY_OP_EXPM1:       return op_expm1(x);
-        case GGML_UNARY_OP_SOFTPLUS:    return op_softplus(x);
-        case GGML_UNARY_OP_GELU_ERF:    return op_gelu_erf(x);
-        case GGML_UNARY_OP_FLOOR:       return op_floor(x);
-        case GGML_UNARY_OP_CEIL:        return op_ceil(x);
-        case GGML_UNARY_OP_ROUND:       return op_round(x);
-        case GGML_UNARY_OP_TRUNC:       return op_trunc(x);
-        default:                        return x;
-    }
-}
-
 bool ggml_cuda_chain_unary_supported(int op) {
     switch (op) {
         case GGML_UNARY_OP_ABS: case GGML_UNARY_OP_SGN: case GGML_UNARY_OP_NEG: case GGML_UNARY_OP_STEP:
@@ -702,22 +562,7 @@ static __global__ void elt_chain_f32(const ggml_cuda_chain_args a, const int64_t
 #pragma unroll 1
     for (int k = 0; k < a.n_steps; k++) {
         const ggml_cuda_chain_step st = a.step[k];
-        switch (st.op) {
-            case GGML_CUDA_CHAIN_ADD:   v = v + at(a.arg[st.arg]); break;
-            case GGML_CUDA_CHAIN_SUB:   v = v - at(a.arg[st.arg]); break;
-            case GGML_CUDA_CHAIN_MUL:   v = v * at(a.arg[st.arg]); break;
-            case GGML_CUDA_CHAIN_DIV:   v = v / at(a.arg[st.arg]); break;
-            case GGML_CUDA_CHAIN_RSUB:  v = at(a.arg[st.arg]) - v; break;
-            case GGML_CUDA_CHAIN_RDIV:  v = at(a.arg[st.arg]) / v; break;
-            case GGML_CUDA_CHAIN_SCALE: v = st.p0 * v + st.p1; break;
-            case GGML_CUDA_CHAIN_CLAMP: v = fminf(fmaxf(v, st.p0), st.p1); break;
-            case GGML_CUDA_CHAIN_SQR:   v = v * v; break;
-            case GGML_CUDA_CHAIN_SQRT:  v = sqrtf(v); break;
-            case GGML_CUDA_CHAIN_LOG:   v = logf(v); break;
-            case GGML_CUDA_CHAIN_SIN:   v = sinf(v); break;
-            case GGML_CUDA_CHAIN_COS:   v = cosf(v); break;
-            default:                    v = ggml_cuda_chain_unary(st.op - GGML_CUDA_CHAIN_UNARY, v); break;
-        }
+        v = ggml_cuda_chain_apply(st, v, st.arg >= 0 ? at(a.arg[st.arg]) : 0.0f);
     }
     a.dst[idx] = v;
 }

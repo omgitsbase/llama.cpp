@@ -1634,6 +1634,8 @@ static inline void ggml_cuda_norm_fold_reserve(ggml_backend_cuda_context & ctx, 
     }
 }
 
+struct ggml_cuda_mm_epilogue;
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1641,6 +1643,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    // alone, without any of the above: the lean kernel applies it before the store
+    const ggml_cuda_mm_epilogue * epi = nullptr;
 };
 // weight rows a matvec asks for in L2 before its PDL wait. The pointers repeat the kernel's matrix and gate:
 // a prefetch through the kernel's own pointers costs registers in its main loop
