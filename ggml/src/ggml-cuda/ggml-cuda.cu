@@ -3994,8 +3994,7 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
     return 2;
 }
 
-// the matvec epilogue, the gate/up pairs and the merged gate_up GLU: opt in with GGML_CUDA_MM_EPI=1 until their
-// decode A/B passes (a contended MTP run on a 27B IQ model measured them slower)
+// the matvec epilogue, the gate/up pairs and the merged gate_up GLU run only with GGML_CUDA_MM_EPI=1
 static bool ggml_cuda_mm_epi_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MM_EPI");
@@ -4021,7 +4020,6 @@ static bool ggml_cuda_mm_epi_arg_of(const ggml_tensor * mm, const ggml_tensor * 
     }
     a.data = (const float *) o->data;
     if (ggml_are_same_shape(o, n)) {
-        // element for element with the product
         a.s_row     = 1;
         a.s_col     = (int) mm->ne[0];
         a.s_channel = (int) (mm->ne[0]*mm->ne[1]);
@@ -4069,9 +4067,7 @@ static bool ggml_cuda_mm_epi_arg_of(const ggml_tensor * mm, const ggml_tensor * 
     return true;
 }
 
-// a matvec and the elementwise ops that follow it (bias and residual adds, scales, unary ops, through reshapes
-// of the product): one launch whose epilogue applies them in graph order before the store. Quantized weights at
-// 1-8 columns, float weights at one column
+// a matvec and the elementwise ops after it, applied in graph order by the matvec's epilogue before the store
 static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     const ggml_tensor * mm = cgraph->nodes[i];
     if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 262144)) {
@@ -4084,7 +4080,6 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
         ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return 0;
     }
-    // the node takes the vector kernel on its own
     const int  cc    = ggml_cuda_info().devices[ctx.device].cc;
     const bool quant = ggml_is_quantized(src0->type);
     if (quant) {
@@ -4121,7 +4116,6 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
             (cur->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, cur_idx) != 1) {
             break;
         }
-        // a plain reshape of the product
         if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) {
             if (n->src[0] != cur || n->view_offs != 0 || n->data != cur->data || !ggml_is_contiguous(n) ||
                 ggml_nelements(n) != ggml_nelements(mm)) {
@@ -4204,12 +4198,11 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
-    // the float kernel reads the activation while other blocks store
+    // the output may reuse memory freed after the product; the weight, and the float kernel's activation, are
+    // still read by other blocks while it is stored
     ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, src1);
-    if (!quant) {
-        const ggml_tensor * x = fold ? fold->x : src1;
-        const char * xb = (const char *) x->data;
-        if (xb < ob + on && ob < xb + ggml_nbytes(x)) {
+    for (const ggml_tensor * t : { src0, quant ? nullptr : (fold ? fold->x : src1) }) {
+        if (t != nullptr && (const char *) t->data < ob + on && ob < (const char *) t->data + ggml_nbytes(t)) {
             return 0;
         }
     }
@@ -4227,9 +4220,7 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
     return last - i;
 }
 
-// gate and up that the fused gate kernel cannot take together (different types, or a GLU it does not speak):
-// the gate's matvec into scratch, then the up's with the bias and the GLU in its epilogue, both reading one
-// quantized activation
+// gate and up the fused gate kernel declines: the gate into scratch, then the up with its bias and the GLU as epilogue
 static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * up_mm,
         const ggml_tensor * gate_b, const ggml_tensor * up_b, ggml_tensor * glu) {
     if (!ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576)) {
@@ -4266,10 +4257,10 @@ static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggm
     if ((gate_b && !ggml_cuda_mm_epi_arg_of(gate_mm, gate_mm, gate_b, gb)) || (up_b && !ggml_cuda_mm_epi_arg_of(up_mm, up_mm, up_b, ub))) {
         return false;
     }
-    // a bias under the output would be overwritten while other blocks still read it
+    // a bias or weight under the output would be overwritten while other blocks still read it
     const char * ob = (const char *) glu->data;
     const size_t on = ggml_nbytes(glu);
-    for (const ggml_tensor * t : { gate_b, up_b }) {
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ gate_b, up_b, gate_mm->src[0], up_mm->src[0] }) {
         if (t && (const char *) t->data < ob + on && ob < (const char *) t->data + ggml_nbytes(t)) {
             return false;
         }
@@ -4329,8 +4320,7 @@ static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggm
     return true;
 }
 
-// one weight matrix holding gate and up (a merged gate_up) and a GLU over the two halves of its product, either
-// through two views or as a single-tensor GLU: the fused gate kernel over the halves as two weight matrices
+// a merged gate_up weight and a GLU over the two halves of its product: the fused gate kernel over the two row halves
 static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     const ggml_tensor * gu = cgraph->nodes[i];
     if ((gu->op != GGML_OP_MUL_MAT && gu->op != GGML_OP_MUL_MAT_ID) || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576) ||
@@ -4338,7 +4328,9 @@ static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_
         return 0;
     }
     const ggml_tensor * w = gu->src[0];
+    // a half-row shadow of a weight in a compute buffer would take the padding clear meant for the whole tensor
     if (!ggml_is_quantized(w->type) || w->type == GGML_TYPE_NVFP4 || w->buffer == nullptr ||
+        ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
         ggml_get_op_params_i32(gu, 1) == GGML_HINT_SRC0_IS_HADAMARD || !ggml_cuda_should_fuse_mul_mat_vec_q(gu)) {
         return 0;
     }
@@ -4348,7 +4340,6 @@ static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_
     }
     const int64_t f = gu->ne[0] / 2;
 
-    // the GLU and which half of the rows is the gate
     const ggml_tensor * glu = nullptr;
     int glu_idx  = -1;
     int gate_half = 0;
@@ -4400,10 +4391,10 @@ static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_
     if (!ggml_cuda_fused_glu_ok(glu)) {
         return 0;
     }
-    // the output must not sit under the product it is computed from
+    // the weight is read by other blocks while the output is stored
     const char * ob = (const char *) glu->data;
-    const char * gb = (const char *) gu->data;
-    if (gb < ob + ggml_nbytes(glu) && ob < gb + ggml_nbytes(gu)) {
+    const char * wb = (const char *) w->data;
+    if (wb < ob + ggml_nbytes(glu) && ob < wb + ggml_nbytes(w)) {
         return 0;
     }
 
@@ -4425,6 +4416,9 @@ static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_
 
 // {gate, up, GLU} or {gate, bias, up, bias, GLU} over one activation that the fused gate kernel declined
 static int ggml_cuda_try_glu_pair_at(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & 1048576)) {
+        return 0;
+    }
     for (const bool with_bias : { false, true }) {
         const int n_ops = with_bias ? 5 : 3;
         const ggml_op ops_plain[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
@@ -4450,6 +4444,12 @@ static int ggml_cuda_try_glu_pair_at(ggml_backend_cuda_context & ctx, const ggml
                 const bool lhs = add->src[0]->op == GGML_OP_MUL_MAT && (add->src[0] == cgraph->nodes[i] || add->src[0] == cgraph->nodes[i + 2]);
                 mm = lhs ? add->src[0] : add->src[1];
                 b  = lhs ? add->src[1] : add->src[0];
+                // the fused path never writes the nodes in its range, so a bias must come from outside it
+                for (int k = i; k < i + n_ops; ++k) {
+                    if (b == cgraph->nodes[k] || b->view_src == cgraph->nodes[k]) {
+                        return false;
+                    }
+                }
                 return (mm == cgraph->nodes[i] || mm == cgraph->nodes[i + 2]) && ggml_are_same_shape(add, mm);
             };
             if (!split(glu->src[0], gate_mm, gate_b) || !split(glu->src[1], up_mm, up_b)) {

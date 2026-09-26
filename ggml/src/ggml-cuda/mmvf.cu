@@ -18,13 +18,15 @@ static __device__ __forceinline__ float2 mmvf_load_y(const float2 * y2, const fl
     return v;
 }
 
-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false,
+          bool has_epi = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, const ggml_cuda_mm_epilogue_t<has_fusion ? 1 : 0> epi) {
+        const int ids_stride, const ggml_cuda_mm_epilogue_t<has_epi ? 1 : 0> epi) {
+    static_assert(!has_epi || has_fusion, "the epilogue runs in the fused instance");
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -347,7 +349,7 @@ static __global__ void mul_mat_vec_f(
 
     // the threads that store load the epilogue's operands, so the loads overlap the reduction
     [[maybe_unused]] float epi_arg[GGML_CUDA_MM_EPI_MAX_ARGS] = {0.0f};
-    if constexpr (has_fusion) {
+    if constexpr (has_epi) {
         if (tid < ncols_dst) {
 #pragma unroll
             for (int k = 0; k < GGML_CUDA_MM_EPI_MAX_ARGS; ++k) {
@@ -427,7 +429,9 @@ static __global__ void mul_mat_vec_f(
                     break;
             }
         }
-        value = ggml_cuda_mm_epi_apply(epi, value, epi_arg[0], epi_arg[1], epi_arg[2]);
+        if constexpr (has_epi) {
+            value = ggml_cuda_mm_epi_apply(epi, value, epi_arg[0], epi_arg[1], epi_arg[2]);
+        }
     }
 
     dst[tid*stride_col_dst + row] = value;
@@ -451,12 +455,21 @@ static void mul_mat_vec_f_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || epi != nullptr;
     if constexpr (ncols_dst == 1) {
+        if constexpr (!is_multi_token_id) {
+            if (epi != nullptr) {
+                ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, true>, launch_params,
+                    x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *epi);
+                return;
+            }
+        }
         if (has_fusion) {
+            GGML_ASSERT(epi == nullptr);
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride,
-                epi ? *epi : ggml_cuda_mm_epilogue{});
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mm_epilogue_none{});
             return;
        }
     }
