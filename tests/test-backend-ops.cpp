@@ -6852,11 +6852,12 @@ struct test_mul_mat_pair : public test_case {
     const int64_t n;
     const int64_t k;
     const bool with_norm;
+    const bool with_view;
     ggml_tensor * out0 = nullptr;
     ggml_tensor * out1 = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR6(type, m0, m1, n, k, with_norm);
+        return VARS_TO_STR7(type, m0, m1, n, k, with_norm, with_view);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6871,8 +6872,8 @@ struct test_mul_mat_pair : public test_case {
     bool run_whole_graph() override { return true; }
     bool use_weight_context() override { return true; }
 
-    test_mul_mat_pair(ggml_type type, int64_t m0, int64_t m1, int64_t n, int64_t k, bool with_norm)
-        : type(type), m0(m0), m1(m1), n(n), k(k), with_norm(with_norm) {}
+    test_mul_mat_pair(ggml_type type, int64_t m0, int64_t m1, int64_t n, int64_t k, bool with_norm, bool with_view = false)
+        : type(type), m0(m0), m1(m1), n(n), k(k), with_norm(with_norm), with_view(with_view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, ctx);
@@ -6894,7 +6895,10 @@ struct test_mul_mat_pair : public test_case {
         out1 = ggml_mul_mat(ctx, a1, x);
         ggml_set_name(out0, "out0");
         ggml_set_name(out1, "out1");
-        ggml_tensor * out = ggml_concat(ctx, out0, out1, 0);
+        // with_view: a reshape between the two matvecs, as attention's head split puts one
+        ggml_tensor * out = with_view ?
+            ggml_concat(ctx, ggml_reshape_3d(ctx, out0, m0, 1, n), ggml_reshape_3d(ctx, out1, m1, 1, n), 0) :
+            ggml_concat(ctx, out0, out1, 0);
         ggml_set_name(out, "out");
         return out;
     }
@@ -10863,6 +10867,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         test_cases.emplace_back(new test_mul_mat_pair(type, m0, m1, n, k, with_norm));
                     }
                 }
+            }
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int n : {1, 4}) {
+            for (bool with_norm : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_pair(type, 512, 128, n, 2048, with_norm, true));
+                test_cases.emplace_back(new test_mul_mat_pair(type, 48, 80, n, 5120, with_norm, true));
             }
         }
     }
