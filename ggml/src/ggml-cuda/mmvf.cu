@@ -798,6 +798,12 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
     }
+
+    // this kernel reads the ids after its wait and releases no earlier (see ggml_cuda_mul_mat_vec_q)
+    if (ids) {
+        ctx.ids_ready        = ids;
+        ctx.ids_ready_stream = ctx.curr_stream_no;
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_f(

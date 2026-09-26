@@ -1474,6 +1474,10 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const ggml_tensor *, std::shared_ptr<ggml_cuda_norm_fold>> norm_folds;
     std::vector<ggml_cuda_norm_fold *> norm_fold_order;
 
+    // the last expert ids a matvec read after its PDL wait, and its stream; cleared with norm_folds
+    const ggml_tensor * ids_ready        = nullptr;
+    int                 ids_ready_stream = -1;
+
 
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };

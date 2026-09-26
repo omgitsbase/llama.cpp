@@ -66,6 +66,15 @@ static constexpr __device__ int mmvq_type_size(ggml_type type) {
     }
 }
 
+// an id written by a kernel that finished before an earlier kernel's PDL wait: read from L2, past any stale L1 line
+static __device__ __forceinline__ uint32_t mmvq_ld_ids_early(const int32_t * p) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return (uint32_t) __ldcg(p);
+#else
+    return (uint32_t) *p;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 static constexpr __device__ bool has_vec_dot_multi(ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S;
 }
@@ -551,7 +560,7 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride, const uint32_t nrows_x, const uint32_t pf_bytes, const bool release) {
+        const uint32_t ids_stride, const uint32_t nrows_x, const uint32_t pf_bytes, const bool release, const uint32_t nchannels_x) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -578,15 +587,18 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_y;
     uint32_t sample_dst;
 
-    // the weights are constant, so their first bytes can be on their way into L2 while the producer finishes
+    // the weights are constant, so their first bytes can be on their way into L2 while the producer finishes.
+    // With ids the host asks for this only when an earlier kernel on this stream read the same ids after its
+    // own wait, so they are final; they only choose what to prefetch, and are read again below after the wait
     if (pf_bytes != 0 && threadIdx.y == 0) {
-        const int64_t kb0 = (int64_t) fastdiv(blockIdx.z, sample_ratio)*stride_sample_x
-            + (int64_t) fastdiv(channel_dst, channel_ratio)*stride_channel_x + (int64_t) row0*stride_row_x;
+        const uint32_t channel_pf = ncols_dst == 1 && ids ? mmvq_ld_ids_early(ids + channel_dst) : fastdiv(channel_dst, channel_ratio);
+        const int64_t  kb0 = (int64_t) fastdiv(blockIdx.z, sample_ratio)*stride_sample_x
+            + (int64_t) channel_pf*stride_channel_x + (int64_t) row0*stride_row_x;
 #pragma unroll
         for (int r = 0; r < rows_per_cuda_block*(has_fusion ? 2 : 1); ++r) {
             const int    i    = r % rows_per_cuda_block;
             const void * base = has_fusion && r >= rows_per_cuda_block ? fusion.gate : vx;
-            if (base != nullptr && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x)) {
+            if (base != nullptr && channel_pf < nchannels_x && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x)) {
                 const int64_t kb = kb0 + (int64_t) i*stride_row_x;
                 ggml_cuda_prefetch_l2_warp((const char *) base + kb*mmvq_type_size(type), pf_bytes, threadIdx.x);
             }
@@ -942,7 +954,8 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
-        const uint32_t ids_stride, const uint32_t nrows_x, const uint32_t pf_bytes, const bool release, cudaStream_t stream) {
+        const uint32_t ids_stride, const uint32_t nrows_x, const uint32_t pf_bytes, const bool release, const uint32_t nchannels_x,
+        cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
@@ -952,7 +965,7 @@ static void mul_mat_vec_q_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, one_row>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release, nchannels_x);
             return;
         }
     }
@@ -963,7 +976,7 @@ static void mul_mat_vec_q_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, one_row>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release, nchannels_x);
 }
 
 // lanes a row of this type and width needs, and the lane groups that let several rows share a warp
@@ -1047,6 +1060,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride, const bool pf_ok, const bool release, cudaStream_t stream) {
+    // pf_ok with ids: the ids are final before this launch's wait (see ggml_cuda_mul_mat_vec_q)
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
@@ -1193,7 +1207,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                 stride_sample_x, stride_sample_y, stride_sample_dst, d.first, d.second, 0, ids_stride, nrows_x,
-                pf_bytes, release, stream);
+                pf_bytes, release, nchannels_x, stream);
         };
         if constexpr (ncols > 1 && !small_k) {
             if (one_row) {
@@ -1501,10 +1515,14 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    const uint64_t fo      = ggml_cuda_fuse_off_mask();
-    const bool     pf_ok   = !ids && !(fo & 4096) && ggml_cuda_tensor_is_constant(src0) &&
+    // expert ids are final before this launch's wait when an earlier matvec on this stream read them after its
+    // own: every kernel after that one started after its wait returned, so their producer had completed
+    const uint64_t fo        = ggml_cuda_fuse_off_mask();
+    const bool     ids_early = ids && ncols_dst == 1 && !(fo & (1ull << 37)) &&
+        ctx.ids_ready == ids && ctx.ids_ready_stream == ctx.curr_stream_no;
+    const bool     pf_ok     = (!ids || ids_early) && !(fo & 4096) && ggml_cuda_tensor_is_constant(src0) &&
         (fusion == nullptr || fusion->gate == nullptr || ggml_cuda_tensor_is_constant(fusion->gate));
-    const bool     release = !(fo & 8192);
+    const bool     release   = !(fo & 8192);
 
     if (!ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_mma_supported(src0->type, ggml_cuda_info().devices[ctx.device].cc, ncols_dst)) {
@@ -1517,6 +1535,11 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, pf_ok, release, stream);
+
+    if (ids) {
+        ctx.ids_ready        = ids;
+        ctx.ids_ready_stream = ctx.curr_stream_no;
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
