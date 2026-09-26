@@ -2,6 +2,10 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include "fwht.cuh"
+#include "cpy-utils.cuh"
+
+#include <type_traits>
 
 struct rope_corr_dims {
     float v[2];
@@ -702,6 +706,32 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
     ggml_cuda_op_rope_impl<true>(ctx, rope, set_rows);
 }
 
+// the K row of a quantized cache is Hadamard-rotated per head before it is quantized: warp 0 rotates the
+// staged row exactly as fwht_cuda does and each lane then writes one q8_0 block
+template <int N>
+static __device__ __forceinline__ void fwht_quant_q8_0(float * row, block_q8_0 * dst, const float scale, const int lane) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int el_w      = N / warp_size;
+
+    float reg[el_w];
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        reg[i] = row[i*warp_size + lane] * scale;
+    }
+
+    fwht_warp<N>(reg, lane);
+
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        row[i*warp_size + lane] = reg[i];
+    }
+    __syncwarp();
+
+    if (lane < N/QK8_0) {
+        quantize_f32_q8_0_block(row + lane*QK8_0, dst + lane);
+    }
+}
+
 // fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
 // one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns
 template <int block_size, bool has_ff, bool mrope, typename D>
@@ -720,7 +750,11 @@ static __global__ void rms_norm_mul_rope_f32(
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
         const bool is_neox, const mrope_sections sections, const bool is_imrope,
-        const bool w_pre) {
+        const bool w_pre, const float hscale) {
+    // a q8_0 destination is the K cache: the row is rotated and quantized after the rope, so it is staged in shared memory
+    constexpr bool q8 = std::is_same<D, block_q8_0>::value;
+    using E = typename std::conditional<q8, float, D>::type;
+
     ggml_cuda_pdl_lc();
     const int row     = blockIdx.x;
     const int channel = blockIdx.y;
@@ -775,6 +809,9 @@ static __global__ void rms_norm_mul_rope_f32(
     }
     dst += idst;
 
+    float * s_row = s_sum + 32;
+    E *     out   = q8 ? (E *) s_row : (E *) dst;
+
     for (int i0 = 2*tid; i0 < ncols; i0 += 2*block_size) {
         int ix0;
         int ix1;
@@ -788,8 +825,8 @@ static __global__ void rms_norm_mul_rope_f32(
         const float x1 = scale * x[ix1] * w1;
 
         if (i0 >= n_dims) {
-            dst[ix0] = ggml_cuda_cast<D>(x0);
-            dst[ix1] = ggml_cuda_cast<D>(x1);
+            out[ix0] = ggml_cuda_cast<E>(x0);
+            out[ix1] = ggml_cuda_cast<E>(x1);
             continue;
         }
 
@@ -806,11 +843,24 @@ static __global__ void rms_norm_mul_rope_f32(
             float y1;
             rope_rotate(x0, x1, cos_theta, sin_theta, y0, y1);
 
-            dst[ix0] = ggml_cuda_cast<D>(y0);
-            dst[ix1] = ggml_cuda_cast<D>(y1);
+            out[ix0] = ggml_cuda_cast<E>(y0);
+            out[ix1] = ggml_cuda_cast<E>(y1);
         } else {
-            dst[ix0] = ggml_cuda_cast<D>(x0*cos_theta - x1*sin_theta);
-            dst[ix1] = ggml_cuda_cast<D>(x0*sin_theta + x1*cos_theta);
+            out[ix0] = ggml_cuda_cast<E>(x0*cos_theta - x1*sin_theta);
+            out[ix1] = ggml_cuda_cast<E>(x0*sin_theta + x1*cos_theta);
+        }
+    }
+
+    if constexpr (q8) {
+        __syncthreads();
+        if (tid < ggml_cuda_get_physical_warp_size()) {
+            switch (ncols) {
+                case  64: fwht_quant_q8_0< 64>(s_row, dst, hscale, tid); break;
+                case 128: fwht_quant_q8_0<128>(s_row, dst, hscale, tid); break;
+                case 256: fwht_quant_q8_0<256>(s_row, dst, hscale, tid); break;
+                case 512: fwht_quant_q8_0<512>(s_row, dst, hscale, tid); break;
+                default: break;
+            }
         }
     }
 }
@@ -832,20 +882,21 @@ static void rms_norm_mul_rope_launch(
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
         const bool is_neox, const mrope_sections sections, const bool is_imrope,
-        const bool w_pre) {
-    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(block_size, 1, 1), 32*sizeof(float), stream};
+        const bool w_pre, const float hscale) {
+    constexpr bool q8 = std::is_same<D, block_q8_0>::value;
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(block_size, 1, 1), (32 + (q8 ? ncols : 0))*sizeof(float), stream};
     if (freq_factors == nullptr) {
         ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<block_size, false, mrope, D>, launch_params,
             x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
             n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-            freq_factors, row_indices, set_rows_stride, is_neox, sections, is_imrope, w_pre);
+            freq_factors, row_indices, set_rows_stride, is_neox, sections, is_imrope, w_pre, hscale);
     } else {
         ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<block_size, true, mrope, D>, launch_params,
             x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
             n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-            freq_factors, row_indices, set_rows_stride, is_neox, sections, is_imrope, w_pre);
+            freq_factors, row_indices, set_rows_stride, is_neox, sections, is_imrope, w_pre, hscale);
     }
 }
 
@@ -866,7 +917,7 @@ static void rms_norm_mul_rope_cuda(
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
         const bool is_neox, const bool is_mrope, const mrope_sections sections, const bool is_imrope,
-        const bool w_pre, cudaStream_t stream) {
+        const bool w_pre, const float hscale, cudaStream_t stream) {
     GGML_ASSERT(ncols % 2 == 0);
 
     const dim3 blocks_num(nrows, nchannels, nsamples);
@@ -883,7 +934,7 @@ static void rms_norm_mul_rope_cuda(
         x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03, \
         mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
         n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, \
-        freq_factors, row_indices, set_rows_stride, is_neox, sections, is_imrope, w_pre)
+        freq_factors, row_indices, set_rows_stride, is_neox, sections, is_imrope, w_pre, hscale)
 
     if (ncols < 1024) {
         if (is_mrope) {
@@ -903,7 +954,7 @@ static void rms_norm_mul_rope_cuda(
 }
 
 void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
-        ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows) {
+        ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows, const ggml_tensor * hadamard) {
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
 
@@ -972,9 +1023,18 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
 
     const size_t ts_dst = ggml_type_size(rope->type);
-    const int64_t s1 = rope->nb[1] / ts_dst;
+    int64_t s1 = rope->nb[1] / ts_dst;
     const int64_t s2 = rope->nb[2] / ts_dst;
     const int64_t s3 = rope->nb[3] / ts_dst;
+
+    // the K cache: blocks per head, and the same scale the standalone rotation uses
+    float hscale = 1.0f;
+    if (dst_type == GGML_TYPE_Q8_0) {
+        const int n = x->ne[0];
+        GGML_ASSERT(hadamard != nullptr && n % 64 == 0 && n <= 512);
+        s1     = n / QK8_0;
+        hscale = 1 / sqrtf(n);
+    }
 
     const bool w_pre = !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NORM_WEIGHT_EARLY) && ggml_cuda_tensor_is_constant(mul_src);
 
@@ -986,14 +1046,21 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, is_mrope, sections, is_imrope, w_pre, stream);
+            freq_factors, row_indices, set_rows_stride, is_neox, is_mrope, sections, is_imrope, w_pre, hscale, stream);
     } else if (dst_type == GGML_TYPE_F16) {
         rms_norm_mul_rope_cuda((const float *) x->data, (half *) dst_d,
             x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, is_mrope, sections, is_imrope, w_pre, stream);
+            freq_factors, row_indices, set_rows_stride, is_neox, is_mrope, sections, is_imrope, w_pre, hscale, stream);
+    } else if (dst_type == GGML_TYPE_Q8_0) {
+        rms_norm_mul_rope_cuda((const float *) x->data, (block_q8_0 *) dst_d,
+            x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
+            (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
+            mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
+            n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+            freq_factors, row_indices, set_rows_stride, is_neox, is_mrope, sections, is_imrope, w_pre, hscale, stream);
     } else {
         GGML_ABORT("fatal error");
     }

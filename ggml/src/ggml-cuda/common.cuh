@@ -1492,6 +1492,7 @@ enum ggml_cuda_fuse_path : uint64_t {
     GGML_CUDA_FUSE_GET_ROWS_CPY       = 1ull << 34,
     GGML_CUDA_FUSE_MMV_IDS_EARLY      = 1ull << 37,
     GGML_CUDA_FUSE_MMV_PRODUCER_PF    = 1ull << 38,
+    GGML_CUDA_FUSE_ROPE_HADAMARD      = 1ull << 39,
 };
 
 uint64_t ggml_cuda_fuse_off_mask();

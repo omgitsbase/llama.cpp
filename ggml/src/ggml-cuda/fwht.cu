@@ -25,32 +25,7 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
         reg[i] = src[i * warp_size + lane] * scale;
     }
 
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-
-#pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
+    fwht_warp<N>(reg, lane);
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {

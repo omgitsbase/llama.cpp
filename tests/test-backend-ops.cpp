@@ -2643,6 +2643,7 @@ struct test_rms_norm_mul_rope : public test_case {
     int mode;
     const int n_dims;     // 0: every element is rotated
     const bool weights;   // the broadcast weight lives in a weights buffer
+    const bool hadamard;  // each head rotated by a Hadamard matrix into a q8_0 row: the K path of a quantized cache
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -2653,14 +2654,19 @@ struct test_rms_norm_mul_rope : public test_case {
     bool use_weight_context() override { return weights && broadcast; }
 
     std::string vars() override {
-        return VARS_TO_STR8(ne, eps, multi_add, set_rows, broadcast, mode, n_dims, weights);
+        return VARS_TO_STR9(ne, eps, multi_add, set_rows, broadcast, mode, n_dims, weights, hadamard);
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
                            bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
-                           int n_dims = 0, bool weights = false)
+                           int n_dims = 0, bool weights = false, bool hadamard = false)
         : ne(ne), eps(eps), multi_add(multi_add), set_rows(set_rows), broadcast(broadcast), mode(mode),
-          n_dims(n_dims), weights(weights) {}
+          n_dims(n_dims), weights(weights), hadamard(hadamard) {}
+
+    double max_nmse_err() override {
+        // a rounding difference before the q8_0 quantization can move one level
+        return hadamard ? 1e-5 : test_case::max_nmse_err();
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, nullptr);
@@ -2701,9 +2707,17 @@ struct test_rms_norm_mul_rope : public test_case {
         ggml_tensor * out;
 
         if (set_rows) {
-            ggml_tensor * view = ggml_view_2d(ctx, rope, ne[0] * ne[1], ne[2], rope->nb[2], 0);
+            ggml_tensor * src = rope;
+            if (hadamard) {
+                ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[0]);
+                ggml_set_name(rot, "rot");
+                src = ggml_mul_mat(ctx, rot, ggml_reshape_2d(ctx, rope, ne[0], ne[1]*ne[2]));
+                ggml_mul_mat_set_hint(src, GGML_HINT_SRC0_IS_HADAMARD);
+                src = ggml_reshape_4d(ctx, src, ne[0], ne[1], ne[2], 1);
+            }
+            ggml_tensor * view = ggml_view_2d(ctx, src, ne[0] * ne[1], ne[2], src->nb[2], 0);
 
-            ggml_tensor * dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
+            ggml_tensor * dst = ggml_new_tensor_4d(ctx, hadamard ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
             ggml_set_name(dst, "dst");
 
             ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, ne[2], 1, 1);
@@ -2720,7 +2734,22 @@ struct test_rms_norm_mul_rope : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I32 && ggml_nelements(t) != ne[2]) {
+            if (strcmp(t->name, "rot") == 0) {
+                // the orthonormal Sylvester Hadamard matrix
+                const int64_t n = t->ne[0];
+                std::vector<float> data(n*n);
+                const float scale = 1.0f / sqrtf((float) n);
+                for (int64_t r = 0; r < n; r++) {
+                    for (int64_t i = 0; i < n; i++) {
+                        int pop = 0;
+                        for (int64_t v = r & i; v; v >>= 1) {
+                            pop += v & 1;
+                        }
+                        data[r*n + i] = pop % 2 == 0 ? scale : -scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (t->type == GGML_TYPE_I32 && ggml_nelements(t) != ne[2]) {
                 // the four position sections of a multi-section rope
                 std::vector<int32_t> data(ggml_nelements(t));
                 for (auto & p : data) {
@@ -9786,6 +9815,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+    }
+
+    // the K path of a quantized cache: rope, one Hadamard rotation per head, q8_0 set_rows
+    for (auto rope : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE}) {
+        test_cases.emplace_back(new test_rms_norm_mul_rope({256, 4, 5, 1}, 1e-6f, false, true, true,  rope,  64, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({128, 2, 3, 1}, 1e-6f, false, true, true,  rope,  64, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({ 64, 8, 2, 1}, 1e-6f, false, true, false, rope,  32, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({512, 1, 3, 1}, 1e-6f, false, true, true,  rope, 128, false, true));
     }
 
     for (auto multi_add : {false, true}) {
