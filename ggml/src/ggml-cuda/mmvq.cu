@@ -542,7 +542,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
+// one_row: each block takes a single row, for batched launches too small to fill the GPU with two
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool one_row = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -561,7 +562,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = one_row ? 1 : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -804,10 +805,11 @@ static __global__ void mul_mat_vec_q(
 }
 
 // Dedicated MoE multi-token kernel.
-// Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
+// Grid: (ceil(nrows_x / (c_rows_per_block*lane_groups)), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion>
+// With lane_groups > 1 a row fits in a fraction of a warp, and each lane group takes its own rows.
+template <ggml_type type, int c_rows_per_block, int lane_groups, bool has_fusion>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
@@ -833,10 +835,14 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
+    constexpr int group_size = warp_size/lane_groups;
+    static_assert(group_size % (qi/vdr) == 0, "a block's lanes must fit in one lane group");
+
     const uint32_t token_idx   = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      lane        = threadIdx.x % group_size;
+    const int      row0        = c_rows_per_block*(lane_groups*blockIdx.x + threadIdx.x/group_size);
     const int      blocks_per_row_x = ncols_x / qk;
-    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+    constexpr int  blocks_per_iter  = vdr * group_size / qi;
 
     const uint32_t channel_dst = blockIdx.y;
 
@@ -858,9 +864,9 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     [[maybe_unused]] float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+        const int kqs = vdr * (lane % (qi/vdr));
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
@@ -875,20 +881,28 @@ static __global__ void mul_mat_vec_q_moe(
         ggml_cuda_pdl_lc();
     }
 
-    // Warp-level reduction only - no shared memory needed
+    // Warp-level reduction only - no shared memory needed.
+    // A lane group skips the steps that would add the other groups' lanes; in a whole warp those lanes
+    // hold +0 for this row, and adding +0 once gives the same bits as adding it at every skipped step
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if constexpr (lane_groups > 1) {
+            tmp[i] = __fadd_rn(tmp[i], 0.0f);
+            if constexpr (has_fusion) {
+                tmp_gate[i] = __fadd_rn(tmp_gate[i], 0.0f);
+            }
+        }
+        tmp[i] = warp_reduce_sum<group_size>(tmp[i]);
         if constexpr (has_fusion) {
-            tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+            tmp_gate[i] = warp_reduce_sum<group_size>(tmp_gate[i]);
         }
     }
 
     // Write results
-    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        float result = tmp[threadIdx.x];
+    if (lane < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + lane) < nrows_x)) {
+        float result = tmp[lane];
         if constexpr (has_fusion) {
-            const float gate_value = tmp_gate[threadIdx.x];
+            const float gate_value = tmp_gate[lane];
             switch (fusion.glu_op) {
                 case GGML_GLU_OP_SWIGLU:
                     result *= ggml_cuda_op_silu_single(gate_value);
@@ -904,23 +918,23 @@ static __global__ void mul_mat_vec_q_moe(
                     break;
             }
         }
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + lane] = result;
     }
 }
 
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool one_row = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = one_row ? 1 : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool one_row = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -935,7 +949,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, one_row>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release);
@@ -946,10 +960,31 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, one_row>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x, pf_bytes, release);
+}
+
+// lanes a row of this type and width needs, and the lane groups that let several rows share a warp
+// (each group must hold whole blocks and a whole row, and every group must get two real rows)
+template <ggml_type type>
+static int mmvq_lane_groups(const int ncols_x, const int nrows_x, const int warp_size) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int lpb = ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
+    const int     tpr = ncols_x/qk * lpb;
+    for (const int g : {4, 2}) {
+        if (tpr*g <= warp_size && lpb*g <= warp_size && nrows_x % (2*g) == 0) {
+            return g;
+        }
+    }
+    return 1;
+}
+
+// GGML_CUDA_MMVQ_LANE_GROUPS and GGML_CUDA_MMVQ_ONE_ROW force a CTA shape for tests; -1 leaves it to the rule
+static int mmvq_force_env(const char * name) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : -1;
 }
 
 template <ggml_type type>
@@ -959,29 +994,48 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, const bool release, cudaStream_t stream) {
+        const int warp_size, const int nchannels_dst, const int lane_groups, const bool release, cudaStream_t stream) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
-    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, nchannels_dst);
-    const dim3 block_dims(warp_size, ncols_dst);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    constexpr int lpb = ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
 
     // only the gate travels with this kernel; biases and scales keep their own launches
     GGML_ASSERT(fusion.x_bias == nullptr && fusion.gate_bias == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr);
-    if (fusion.gate != nullptr) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+
+    const auto launch = [&](auto c_lane_groups) {
+        constexpr int g = decltype(c_lane_groups)::value;
+        const int64_t nblocks_rows = (nrows_x + rows_per_block*g - 1) / (rows_per_block*g);
+        const dim3 block_nums(nblocks_rows, nchannels_dst);
+        const dim3 block_dims(warp_size, ncols_dst);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        if (fusion.gate != nullptr) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, g, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, release);
+            return;
+        }
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, g, false>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride, release);
-        return;
+    };
+
+    if constexpr (lpb <= 8) {
+        if (lane_groups == 4 && warp_size == 32) {
+            launch(std::integral_constant<int, 4>{});
+            return;
+        }
     }
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
-        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-        stride_row_x, stride_col_y, stride_col_dst,
-        stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride, release);
+    if constexpr (lpb <= 16) {
+        if (lane_groups == 2 && warp_size == 32) {
+            launch(std::integral_constant<int, 2>{});
+            return;
+        }
+    }
+    launch(std::integral_constant<int, 1>{});
 }
 
 template <ggml_type type>
@@ -1050,34 +1104,104 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return use;
     };
 
+    const int      nsm        = ggml_cuda_info().devices[device].nsm;
+    const int64_t  row_bytes  = (int64_t) (ncols_x/ggml_blck_size(type))*ggml_type_size(type);
+    const bool     has_gate   = fusion.gate != nullptr;
+    const uint64_t fo         = ggml_cuda_fuse_off_mask();
+    const bool     shape_ok   = GGML_CUDA_CC_IS_NVIDIA(cc);
+
+    // several rows per warp when a row takes a fraction of it; only worth it while the launch is more than a wave
+    static const int force_lane_groups = mmvq_force_env("GGML_CUDA_MMVQ_LANE_GROUPS");
+    const int lane_groups = shape_ok && !(fo & 131072) && has_ids ? mmvq_lane_groups<type>(ncols_x, nrows_x, warp_size) : 1;
+    const auto moe_waves_over_one = [&](const int ncols) {
+        const void * kernel = has_gate ? (const void *) mul_mat_vec_q_moe<type, 2, 1, true> : (const void *) mul_mat_vec_q_moe<type, 2, 1, false>;
+        return (int64_t) ((nrows_x + 1)/2)*nchannels_dst > (int64_t) nsm*ggml_cuda_max_active_blocks(kernel, warp_size*ncols, 0);
+    };
+    const auto pick_lane_groups = [&](const bool over_one_wave) {
+        if (force_lane_groups > 0) {
+            return lane_groups > 1 ? std::min(force_lane_groups, lane_groups) : 1;
+        }
+        return over_one_wave ? lane_groups : 1;
+    };
+
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, release, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst,
+            lane_groups > 1 ? pick_lane_groups(moe_waves_over_one(ncols_dst)) : 1, release, stream);
         return;
     }
 
-    const int     nsm       = ggml_cuda_info().devices[device].nsm;
-    const int64_t row_bytes = (int64_t) (ncols_x/ggml_blck_size(type))*ggml_type_size(type);
+    static const int force_one_row = mmvq_force_env("GGML_CUDA_MMVQ_ONE_ROW");
 
     const auto launch = [&](auto c_ncols_dst, auto c_small_k) {
         constexpr int  ncols   = decltype(c_ncols_dst)::value;
         constexpr bool small_k = decltype(c_small_k)::value;
         const std::pair<dim3, dim3> dims = calc_launch_params<type>(ncols, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, small_k);
-        uint32_t pf_bytes = 0;
-        if (pf_ok && ggml_cuda_kernel_uses_pdl((const void *) mul_mat_vec_q<type, ncols, false, small_k>)) {
-            const int     rpb   = calc_rows_per_block(ncols, table_id, small_k, dims.second.y);
-            const int64_t nctas = (int64_t) dims.first.x*dims.first.y*dims.first.z;
-            pf_bytes = ggml_cuda_mv_prefetch_bytes(row_bytes, rpb*(fusion.gate ? 2 : 1), nctas, nsm);
+        const int     threads = dims.second.x*dims.second.y;
+        const int64_t nctas   = (int64_t) dims.first.x*dims.first.y*dims.first.z;
+
+        // a single token's experts, their rows short enough to share a warp: the MoE kernel takes them in
+        // lane groups, which is the same sum in the same order, when today's grid is more than a wave
+        if constexpr (ncols == 1) {
+            if (lane_groups > 1 && nsamples_dst == 1 && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+                    fusion.x_scale == nullptr && fusion.gate_scale == nullptr) {
+                const void * kernel = has_gate ? (const void *) mul_mat_vec_q<type, 1, true, small_k> : (const void *) mul_mat_vec_q<type, 1, false, small_k>;
+                const int g = pick_lane_groups(nctas > (int64_t) nsm*ggml_cuda_max_active_blocks(kernel, threads, 0));
+                if (g > 1) {
+                    mul_mat_vec_q_moe_launch<type>(
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                        stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        1, ids_stride, warp_size, nchannels_dst, g, release, stream);
+                    return;
+                }
+            }
         }
-        mul_mat_vec_q_switch_fusion<type, ncols, small_k>(
-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
-            stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, nrows_x,
-            pf_bytes, release, stream);
+
+        // one row per block when two-row blocks fill at most half a wave and one-row blocks still fit in one
+        bool one_row = false;
+        if constexpr (ncols > 1 && !small_k) {
+            if (shape_ok && !(fo & 65536)) {
+                if (force_one_row >= 0) {
+                    one_row = force_one_row > 0;
+                } else {
+                    const bool    fused  = has_gate || fusion.x_bias || fusion.gate_bias || fusion.x_scale || fusion.gate_scale;
+                    const int64_t nctas1 = (int64_t) nrows_x*dims.first.y*dims.first.z;
+                    const void *  k2     = fused ? (const void *) mul_mat_vec_q<type, ncols, true, false, false>
+                                                 : (const void *) mul_mat_vec_q<type, ncols, false, false, false>;
+                    const void *  k1     = fused ? (const void *) mul_mat_vec_q<type, ncols, true, false, true>
+                                                 : (const void *) mul_mat_vec_q<type, ncols, false, false, true>;
+                    one_row = 2*nctas <= (int64_t) nsm*ggml_cuda_max_active_blocks(k2, threads, 0) &&
+                                nctas1 <= (int64_t) nsm*ggml_cuda_max_active_blocks(k1, threads, 0);
+                }
+            }
+        }
+
+        const auto run = [&](auto c_one_row) {
+            constexpr bool or1 = decltype(c_one_row)::value;
+            const std::pair<dim3, dim3> d = or1 ? calc_launch_params<type>(ncols, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true) : dims;
+            uint32_t pf_bytes = 0;
+            if (pf_ok && ggml_cuda_kernel_uses_pdl((const void *) mul_mat_vec_q<type, ncols, false, small_k>)) {
+                const int rpb = or1 ? 1 : calc_rows_per_block(ncols, table_id, small_k, d.second.y);
+                pf_bytes = ggml_cuda_mv_prefetch_bytes(row_bytes, rpb*(has_gate ? 2 : 1), (int64_t) d.first.x*d.first.y*d.first.z, nsm);
+            }
+            mul_mat_vec_q_switch_fusion<type, ncols, small_k, or1>(
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                stride_sample_x, stride_sample_y, stride_sample_dst, d.first, d.second, 0, ids_stride, nrows_x,
+                pf_bytes, release, stream);
+        };
+        if constexpr (ncols > 1 && !small_k) {
+            if (one_row) {
+                run(std::true_type{});
+                return;
+            }
+        }
+        run(std::false_type{});
     };
 
     switch (ncols_dst) {
