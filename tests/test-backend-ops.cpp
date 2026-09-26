@@ -6354,7 +6354,8 @@ struct test_topk_moe : public test_case {
     }
 };
 
-// a matvec and the elementwise tail after it, which the CUDA backend applies before the matvec's store
+// a matvec and the elementwise tail after it; the CUDA backend fuses them only with GGML_CUDA_MM_EPI=1, and quantized
+// weights at one column also need GGML_CUDA_LEAN_T1=1
 enum test_mm_epi_tail {
     MM_EPI_BIAS,          // + b[m]
     MM_EPI_RESIDUAL,      // + r
@@ -6368,6 +6369,7 @@ enum test_mm_epi_tail {
     MM_EPI_SCALAR_BIAS,   // * s[1] + b[m] + r
     MM_EPI_ROW_SPLIT,     // reshape splitting the rows, then + r of that shape
     MM_EPI_COL_GATE,      // * g[1, n] (a gate per token), then + r
+    MM_EPI_INPLACE_RES,   // r += mm, the output is the residual's memory
     MM_EPI_COUNT,
 };
 
@@ -6378,9 +6380,10 @@ struct test_mul_mat_epi : public test_case {
     const int64_t k;
     const int tail;
     const std::array<int64_t, 2> bs;
+    const bool norm; // rms_norm * w in front of the matvec
 
     std::string vars() override {
-        return VARS_TO_STR6(type, m, n, k, tail, bs);
+        return VARS_TO_STR7(type, m, n, k, tail, bs, norm);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6389,17 +6392,26 @@ struct test_mul_mat_epi : public test_case {
     }
 
     double max_nmse_err() override {
-        return 1e-3; // the 1-2 bit types reach 5e-4 against the CPU at K=5120
+        switch (type) {
+            case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_TQ1_0: case GGML_TYPE_Q2_K:
+            case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+                return 1e-3; // the unfused path reaches 5e-4 against the CPU too
+            default:
+                return 5e-4;
+        }
     }
 
     bool run_whole_graph() override { return true; }
 
-    test_mul_mat_epi(ggml_type type, int64_t m, int64_t n, int64_t k, int tail, std::array<int64_t, 2> bs = {1, 1})
-        : type(type), m(m), n(n), k(k), tail(tail), bs(bs) {}
+    test_mul_mat_epi(ggml_type type, int64_t m, int64_t n, int64_t k, int tail, std::array<int64_t, 2> bs = {1, 1}, bool norm = false)
+        : type(type), m(m), n(n), k(k), tail(tail), bs(bs), norm(norm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
         ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k, n, bs[0], bs[1]);
+        if (norm) {
+            b = ggml_mul(ctx, ggml_rms_norm(ctx, b, 1e-6f), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
+        }
         ggml_tensor * cur = ggml_mul_mat(ctx, a, b);
         auto like = [&](const ggml_tensor * t) {
             return ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, t->ne);
@@ -6451,6 +6463,9 @@ struct test_mul_mat_epi : public test_case {
                 cur = ggml_mul(ctx, cur, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n, bs[0], bs[1]));
                 cur = ggml_add(ctx, cur, like(cur));
                 break;
+            case MM_EPI_INPLACE_RES:
+                cur = ggml_add_inplace(ctx, like(cur), cur);
+                break;
             default:
                 GGML_ABORT("fatal error");
         }
@@ -6460,7 +6475,7 @@ struct test_mul_mat_epi : public test_case {
 };
 
 // gate and up that the fused gate kernel does not take as they are: different weight types, a GLU op or
-// parameters it does not speak, or one merged gate_up weight whose product is split into its halves
+// parameters it does not speak, or one merged gate_up weight; the CUDA backend fuses them only with GGML_CUDA_MM_EPI=1
 struct test_mul_mat_glu_pair : public test_case {
     const ggml_type type_gate;
     const ggml_type type_up;
@@ -6473,9 +6488,10 @@ struct test_mul_mat_glu_pair : public test_case {
     const bool use_id;
     const float alpha;
     const float limit;
+    const bool norm; // rms_norm * w in front of the matvecs
 
     std::string vars() override {
-        return VARS_TO_STR11(type_gate, type_up, glu_op, m, n, k, with_bias, merged, use_id, alpha, limit);
+        return VARS_TO_STR12(type_gate, type_up, glu_op, m, n, k, with_bias, merged, use_id, alpha, limit, norm);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6490,9 +6506,9 @@ struct test_mul_mat_glu_pair : public test_case {
     bool run_whole_graph() override { return true; }
 
     test_mul_mat_glu_pair(ggml_type type_gate, ggml_type type_up, ggml_glu_op glu_op, int64_t m, int64_t n, int64_t k,
-            bool with_bias = false, int merged = 0, bool use_id = false, float alpha = 1.702f, float limit = 7.0f)
+            bool with_bias = false, int merged = 0, bool use_id = false, float alpha = 1.702f, float limit = 7.0f, bool norm = false)
         : type_gate(type_gate), type_up(type_up), glu_op(glu_op), m(m), n(n), k(k), with_bias(with_bias), merged(merged),
-          use_id(use_id), alpha(alpha), limit(limit) {}
+          use_id(use_id), alpha(alpha), limit(limit), norm(norm) {}
 
     ggml_tensor * glu(ggml_context * ctx, ggml_tensor * g, ggml_tensor * u) {
         if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
@@ -6512,6 +6528,9 @@ struct test_mul_mat_glu_pair : public test_case {
             cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
         } else {
             cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        }
+        if (norm) {
+            cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, 1e-6f), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
         }
         auto mm = [&](ggml_type type, int64_t rows) {
             ggml_tensor * w = use_id ? ggml_new_tensor_3d(ctx, type, k, rows, n_mats) : ggml_new_tensor_2d(ctx, type, k, rows);
@@ -10324,6 +10343,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        for (bool with_bias : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_glu_pair(GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_GLU_OP_SWIGLU, m, 64, 512,
+                with_bias, 0, false, 1.702f, 7.0f, true));
+        }
+        test_cases.emplace_back(new test_mul_mat_glu_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_GLU_OP_GEGLU, m, 64, 512,
+            false, 1, false, 1.702f, 7.0f, true));
     }
 
     // the matvec epilogue: every quantized type, every column count the vector kernel takes
@@ -10354,7 +10379,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_epi(type, 5120, n, 6144, MM_EPI_RESIDUAL));
             test_cases.emplace_back(new test_mul_mat_epi(type, 2048, n, 4096, MM_EPI_RESHAPE_RES));
             test_cases.emplace_back(new test_mul_mat_epi(type, 32, n, 2048, MM_EPI_SOFTPLUS));
+            test_cases.emplace_back(new test_mul_mat_epi(type, 64, n, 2048, MM_EPI_RESIDUAL, {1, 1}, true));
+            test_cases.emplace_back(new test_mul_mat_epi(type, 64, n, 2048, MM_EPI_INPLACE_RES, {1, 1}, true));
         }
+    }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_mul_mat_epi(type, 64, 1, 2048, MM_EPI_RESIDUAL, {1, 1}, true));
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
