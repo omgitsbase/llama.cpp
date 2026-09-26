@@ -37,6 +37,7 @@ private:
         std::exception_ptr      exception; // exception thrown while processing tasks, if any
         bool stop     = false;
         bool in_task  = false; // the worker is inside callback_new_task() for a task it took during a yield
+        bool busy     = false; // with LLAMA_HOST_OFF bit 8, set by yield_to_queue() and cleared once the worker is idle again
         bool yielding = false; // work() is still running on the start_loop() thread
     };
     worker_t worker;

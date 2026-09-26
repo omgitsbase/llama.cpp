@@ -3,6 +3,8 @@
 
 #include "log.h"
 
+#include <cstdlib>
+
 #include <chrono>
 #include <thread>
 
@@ -123,6 +125,15 @@ void server_queue::terminate() {
     condition_tasks.notify_all();
 }
 
+// LLAMA_HOST_OFF bit 8: a yield ends only once the worker is back idle, the handshake before the in-task wait
+static bool yield_waits_idle() {
+    static const bool off = [] {
+        const char * env = getenv("LLAMA_HOST_OFF");
+        return env && (strtoul(env, nullptr, 0) & 8) != 0;
+    }();
+    return off;
+}
+
 bool server_queue::process_new_tasks(bool is_yielding) {
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -166,7 +177,7 @@ void server_queue::worker_loop() {
         {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             worker.cv.wait(lock, [&]{
-                return worker.stop || worker.yielding;
+                return worker.stop || worker.yielding || worker.busy;
             });
             if (worker.stop) {
                 return;
@@ -185,6 +196,10 @@ void server_queue::worker_loop() {
                 worker.exception = std::current_exception();
                 worker.in_task   = false;
                 condition_tasks.notify_all();
+                // take no more tasks in this yield, so a second exception cannot replace the first
+                condition_tasks.wait(lock, [&]{
+                    return worker.stop || !worker.yielding;
+                });
                 break;
             }
 
@@ -198,6 +213,12 @@ void server_queue::worker_loop() {
             condition_tasks.wait(lock, [&]{
                 return worker.stop || !running || !worker.yielding || !queue_tasks.empty();
             });
+        }
+
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        if (worker.busy) {
+            worker.busy = false;
+            condition_tasks.notify_all();
         }
     }
 }
@@ -224,6 +245,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         GGML_ASSERT(!worker.yielding && "yield_to_queue() cannot be nested");
         worker.yielding = true;
+        worker.busy     = yield_waits_idle();
     }
     worker.cv.notify_one();
 
@@ -242,7 +264,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         worker.yielding = false;
         condition_tasks.notify_all();
         condition_tasks.wait(lock, [&]{
-            return !worker.in_task;
+            return !worker.in_task && !worker.busy;
         });
 
         // put the declined tasks back, keeping their order
@@ -278,6 +300,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     GGML_ASSERT(!worker.thread.joinable() && "start_loop() is already running");
     worker.stop     = false;
     worker.in_task  = false;
+    worker.busy     = false;
     worker.yielding = false;
     worker.thread = std::thread([this]() { worker_loop(); });
 
