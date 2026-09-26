@@ -1180,9 +1180,29 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         }
 
+        // MSVC does not take the enclosing lambda's constexpr locals as template arguments here, so run derives its own
+        const auto run = [&](auto c_n, auto c_sk, auto c_one_row) {
+            constexpr int  n   = decltype(c_n)::value;
+            constexpr bool sk  = decltype(c_sk)::value;
+            constexpr bool or1 = decltype(c_one_row)::value;
+            const std::pair<dim3, dim3> d = or1 ? calc_launch_params<type>(n, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true) : dims;
+            ggml_cuda_mv_pf pf;
+            if (pf_ok && ggml_cuda_kernel_uses_pdl((const void *) mul_mat_vec_q<type, n, false, sk>)) {
+                const int rpb = or1 ? 1 : calc_rows_per_block(n, table_id, sk, d.second.y);
+                pf.x     = vx;
+                pf.gate  = fusion.gate;
+                pf.bytes = ggml_cuda_mv_prefetch_bytes(row_bytes, rpb*(has_gate ? 2 : 1), (int64_t) d.first.x*d.first.y*d.first.z, nsm);
+            }
+            mul_mat_vec_q_switch_fusion<type, n, sk, or1>(
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                stride_sample_x, stride_sample_y, stride_sample_dst, d.first, d.second, 0, ids_stride, nrows_x,
+                pf, release, nchannels_x, stream);
+        };
+
         // one row per block when two-row blocks fill at most half a wave and one-row blocks still fit in one
-        bool one_row = false;
         if constexpr (ncols > 1 && !small_k) {
+            bool one_row = false;
             if (shape_ok && !(fo & 65536)) {
                 if (force_one_row >= 0) {
                     one_row = force_one_row > 0;
@@ -1197,31 +1217,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
                                 nctas1 <= (int64_t) nsm*ggml_cuda_max_active_blocks(k1, threads, 0);
                 }
             }
-        }
-
-        const auto run = [&](auto c_one_row) {
-            constexpr bool or1 = decltype(c_one_row)::value;
-            const std::pair<dim3, dim3> d = or1 ? calc_launch_params<type>(ncols, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true) : dims;
-            ggml_cuda_mv_pf pf;
-            if (pf_ok && ggml_cuda_kernel_uses_pdl((const void *) mul_mat_vec_q<type, ncols, false, small_k>)) {
-                const int rpb = or1 ? 1 : calc_rows_per_block(ncols, table_id, small_k, d.second.y);
-                pf.x     = vx;
-                pf.gate  = fusion.gate;
-                pf.bytes = ggml_cuda_mv_prefetch_bytes(row_bytes, rpb*(has_gate ? 2 : 1), (int64_t) d.first.x*d.first.y*d.first.z, nsm);
-            }
-            mul_mat_vec_q_switch_fusion<type, ncols, small_k, or1>(
-                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
-                stride_sample_x, stride_sample_y, stride_sample_dst, d.first, d.second, 0, ids_stride, nrows_x,
-                pf, release, nchannels_x, stream);
-        };
-        if constexpr (ncols > 1 && !small_k) {
             if (one_row) {
-                run(std::true_type{});
+                run(c_ncols_dst, c_small_k, std::true_type{});
                 return;
             }
         }
-        run(std::false_type{});
+        run(c_ncols_dst, c_small_k, std::false_type{});
     };
 
     switch (ncols_dst) {
