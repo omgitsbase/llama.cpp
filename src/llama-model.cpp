@@ -1048,7 +1048,6 @@ struct llama_model::impl {
     };
 
     layer_dev dev_input = {};
-    layer_dev dev_tok_embd = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
@@ -1373,32 +1372,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     } else {
         pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
     }
-    // the token table joins the device when every weight is there, so the lookup does not split the graph at every token;
-    // an override that sends weights to host memory keeps it on the CPU, where its VRAM would cost more than the split
-    bool overrides_to_host = false;
-    for (const auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
-        auto * o_dev = ggml_backend_buft_get_device(o->buft);
-        overrides_to_host = overrides_to_host || ggml_backend_buft_is_host(o->buft) ||
-            (o_dev && ggml_backend_dev_type(o_dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
-    }
-    // by default only a table whose rows the device decodes to the CPU's bits (a convert or one multiply);
-    // LLAMA_INPUT_ON_DEVICE=1 takes any type
-    const ggml_tensor * tok_embd_meta = ml.get_tensor_meta(LLM_TN(arch)(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
-    bool tok_embd_exact = false;
-    if (tok_embd_meta) {
-        switch (tok_embd_meta->type) {
-            case GGML_TYPE_F32:
-            case GGML_TYPE_F16:
-            case GGML_TYPE_BF16:
-            case GGML_TYPE_Q8_0:
-                tok_embd_exact = true;
-                break;
-            default:
-                break;
-        }
-    }
-    const bool tok_embd_on_device = (input_env ? atoi(input_env) != 0 : !overrides_to_host && tok_embd_exact) && n_gpu_layers > n_layer_all;
-    pimpl->dev_tok_embd = tok_embd_on_device ? get_layer_buft_list(0) : pimpl->dev_input;
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1589,6 +1562,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             strcmp(output->name, tok_embd->name) == 0 &&
             output->type == GGML_TYPE_NVFP4 &&
             (output_s || output_in_s)));
+
+    // a tied output already holds the token table on the first layer's device: the lookup reads that copy instead of
+    // splitting the graph at the CPU one, which costs no VRAM; only types whose device rows are the CPU's bits
+    if (tok_embd && output && tok_embd != output && strcmp(output->name, tok_embd->name) == 0 &&
+            !(input_env && atoi(input_env) == 0) && !pimpl->dev_layer.empty()) {
+        auto buft_of = [&](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
+            for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+                if (ggml_get_tensor(ctx_ptr.get(), t->name) == t) {
+                    return buft;
+                }
+            }
+            return nullptr;
+        };
+        ggml_backend_buffer_type_t buft_tok = buft_of(tok_embd);
+        ggml_backend_buffer_type_t buft_out = buft_of(output);
+        ggml_backend_dev_t dev_out = buft_out ? ggml_backend_buft_get_device(buft_out) : nullptr;
+        const bool exact = output->type == GGML_TYPE_F32 || output->type == GGML_TYPE_F16 ||
+                           output->type == GGML_TYPE_BF16 || output->type == GGML_TYPE_Q8_0;
+        if (exact && buft_tok && ggml_backend_buft_is_host(buft_tok) && dev_out && !ggml_backend_buft_is_host(buft_out) &&
+                dev_out == pimpl->dev_layer[0].dev && weight_buft_supported(hparams, output, GGML_OP_GET_ROWS, buft_out, dev_out)) {
+            LLAMA_LOG_INFO("%s: token lookup reads the tied output on %s\n", __func__, ggml_backend_dev_name(dev_out));
+            tok_embd = output;
+        }
+    }
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
@@ -1736,9 +1733,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    const buft_list_t * buft_list_input = tn.tensor == LLM_TENSOR_TOKEN_EMBD ? pimpl->dev_tok_embd.buft_list : pimpl->dev_input.buft_list;
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 

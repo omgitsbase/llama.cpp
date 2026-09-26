@@ -28,6 +28,9 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+// checks if the weight tensor can be used with the specified buffer type and device
+bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev);
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
