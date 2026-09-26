@@ -2821,6 +2821,10 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 }
 #endif // USE_CUDA_GRAPH
 
+static bool ggml_cuda_fuse_multi_rope(const int mode) {
+    return (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) && !(ggml_cuda_fuse_off_mask() & 67108864);
+}
+
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
                                                 const ggml_tensor * set_rows) {
@@ -2846,9 +2850,9 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    // Only norm/neox shaders have the fusion code
+    // the vision shader has no fusion code
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && !ggml_cuda_fuse_multi_rope(mode)) {
         return false;
     }
 
@@ -2992,9 +2996,9 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
+    // the fused kernel handles every mode but vision
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && !ggml_cuda_fuse_multi_rope(mode)) {
         return false;
     }
 
@@ -3005,7 +3009,6 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 
     return true;
 }
-
 
 // An elementwise node: f32, contiguous, one of the ops the chain kernel
 // speaks, and for a binary op a second operand that broadcasts onto it.
@@ -3719,10 +3722,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
-// bits: 1 empty-skip, 2 l2 pair, 4 expert-sum, 8 nscale, 128 elt_chain, 256 norm fold / add+rms,
-// 512 float fold reader, 1024 quantized fold reader; matvec: 4096 prefetch, 8192 release, 16384 early norm weight,
-// 65536 one_row, 131072 lane groups, 1<<37 ids-early prefetch, 1<<38 producer prefetch.
-// The matvec bits in 0x2000037000 stay off until GGML_CUDA_MMV_EXPERIMENTAL=1: they have no clean speed number yet
+// try and fuse nodes and return the number of nodes to skip
+// GGML_CUDA_FUSE_OFF (decimal or 0x): each bit set turns one path off.
+//   1 empty-skip, 2 l2 pair, 4 expert-sum, 8 nscale, 128 elt_chain, 256 norm fold / add+rms,
+//   512 float fold reader, 1024 quantized fold reader, 4096 matvec prefetch, 8192 matvec release,
+//   16384 norm weight read before the PDL wait (quantize_q8_1_rms, norm+rope), 65536 one_row, 131072 lane groups,
+//   67108864 multi-section rope in norm+rope(+set_rows), 4294967296 register-resident quantize_q8_1_rms,
+//   8589934592 topk_moe REDUX selection, 1<<37 ids-early prefetch, 1<<38 producer prefetch.
+// The bits in 0x2000037000 stay off until GGML_CUDA_MMV_EXPERIMENTAL=1: they have no clean speed number yet
 uint64_t ggml_cuda_fuse_off_mask() {
     static const uint64_t mask = [] {
         const char *   e   = getenv("GGML_CUDA_FUSE_OFF");

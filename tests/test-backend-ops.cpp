@@ -2586,6 +2586,8 @@ struct test_rms_norm_mul_rope : public test_case {
     const bool set_rows;
     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
     int mode;
+    const int n_dims;     // 0: every element is rotated
+    const bool weights;   // the broadcast weight lives in a weights buffer
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -2593,16 +2595,23 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return weights && broadcast; }
 
     std::string vars() override {
-        return VARS_TO_STR6(ne, eps, multi_add, set_rows, broadcast, mode);
+        return VARS_TO_STR8(ne, eps, multi_add, set_rows, broadcast, mode, n_dims, weights);
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
-                           bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL)
-        : ne(ne), eps(eps), multi_add(multi_add), set_rows(set_rows), broadcast(broadcast), mode(mode) {}
+                           bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
+                           int n_dims = 0, bool weights = false)
+        : ne(ne), eps(eps), multi_add(multi_add), set_rows(set_rows), broadcast(broadcast), mode(mode),
+          n_dims(n_dims), weights(weights) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
         ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
         ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
@@ -2611,13 +2620,28 @@ struct test_rms_norm_mul_rope : public test_case {
             a = ggml_add(ctx, ggml_add(ctx, a, b), c);
         }
 
-        ggml_tensor * w = broadcast ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]) : b;
+        ggml_tensor * w = broadcast ? ggml_new_tensor_1d(ctx_weights ? ctx_weights : ctx, GGML_TYPE_F32, ne[0]) : b;
 
         a = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
 
-        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2]);
+        const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+        const int  nd       = n_dims > 0 ? n_dims : (int) ne[0];
 
-        ggml_tensor * rope = ggml_rope(ctx, a, pos, ne[0], mode);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, is_mrope ? ne[2]*4 : ne[2]);
+        ggml_set_name(pos, "pos");
+
+        ggml_tensor * rope;
+        if (is_mrope) {
+            // the sections cover a quarter of the pairs each, the last one the remainder
+            int sections[4] = { nd/8, nd/8, nd/8, nd/2 - 3*(nd/8) };
+            if (mode == GGML_ROPE_TYPE_IMROPE) {
+                sections[3] = 0;
+                sections[0] += nd/2 - 3*(nd/8);
+            }
+            rope = ggml_rope_multi(ctx, a, pos, nullptr, nd, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        } else {
+            rope = ggml_rope_ext(ctx, a, pos, nullptr, nd, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
 
         ggml_tensor * out;
 
@@ -2641,7 +2665,14 @@ struct test_rms_norm_mul_rope : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+            if (t->type == GGML_TYPE_I32 && ggml_nelements(t) != ne[2]) {
+                // the four position sections of a multi-section rope
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & p : data) {
+                    p = rand() % 64;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) {
                     continue;
                 }
@@ -8785,7 +8816,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
 
-    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
+    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
             for (int ne2 : {1, 8, 512}) {
                 test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 128, 32, ne2, 1 }, mode));
@@ -9388,6 +9419,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_rms_norm_mul_rope({8192, 2, 2, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                     test_cases.emplace_back(new test_rms_norm_mul_rope({8192, 2, 2, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                 }
+            }
+        }
+    }
+    for (auto set_rows : {false, true}) {
+        for (auto weights : {false, true}) {
+            for (int rope : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+                // partial rotation of a 256 head, full rotation of a 128 head, and the 1024-thread kernel
+                test_cases.emplace_back(new test_rms_norm_mul_rope({256, 16, 1, 1}, 1e-6f, false, set_rows, true, rope, 64, weights));
+                test_cases.emplace_back(new test_rms_norm_mul_rope({256, 2, 7, 1}, 1e-6f, false, set_rows, true, rope, 64, weights));
+                test_cases.emplace_back(new test_rms_norm_mul_rope({128, 8, 5, 1}, 1e-6f, false, set_rows, true, rope, 0, weights));
+                test_cases.emplace_back(new test_rms_norm_mul_rope({1536, 2, 3, 1}, 1e-6f, false, set_rows, true, rope, 512, weights));
+                test_cases.emplace_back(new test_rms_norm_mul_rope({2048, 2, 3, 1}, 1e-6f, false, set_rows, false, rope, 0, weights));
             }
         }
     }
