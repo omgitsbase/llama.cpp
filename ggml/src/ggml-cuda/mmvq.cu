@@ -1441,7 +1441,7 @@ static void mul_mat_vec_q_switch_type(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion, ggml_cuda_norm_fold * fold) {
+        const ggml_cuda_mm_fusion_args_host * fusion, ggml_cuda_norm_fold * fold, const void * q8_pre) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1546,7 +1546,10 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s11_src = src1->nb[1] / ts_src1;
     const int64_t s12_src = src1->nb[2] / ts_src1;
     const int64_t s13_src = src1->nb[3] / ts_src1;
-    if (fold) {
+    if (q8_pre) {
+        GGML_ASSERT(!fold);
+        q8 = (char *) q8_pre;
+    } else if (fold) {
         GGML_ASSERT(fold->x->type == GGML_TYPE_F32 && fold->w->type == GGML_TYPE_F32 && fold->q8_bytes == q8_bytes);
         ggml_cuda_norm_fold_reserve(ctx, *fold);
         // the first quantized reader quantizes, and writes the row factors for any float reader.

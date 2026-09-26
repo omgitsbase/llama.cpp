@@ -6459,6 +6459,98 @@ struct test_mul_mat_epi : public test_case {
     }
 };
 
+// gate and up that the fused gate kernel does not take as they are: different weight types, a GLU op or
+// parameters it does not speak, or one merged gate_up weight whose product is split into its halves
+struct test_mul_mat_glu_pair : public test_case {
+    const ggml_type type_gate;
+    const ggml_type type_up;
+    const ggml_glu_op glu_op;
+    const int64_t m; // tokens
+    const int64_t n; // rows of gate and of up
+    const int64_t k;
+    const bool with_bias;
+    const int merged; // 0 two weights, 1 one weight and two views, 2 one weight and a single-tensor GLU, 3 the same swapped
+    const bool use_id;
+    const float alpha;
+    const float limit;
+
+    std::string vars() override {
+        return VARS_TO_STR11(type_gate, type_up, glu_op, m, n, k, with_bias, merged, use_id, alpha, limit);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_GLU_PAIR";
+    }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_glu_pair(ggml_type type_gate, ggml_type type_up, ggml_glu_op glu_op, int64_t m, int64_t n, int64_t k,
+            bool with_bias = false, int merged = 0, bool use_id = false, float alpha = 1.702f, float limit = 7.0f)
+        : type_gate(type_gate), type_up(type_up), glu_op(glu_op), m(m), n(n), k(k), with_bias(with_bias), merged(merged),
+          use_id(use_id), alpha(alpha), limit(limit) {}
+
+    ggml_tensor * glu(ggml_context * ctx, ggml_tensor * g, ggml_tensor * u) {
+        if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+            return ggml_swiglu_oai(ctx, g, u, alpha, limit);
+        }
+        return ggml_glu_split(ctx, g, u, glu_op);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int n_mats = 8;
+        const int n_used = 4;
+        ggml_tensor * ids = nullptr;
+        ggml_tensor * cur = nullptr;
+        if (use_id) {
+            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
+            ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
+            cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
+        } else {
+            cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        }
+        auto mm = [&](ggml_type type, int64_t rows) {
+            ggml_tensor * w = use_id ? ggml_new_tensor_3d(ctx, type, k, rows, n_mats) : ggml_new_tensor_2d(ctx, type, k, rows);
+            return use_id ? ggml_mul_mat_id(ctx, w, cur, ids) : ggml_mul_mat(ctx, w, cur);
+        };
+        ggml_tensor * out = nullptr;
+        if (merged == 0) {
+            ggml_tensor * g = mm(type_gate, n);
+            ggml_tensor * u = mm(type_up, n);
+            if (with_bias) {
+                g = ggml_add(ctx, g, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n));
+                u = ggml_add(ctx, u, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n));
+            }
+            out = glu(ctx, g, u);
+        } else {
+            ggml_tensor * p = mm(type_up, 2*n);
+            if (merged == 1) {
+                ggml_tensor * g = ggml_view_3d(ctx, p, n, p->ne[1], p->ne[2], p->nb[1], p->nb[2], 0);
+                ggml_tensor * u = ggml_view_3d(ctx, p, n, p->ne[1], p->ne[2], p->nb[1], p->nb[2], n*p->nb[0]);
+                out = glu(ctx, g, u);
+            } else {
+                out = ggml_glu(ctx, p, glu_op, merged == 3);
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (use_id) {
+            init_mul_mat_id_tensors(ctx, 8);
+        } else {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10204,6 +10296,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int64_t m_batch : {2, 4, 7}) {
                     test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, glu_op, m_batch, 512, 2304,
                         false, 1, 1, false, with_bias, true, false, {1, 1}));
+                }
+            }
+        }
+    }
+
+    // gate/up pairs of different types, GLU ops the fused kernel does not speak, merged gate_up weights
+    for (int64_t m : {1, 2, 4, 8}) {
+        for (auto tp : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS},
+                {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}, {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}, {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}}) {
+            for (bool with_bias : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_glu_pair(tp.first, tp.second, GGML_GLU_OP_SWIGLU, m, 64, 512, with_bias));
+            }
+            test_cases.emplace_back(new test_mul_mat_glu_pair(tp.first, tp.second, GGML_GLU_OP_GEGLU, m, 272, 1024));
+        }
+        for (ggml_glu_op op : {GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK}) {
+            test_cases.emplace_back(new test_mul_mat_glu_pair(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, op, m, 64, 512));
+        }
+        test_cases.emplace_back(new test_mul_mat_glu_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU_OAI, m, 64, 512, true, 0, false, 1.5f, 5.0f));
+        test_cases.emplace_back(new test_mul_mat_glu_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU_OAI, m, 64, 512, true));
+        for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4}) {
+            for (int merged : {1, 2, 3}) {
+                for (bool use_id : {false, true}) {
+                    for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_REGLU}) {
+                        test_cases.emplace_back(new test_mul_mat_glu_pair(type, type, op, m, 64, 512, false, merged, use_id));
+                    }
                 }
             }
         }

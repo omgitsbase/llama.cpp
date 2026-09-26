@@ -9,10 +9,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 // fold: src1 was never written; quantize its norm input with the norm applied
-// instead, once for every reader of the fold
+// instead, once for every reader of the fold. q8_pre: src1 already quantized by the caller
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
-    ggml_cuda_norm_fold * fold = nullptr);
+    ggml_cuda_norm_fold * fold = nullptr, const void * q8_pre = nullptr);
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,

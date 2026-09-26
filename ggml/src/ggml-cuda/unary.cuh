@@ -239,6 +239,7 @@ enum ggml_cuda_chain_op {
     GGML_CUDA_CHAIN_SCALE = 10, GGML_CUDA_CHAIN_CLAMP, GGML_CUDA_CHAIN_SQR, GGML_CUDA_CHAIN_SQRT,
     GGML_CUDA_CHAIN_LOG, GGML_CUDA_CHAIN_SIN, GGML_CUDA_CHAIN_COS,
     GGML_CUDA_CHAIN_UNARY = 100, // + ggml_unary_op
+    GGML_CUDA_CHAIN_GLU   = 200, // + ggml_glu_op: the operand is the gate, the running value the up
 };
 
 struct ggml_cuda_chain_arg {
@@ -288,6 +289,19 @@ static __device__ __forceinline__ float ggml_cuda_chain_unary(int op, float x) {
     }
 }
 
+// a gated unit on one element, in the operand order of the separate kernels: op(gate) * up
+static __device__ __forceinline__ float ggml_cuda_glu_single(const int op, const float g, const float u, const float alpha, const float limit) {
+    switch (op) {
+        case GGML_GLU_OP_REGLU:       return op_relu(g) * u;
+        case GGML_GLU_OP_GEGLU:       return op_gelu(g) * u;
+        case GGML_GLU_OP_SWIGLU:      return op_silu(g) * u;
+        case GGML_GLU_OP_SWIGLU_OAI:  return ggml_cuda_op_swiglu_oai_single(g, u, alpha, limit);
+        case GGML_GLU_OP_GEGLU_ERF:   return op_gelu_erf(g) * u;
+        case GGML_GLU_OP_GEGLU_QUICK: return op_gelu_quick(g) * u;
+        default:                      return u;
+    }
+}
+
 // one chain step on the running value v; o is the step's operand, if it has one
 static __device__ __forceinline__ float ggml_cuda_chain_apply(const ggml_cuda_chain_step & st, const float v, const float o) {
     switch (st.op) {
@@ -304,7 +318,9 @@ static __device__ __forceinline__ float ggml_cuda_chain_apply(const ggml_cuda_ch
         case GGML_CUDA_CHAIN_LOG:   return logf(v);
         case GGML_CUDA_CHAIN_SIN:   return sinf(v);
         case GGML_CUDA_CHAIN_COS:   return cosf(v);
-        default:                    return ggml_cuda_chain_unary(st.op - GGML_CUDA_CHAIN_UNARY, v);
+        default:
+            return st.op >= GGML_CUDA_CHAIN_GLU ? ggml_cuda_glu_single(st.op - GGML_CUDA_CHAIN_GLU, o, v, st.p0, st.p1) :
+                                                  ggml_cuda_chain_unary(st.op - GGML_CUDA_CHAIN_UNARY, v);
     }
 }
 

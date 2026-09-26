@@ -1681,6 +1681,19 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+// the GLU ops the fused gate kernels apply, at the parameters they use
+static bool ggml_cuda_fused_glu_ok(const ggml_tensor * glu) {
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+            return true;
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_get_op_params_f32(glu, 2) == 1.702f && ggml_get_op_params_f32(glu, 3) == 7.0f;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -1762,9 +1775,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
-
-    if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
+    if (!ggml_cuda_fused_glu_ok(glu)) {
         return false;
     }
 
@@ -4206,6 +4217,246 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
     return last - i;
 }
 
+// gate and up that the fused gate kernel cannot take together (different types, or a GLU it does not speak):
+// the gate's matvec into scratch, then the up's with the bias and the GLU in its epilogue, both reading one
+// quantized activation
+static bool ggml_cuda_try_mm_glu_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * up_mm,
+        const ggml_tensor * gate_b, const ggml_tensor * up_b, ggml_tensor * glu) {
+    if (ggml_cuda_fuse_off_mask() & 1048576) {
+        return false;
+    }
+    if (gate_mm->op != GGML_OP_MUL_MAT || up_mm->op != GGML_OP_MUL_MAT || gate_mm->src[1] != up_mm->src[1] ||
+        !ggml_are_same_shape(gate_mm, up_mm) || !ggml_are_same_shape(up_mm, glu) || !ggml_is_contiguous(glu) ||
+        glu->type != GGML_TYPE_F32 || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_REGLU: case GGML_GLU_OP_GEGLU: case GGML_GLU_OP_SWIGLU: case GGML_GLU_OP_SWIGLU_OAI:
+        case GGML_GLU_OP_GEGLU_ERF: case GGML_GLU_OP_GEGLU_QUICK:
+            break;
+        default:
+            return false;
+    }
+    const ggml_tensor * src1 = up_mm->src[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    for (const ggml_tensor * mm : { gate_mm, up_mm }) {
+        const ggml_tensor * src0 = mm->src[0];
+        if (!ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_NVFP4 || src0->buffer == nullptr ||
+            !ggml_is_contiguous(mm) || mm->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+            !ggml_cuda_should_fuse_mul_mat_vec_q(mm) || !ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
+            return false;
+        }
+    }
+    if (up_mm->ne[1] == 1 && !ggml_cuda_mm_epi_lean_t1()) {
+        return false;
+    }
+    ggml_cuda_mm_epi_arg gb{};
+    ggml_cuda_mm_epi_arg ub{};
+    if ((gate_b && !ggml_cuda_mm_epi_arg_of(gate_mm, gate_mm, gate_b, gb)) || (up_b && !ggml_cuda_mm_epi_arg_of(up_mm, up_mm, up_b, ub))) {
+        return false;
+    }
+    // a bias under the output would be overwritten while other blocks still read it
+    const char * ob = (const char *) glu->data;
+    const size_t on = ggml_nbytes(glu);
+    for (const ggml_tensor * t : { gate_b, up_b }) {
+        if (t && (const char *) t->data < ob + on && ob < (const char *) t->data + ggml_nbytes(t)) {
+            return false;
+        }
+    }
+
+    // the pool is freed in reverse order: the fold's buffer, which outlives this node, is taken first
+    ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, src1);
+    ggml_cuda_pool_alloc<char> q8(ctx.pool());
+    const void * q8_pre = nullptr;
+    if (fold != nullptr) {
+        ggml_cuda_norm_fold_reserve(ctx, *fold);
+    } else {
+        const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+        const size_t  ts          = ggml_type_size(src1->type);
+        q8.alloc(src1->ne[3]*src1->ne[2]*src1->ne[1]*ne10_padded*sizeof(block_q8_1)/QK8_1);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q8.get(), up_mm->src[0]->type, src1->ne[0],
+            src1->nb[1]/ts, src1->nb[2]/ts, src1->nb[3]/ts, ne10_padded, src1->ne[1], src1->ne[2], src1->ne[3], ctx.stream());
+        q8_pre = q8.get();
+    }
+
+    ggml_cuda_pool_alloc<float> g(ctx.pool(), ggml_nelements(gate_mm));
+    {
+        ggml_tensor dst = *gate_mm;
+        dst.data = g.get();
+        ggml_cuda_mm_epilogue epi{};
+        ggml_cuda_mm_fusion_args_host fusion{};
+        if (gate_b) {
+            epi.arg[0]  = gb;
+            epi.n_args  = 1;
+            epi.step[0] = { GGML_CUDA_CHAIN_ADD, 0, 0.0f, 0.0f };
+            epi.n_steps = 1;
+            fusion.epi  = &epi;
+        }
+        ggml_cuda_mul_mat_vec_q(ctx, gate_mm->src[0], src1, nullptr, &dst, gate_b ? &fusion : nullptr, fold, q8_pre);
+    }
+    {
+        ggml_tensor dst = *up_mm;
+        dst.data = glu->data;
+        ggml_cuda_mm_epilogue epi{};
+        if (up_b) {
+            epi.arg[epi.n_args] = ub;
+            epi.step[epi.n_steps++] = { GGML_CUDA_CHAIN_ADD, epi.n_args++, 0.0f, 0.0f };
+        }
+        ggml_cuda_mm_epi_arg & ga = epi.arg[epi.n_args];
+        ga.data      = g.get();
+        ga.s_row     = 1;
+        ga.s_col     = (int) up_mm->ne[0];
+        ga.s_channel = (int) (up_mm->ne[0]*up_mm->ne[1]);
+        ga.s_sample  = (int) (up_mm->ne[0]*up_mm->ne[1]*up_mm->ne[2]);
+        epi.step[epi.n_steps++] = { GGML_CUDA_CHAIN_GLU + (int) ggml_get_glu_op(glu), epi.n_args++,
+                                    ggml_get_op_params_f32(glu, 2), ggml_get_op_params_f32(glu, 3) };
+        ggml_cuda_mm_fusion_args_host fusion{};
+        fusion.epi = &epi;
+        ggml_cuda_mul_mat_vec_q(ctx, up_mm->src[0], src1, nullptr, &dst, &fusion, fold, q8_pre);
+    }
+    ggml_cuda_norm_fold_check_at(ctx, src1);
+    return true;
+}
+
+// one weight matrix holding gate and up (a merged gate_up) and a GLU over the two halves of its product, either
+// through two views or as a single-tensor GLU: the fused gate kernel over the halves as two weight matrices
+static int ggml_cuda_try_merged_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * gu = cgraph->nodes[i];
+    if ((gu->op != GGML_OP_MUL_MAT && gu->op != GGML_OP_MUL_MAT_ID) || (ggml_cuda_fuse_off_mask() & 1048576) ||
+        (gu->flags & GGML_TENSOR_FLAG_OUTPUT) || gu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gu) || gu->ne[0] % 2 != 0) {
+        return 0;
+    }
+    const ggml_tensor * w = gu->src[0];
+    if (!ggml_is_quantized(w->type) || w->type == GGML_TYPE_NVFP4 || w->buffer == nullptr ||
+        ggml_get_op_params_i32(gu, 1) == GGML_HINT_SRC0_IS_HADAMARD || !ggml_cuda_should_fuse_mul_mat_vec_q(gu)) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (gu->op == GGML_OP_MUL_MAT && !ggml_cuda_should_use_mmvq(w->type, cc, gu->src[1]->ne[1])) {
+        return 0;
+    }
+    const int64_t f = gu->ne[0] / 2;
+
+    // the GLU and which half of the rows is the gate
+    const ggml_tensor * glu = nullptr;
+    int glu_idx  = -1;
+    int gate_half = 0;
+    int n_views   = 0;
+    const ggml_tensor * views[2] = {};
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 3; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 && n->op != GGML_OP_VIEW) {
+            return 0;
+        }
+        if (n->op == GGML_OP_VIEW && n->src[0] == gu && n_views < 2) {
+            views[n_views++] = n;
+            continue;
+        }
+        if (n->op == GGML_OP_GLU) {
+            glu     = n;
+            glu_idx = j;
+        }
+        break;
+    }
+    if (glu == nullptr || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return 0;
+    }
+    if (n_views == 0) {
+        if (glu->src[0] != gu || glu->src[1] != nullptr || ggml_node_get_use_count(cgraph, i) != 1) {
+            return 0;
+        }
+        gate_half = ggml_get_op_params_i32(glu, 1) ? 1 : 0;
+    } else {
+        if (n_views != 2 || ggml_node_get_use_count(cgraph, i) != 2) {
+            return 0;
+        }
+        for (const ggml_tensor * v : views) {
+            if ((v != glu->src[0] && v != glu->src[1]) || v->ne[0] != f || v->nb[1] != gu->nb[1] || v->nb[2] != gu->nb[2] ||
+                v->nb[3] != gu->nb[3] || !ggml_are_same_shape(v, glu) || (v->view_offs != 0 && v->view_offs != (size_t) f*gu->nb[0])) {
+                return 0;
+            }
+        }
+        if (glu->src[0]->view_offs == glu->src[1]->view_offs) {
+            return 0;
+        }
+        gate_half = glu->src[0]->view_offs == 0 ? 0 : 1;
+        for (int j = i + 1; j < glu_idx; ++j) {
+            if (ggml_node_get_use_count(cgraph, j) != 1 || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return 0;
+            }
+        }
+    }
+    if (!ggml_cuda_fused_glu_ok(glu)) {
+        return 0;
+    }
+    // the output must not sit under the product it is computed from
+    const char * ob = (const char *) glu->data;
+    const char * gb = (const char *) gu->data;
+    if (gb < ob + ggml_nbytes(glu) && ob < gb + ggml_nbytes(gu)) {
+        return 0;
+    }
+
+    ggml_tensor gate_w = *w;
+    ggml_tensor up_w   = *w;
+    gate_w.ne[1] = f;
+    up_w.ne[1]   = f;
+    gate_w.data = (char *) w->data + gate_half*f*w->nb[1];
+    up_w.data   = (char *) w->data + (1 - gate_half)*f*w->nb[1];
+
+    ggml_cuda_mm_fusion_args_host fusion{};
+    fusion.gate   = &gate_w;
+    fusion.glu_op = ggml_get_glu_op(glu);
+    ggml_cuda_mul_mat_vec_q(ctx, &up_w, gu->src[1], gu->src[2], const_cast<ggml_tensor *>(glu), &fusion,
+        ggml_cuda_norm_fold_for(ctx, gu->src[1]));
+    ggml_cuda_norm_fold_check_at(ctx, gu->src[1]);
+    return glu_idx - i;
+}
+
+// {gate, up, GLU} or {gate, bias, up, bias, GLU} over one activation that the fused gate kernel declined
+static int ggml_cuda_try_glu_pair_at(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    for (const bool with_bias : { false, true }) {
+        const int n_ops = with_bias ? 5 : 3;
+        const ggml_op ops_plain[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+        const ggml_op ops_bias[]  = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_GLU };
+        const int out_nodes[] = { i + n_ops - 1 };
+        if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, with_bias ? ops_bias : ops_plain, out_nodes, 1)) {
+            continue;
+        }
+        ggml_tensor * glu = cgraph->nodes[i + n_ops - 1];
+        const ggml_tensor * gate_mm = nullptr;
+        const ggml_tensor * up_mm   = nullptr;
+        const ggml_tensor * gate_b  = nullptr;
+        const ggml_tensor * up_b    = nullptr;
+        if (!with_bias) {
+            gate_mm = glu->src[0];
+            up_mm   = glu->src[1];
+        } else {
+            // a bias node reads its matvec and one other tensor
+            auto split = [&](const ggml_tensor * add, const ggml_tensor *& mm, const ggml_tensor *& b) {
+                if (add == nullptr || add->op != GGML_OP_ADD) {
+                    return false;
+                }
+                const bool lhs = add->src[0]->op == GGML_OP_MUL_MAT && (add->src[0] == cgraph->nodes[i] || add->src[0] == cgraph->nodes[i + 2]);
+                mm = lhs ? add->src[0] : add->src[1];
+                b  = lhs ? add->src[1] : add->src[0];
+                return (mm == cgraph->nodes[i] || mm == cgraph->nodes[i + 2]) && ggml_are_same_shape(add, mm);
+            };
+            if (!split(glu->src[0], gate_mm, gate_b) || !split(glu->src[1], up_mm, up_b)) {
+                continue;
+            }
+        }
+        if (gate_mm == nullptr || up_mm == nullptr || gate_mm == up_mm ||
+            (gate_mm != cgraph->nodes[i] && gate_mm != cgraph->nodes[i + (with_bias ? 2 : 1)])) {
+            continue;
+        }
+        if (ggml_cuda_try_mm_glu_pair(ctx, gate_mm, up_mm, gate_b, up_b, glu)) {
+            return n_ops - 1;
+        }
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4413,6 +4664,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
             }
             return n_fuse - 1;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        const int nodes_to_skip = ggml_cuda_try_merged_glu(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
         }
     }
 
@@ -4757,6 +5015,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int nodes_to_skip = ggml_cuda_try_glu_pair_at(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
     }
 
     fused_mul_mat_vec = false;
