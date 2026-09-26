@@ -155,6 +155,34 @@ static __device__ __forceinline__ void ggml_cuda_prefetch_l2_warp(const void * p
 #endif
 }
 
+// weight rows a quantize kernel asks for in L2 on behalf of the matvec it feeds, for launches without PDL,
+// where the matvec cannot start early and ask for them itself
+struct ggml_cuda_l2_pf {
+    const char * base[2]    = { nullptr, nullptr }; // the matrix and the gate, or nullptr
+    uint32_t     nrows      = 0;                    // 0: nothing to prefetch
+    uint32_t     row_bytes  = 0;                    // the prefix of each row
+    int64_t      row_stride = 0;                    // bytes
+};
+
+// the grid's threads share the lines, the first rows first
+static __device__ __forceinline__ void ggml_cuda_l2_pf_issue(const ggml_cuda_l2_pf & pf) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__)
+    const uint32_t lines = (pf.row_bytes + 127) / 128;
+    const uint32_t per_row = lines*(pf.base[1] ? 2 : 1);
+    const uint32_t total = pf.nrows*per_row;
+    const uint32_t nt    = gridDim.x*gridDim.y*gridDim.z*blockDim.x;
+    for (uint32_t t = ((blockIdx.z*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x)*blockDim.x + threadIdx.x; t < total; t += nt) {
+        const uint32_t row  = t / per_row;
+        const uint32_t rem  = t - row*per_row;
+        const uint32_t b    = rem >= lines;
+        const uint32_t off  = min(128*(rem - b*lines), pf.row_bytes - 1);
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(pf.base[b] + row*pf.row_stride + off)));
+    }
+#else
+    GGML_UNUSED(pf);
+#endif
+}
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;

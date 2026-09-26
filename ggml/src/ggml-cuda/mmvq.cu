@@ -1474,6 +1474,28 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    // without PDL the matvec cannot start before its producer ends, so the quantize ahead of it asks for the
+    // rows its first blocks read: the 32 KB per SM prefetch budget, taken from the first rows.
+    // Opt-in (GGML_CUDA_PF_PRODUCER=1) until it is measured on a card without PDL
+    ggml_cuda_l2_pf l2_pf;
+    {
+        static const bool   pf_producer = [] { const char * e = getenv("GGML_CUDA_PF_PRODUCER"); return e && atoi(e) != 0; }();
+        const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
+        const int           nsm  = ggml_cuda_info().devices[ctx.device].nsm;
+        if (pf_producer && !ids && ne02 == 1 && ne03 == 1 && !(ggml_cuda_fuse_off_mask() & (1ull << 38)) &&
+                GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ctx.device].cc) &&
+                ggml_cuda_tensor_is_constant(src0) && (gate == nullptr || ggml_cuda_tensor_is_constant(gate))) {
+            const int     nstreams  = gate ? 2 : 1;
+            const int64_t row_bytes = ne00/ggml_blck_size(src0->type)*ts_src0;
+            const int64_t pf_row    = ggml_cuda_mv_prefetch_bytes(row_bytes, nstreams, ne01, nsm);
+            l2_pf.base[0]    = (const char *) src0->data;
+            l2_pf.base[1]    = gate ? (const char *) gate->data : nullptr;
+            l2_pf.row_bytes  = (uint32_t) pf_row;
+            l2_pf.row_stride = nb01;
+            l2_pf.nrows      = (uint32_t) std::min<int64_t>(ne01, (int64_t) nsm*32768/(pf_row*nstreams));
+        }
+    }
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_bytes    = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
@@ -1489,14 +1511,14 @@ void ggml_cuda_mul_mat_vec_q(
         if (!fold->q8_ready) {
             const bool w_early = !(ggml_cuda_fuse_off_mask() & 16384) && ggml_cuda_tensor_is_constant(fold->w);
             quantize_row_q8_1_rms_cuda((const float *) fold->x->data, (const float *) fold->w->data, fold->eps, fold->q8, fold->scale,
-                ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, w_early, stream);
+                ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, w_early, l2_pf, stream);
             fold->q8_ready    = true;
             fold->scale_ready = true;
         }
         q8 = (char *) fold->q8;
     } else {
         q8 = src1_q8_1.alloc(q8_bytes);
-        quantize_row_q8_1_cuda(src1_d, nullptr, q8, src0->type, ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_pf_cuda(src1_d, q8, ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, l2_pf, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

@@ -54,8 +54,11 @@ __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2, const ggml_cuda_l2_pf pf) {
     ggml_cuda_pdl_lc();
+    if (pf.nrows != 0) {
+        ggml_cuda_l2_pf_issue(pf);
+    }
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
     const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
@@ -564,8 +567,11 @@ __launch_bounds__(block_size, 1)
 static __global__ void quantize_q8_1_rms(
         const float * x_ptr, const float * w_ptr, const float eps, void * vy_ptr, float * scale_out_ptr,
         const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int ne0, const int ne1, const uint3 ne2, const bool w_early) {
+        const int ne0, const int ne1, const uint3 ne2, const bool w_early, const ggml_cuda_l2_pf pf) {
     ggml_cuda_pdl_lc();
+    if (pf.nrows != 0) {
+        ggml_cuda_l2_pf_issue(pf);
+    }
     constexpr int nwarps = block_size / WARP_SIZE;
     const int i1  = blockIdx.y;
     const int i3  = fastdiv(blockIdx.z, ne2);
@@ -628,20 +634,23 @@ static __global__ void quantize_q8_1_rms(
 void quantize_row_q8_1_rms_cuda(
         const float * x, const float * w, const float eps, void * vy, float * scale_out,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const bool w_early, cudaStream_t stream) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const bool w_early,
+        const ggml_cuda_l2_pf & pf, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
     const uint3   ne2_fastdiv = init_fastdiv_values(ne2);
     const int64_t nblk        = ne0 / QK8_1;
+    // with PDL the matvec prefetches its own rows while it waits
+    const ggml_cuda_l2_pf pf_k = ggml_cuda_kernel_uses_pdl((const void *) quantize_q8_1_rms<256>) ? ggml_cuda_l2_pf{} : pf;
 
     if (ne00 < 1024) {
         const dim3 num_blocks((nblk + 8 - 1) / 8, ne1, ne2*ne3);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(256, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(quantize_q8_1_rms<256>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early);
+        ggml_cuda_kernel_launch(quantize_q8_1_rms<256>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early, pf_k);
     } else {
         const dim3 num_blocks((nblk + 32 - 1) / 32, ne1, ne2*ne3);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(1024, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(quantize_q8_1_rms<1024>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early);
+        ggml_cuda_kernel_launch(quantize_q8_1_rms<1024>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early, pf_k);
     }
 }
 
@@ -706,11 +715,9 @@ void rms_scale_cuda(
     }
 }
 
-void quantize_row_q8_1_cuda(
-        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
-        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    GGML_ASSERT(!ids);
+void quantize_row_q8_1_pf_cuda(
+        const float * x, void * vy, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const ggml_cuda_l2_pf & pf, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
@@ -719,7 +726,17 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    // with PDL the matvec prefetches its own rows while it waits
+    const ggml_cuda_l2_pf pf_k = ggml_cuda_kernel_uses_pdl((const void *) quantize_q8_1) ? ggml_cuda_l2_pf{} : pf;
+    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, pf_k);
+}
+
+void quantize_row_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(!ids);
+    quantize_row_q8_1_pf_cuda(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, {}, stream);
     GGML_UNUSED(type_src0);
 }
 

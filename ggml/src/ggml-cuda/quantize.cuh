@@ -12,7 +12,7 @@
 void quantize_row_q8_1_rms_cuda(
         const float * x, const float * w, float eps, void * vy, float * scale_out,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
-        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool w_early, cudaStream_t stream);
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool w_early, const ggml_cuda_l2_pf & pf, cudaStream_t stream);
 
 // scale[row] * x * w written out, contiguous rows
 void rms_apply_cuda(const float * x, const float * w, const float * scale, float * dst, int64_t ne00, int64_t n_rows, cudaStream_t stream);
@@ -36,6 +36,11 @@ void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+// quantize_row_q8_1_cuda that also asks for the consuming matvec's first weight rows in L2 when it runs without PDL
+void quantize_row_q8_1_pf_cuda(
+        const float * x, void * vy, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, const ggml_cuda_l2_pf & pf, cudaStream_t stream);
 
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
