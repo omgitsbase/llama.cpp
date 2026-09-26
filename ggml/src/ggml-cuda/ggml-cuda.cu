@@ -3702,13 +3702,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // bits: 1 empty-skip, 2 l2 pair, 4 expert-sum, 8 nscale, 128 elt_chain, 256 norm fold / add+rms,
-// 512 float fold reader, 1024 quantized fold reader, 4096 matvec weight prefetch before the PDL wait,
-// 8192 matvec release after its own wait, 16384 quantize_q8_1_rms norm weight before the wait,
-// 65536 one-row matvec blocks, 131072 MoE lane packing and the one-token expert route,
-// 1<<37 expert rows prefetched from ids that an earlier matvec already read,
-// 1<<38 without PDL, the quantize ahead of a matvec prefetching its first weight rows (opt-in, GGML_CUDA_PF_PRODUCER=1)
+// 512 float fold reader, 1024 quantized fold reader; matvec: 4096 prefetch, 8192 release, 16384 early norm weight,
+// 65536 one_row, 131072 lane groups, 1<<37 ids-early prefetch, 1<<38 producer prefetch.
+// The matvec bits in 0x2000037000 stay off until GGML_CUDA_MMV_EXPERIMENTAL=1: they have no clean speed number yet
 uint64_t ggml_cuda_fuse_off_mask() {
-    static const uint64_t mask = getenv("GGML_CUDA_FUSE_OFF") ? std::strtoull(getenv("GGML_CUDA_FUSE_OFF"), nullptr, 0) : 0;
+    static const uint64_t mask = [] {
+        const char *   e   = getenv("GGML_CUDA_FUSE_OFF");
+        const char *   x   = getenv("GGML_CUDA_MMV_EXPERIMENTAL");
+        const uint64_t off = e ? std::strtoull(e, nullptr, 0) : 0;
+        return off | (x && atoi(x) != 0 ? 0 : 0x2000037000ull);
+    }();
     return mask;
 }
 
