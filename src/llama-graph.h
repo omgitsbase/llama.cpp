@@ -91,6 +91,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_tokens_dev_state;
 
 //
 // llm_graph_input
@@ -136,6 +137,9 @@ public:
 
     bool device = false; // a loop body reads its token on the device
 
+    llama_tokens_dev_state * tokens_dev = nullptr;
+    bool dev_tokens = false; // tokens is a view of tokens_dev->tok_dev
+
     const int64_t n_embd = 0;
 };
 
@@ -171,6 +175,34 @@ struct llama_loop_state {
     int32_t       n_max    = 0;       // steps
     int32_t       n_tok    = 0;       // tokens a step reads
     int32_t       n_rows   = 0;       // window rows
+};
+
+// Batch rows of the next decode that another context's chained MTP draft fills on the device: the verify is
+// queued behind the draft graph instead of waiting for its ids to reach the host. Armed for one decode.
+struct llama_tokens_dev_state {
+    llama_context        * src       = nullptr; // the drafter whose last chained ids fill the rows
+    ggml_backend_sched_t   sched_dst = nullptr;
+    int32_t                i0        = 0;       // first batch row they fill
+    int32_t                n         = 0;       // 0: the host uploads every row
+
+    // Once a handoff has been asked for, a batch of up to n_max tokens reads them from tok_dev, on the device. As a
+    // graph input they would sit in a host buffer, and a copy from the device into one synchronizes the drafter
+    // first: the host would wait for the draft graph, which is what the handoff is there to avoid.
+    static constexpr int32_t n_max   = 16;
+    bool                   enabled   = false;
+    ggml_context         * ctx_dev   = nullptr;
+    ggml_backend_buffer_t  buf_dev   = nullptr;
+    ggml_tensor          * tok_dev   = nullptr; // I32 [n_max], in the token embedding's buffer type
+
+    void disarm() { src = nullptr; sched_dst = nullptr; i0 = 0; n = 0; }
+
+    llama_tokens_dev_state() = default;
+    llama_tokens_dev_state(const llama_tokens_dev_state &) = delete;
+    llama_tokens_dev_state & operator=(const llama_tokens_dev_state &) = delete;
+    ~llama_tokens_dev_state() {
+        if (buf_dev) { ggml_backend_buffer_free(buf_dev); }
+        if (ctx_dev) { ggml_free(ctx_dev); }
+    }
 };
 
 // a chained MTP round takes the target's sampled ids and hidden rows for the
@@ -875,6 +907,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     llama_mtp_round_state  * mtp_round;
+    llama_tokens_dev_state * tokens_dev;
     const llama_loop_state       * loop;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1127,6 +1160,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     llama_mtp_round_state  * mtp_round;
+    llama_tokens_dev_state * tokens_dev;
     const llama_loop_state       * loop;
 
     std::map<llama_seq_id, llama_sampler *> samplers;

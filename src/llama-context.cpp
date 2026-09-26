@@ -1748,6 +1748,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t rt_d1 = 0, rt_d2 = 0;
     int rt_tokens = 0;
 
+    // rows taken on the device are for this decode alone, and only when it is one ubatch: a later ubatch would
+    // upload the batch's placeholders for them
+    struct tokens_dev_reset {
+        llama_tokens_dev_state & t;
+        ~tokens_dev_reset() { t.disarm(); }
+    } tokens_dev_guard{tokens_dev};
+    if (tokens_dev.n > 0 && batch_inp.n_tokens > (int32_t) cparams.n_ubatch) {
+        LLAMA_LOG_ERROR("%s: device token rows need the batch in one ubatch (%d tokens, n_ubatch %u)\n", __func__,
+                        batch_inp.n_tokens, cparams.n_ubatch);
+        return -1;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2672,6 +2684,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.mtp_round   =*/ const_cast<llama_mtp_round_state *>(&mtp_round), // the round allocates its device inputs on first build
+        /*.tokens_dev  =*/ const_cast<llama_tokens_dev_state *>(&tokens_dev),
         /*.loop        =*/ loop_cur,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -4066,6 +4079,29 @@ const llama_token * llama_context::get_mtp_chain_ids(int32_t & n) {
 
 void llama_context::set_mtp_round_target(llama_context * ctx_tgt) {
     mtp_round.ctx_tgt = ctx_tgt;
+}
+
+bool llama_context::set_tokens_device(llama_context * ctx_src, int32_t i0, int32_t n) {
+    tokens_dev.disarm();
+    if (ctx_src == nullptr || n <= 0 || i0 < 0 || i0 + n > llama_tokens_dev_state::n_max ||
+            (int32_t) ctx_src->mtp_ids_pending.size() < n) {
+        return false;
+    }
+    // the rows are read on the device, so the embedding they index has to be there too
+    const ggml_tensor * tok_embd = model.tok_embd;
+    if (tok_embd == nullptr || tok_embd->buffer == nullptr || ggml_backend_buffer_is_host(tok_embd->buffer)) {
+        return false;
+    }
+    tokens_dev.enabled   = true;
+    tokens_dev.src       = ctx_src;
+    tokens_dev.sched_dst = sched.get();
+    tokens_dev.i0        = i0;
+    tokens_dev.n         = n;
+    return true;
+}
+
+bool llama_set_tokens_device(llama_context * ctx, llama_context * ctx_src, int32_t i0, int32_t n) {
+    return ctx->set_tokens_device(ctx_src, i0, n);
 }
 
 void llama_set_mtp_round_target(llama_context * ctx, llama_context * ctx_tgt) {

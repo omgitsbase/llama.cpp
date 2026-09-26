@@ -58,6 +58,11 @@ struct llama_context {
     void synchronize();
 
     const llama_token * get_mtp_chain_ids(int32_t & n);
+    // the chained draft's id tensors, while its ids have not been read back
+    const std::vector<ggml_tensor *> & get_mtp_ids_pending() const { return mtp_ids_pending; }
+
+    // the next decode takes batch rows [i0, i0 + n) from ctx_src's pending chained ids, on the device
+    bool set_tokens_device(llama_context * ctx_src, int32_t i0, int32_t n);
 
     // a chained MTP round's host-side inputs (the first round of a request);
     // later rounds read the target context's tensors on the device
@@ -332,6 +337,7 @@ private:
     ggml_backend_buffer_ptr mtp_ids_buf;
 
     llama_mtp_round_state mtp_round;
+    llama_tokens_dev_state tokens_dev;
 
     llama_loop_state          loop;
     bool                      loop_on_device = false; // the last loop ran as one device graph

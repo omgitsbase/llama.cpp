@@ -68,14 +68,48 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+static void mtp_round_copy(ggml_backend_sched_t sched_src, ggml_backend_sched_t sched_dst, ggml_tensor * src, ggml_tensor * dst, size_t nbytes, size_t dst_offset);
+static void mtp_round_order(ggml_backend_sched_t sched_dst, ggml_backend_t b_src);
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (device) {
         return;
     }
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
+        const size_t  es       = ggml_element_size(tokens);
 
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        llama_tokens_dev_state * td = tokens_dev;
+        const std::vector<ggml_tensor *> * ids = td && td->n > 0 && td->src ? &td->src->get_mtp_ids_pending() : nullptr;
+        const bool armed = ids && td->i0 >= 0 && td->i0 + td->n <= n_tokens && (int32_t) ids->size() >= td->n;
+        if (armed && dev_tokens) {
+            // the host's rows around the drafter's, which it never writes: a later write of its placeholders would
+            // race the copies below. The rows sit on the device, so neither the writes nor the copies wait for the
+            // draft graph; the verify's graph does, on the device
+            if (td->i0 > 0) {
+                ggml_backend_tensor_set(tokens, ubatch->token, 0, td->i0*es);
+            }
+            if (td->i0 + td->n < n_tokens) {
+                ggml_backend_tensor_set(tokens, ubatch->token + td->i0 + td->n, (td->i0 + td->n)*es, (n_tokens - td->i0 - td->n)*es);
+            }
+            ggml_backend_sched_t sched_src = td->src->get_sched();
+            for (int32_t j = 0; j < td->n; ++j) {
+                mtp_round_copy(sched_src, td->sched_dst, (*ids)[j], tokens, es, (size_t) (td->i0 + j)*es);
+            }
+            mtp_round_order(td->sched_dst, ggml_backend_sched_get_tensor_backend(sched_src, (*ids)[0]));
+        } else if (armed) {
+            // a batch that did not get the device rows: read the drafted ids back here, and wait for them
+            std::vector<llama_token> rows(ubatch->token, ubatch->token + n_tokens);
+            for (int32_t j = 0; j < td->n; ++j) {
+                ggml_backend_tensor_get((*ids)[j], &rows[td->i0 + j], 0, sizeof(llama_token));
+            }
+            ggml_backend_tensor_set(tokens, rows.data(), 0, n_tokens*es);
+        } else {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*es);
+        }
+        if (td) {
+            td->n = 0;
+        }
     }
 
     if (ubatch->embd) {
@@ -92,6 +126,11 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+
+    // the device rows are a different graph from a host input
+    const bool want_dev = !device && params.tokens_dev && params.tokens_dev->enabled && params.ubatch.token &&
+                          params.ubatch.n_tokens <= llama_tokens_dev_state::n_max;
+    res &= want_dev == dev_tokens;
 
     return res;
 }
@@ -1643,6 +1682,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     mtp_round        (params.mtp_round),
+    tokens_dev       (params.tokens_dev),
     loop             (params.loop),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2482,6 +2522,19 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         GGML_ASSERT(ubatch.token && ubatch.n_tokens <= loop->n_tok && "loop body: more tokens than the loop holds");
         inp->device = true;
         inp->tokens = ggml_view_1d(ctx0, loop->tok, ubatch.n_tokens, 0);
+    } else if (tokens_dev && tokens_dev->enabled && ubatch.token && ubatch.n_tokens <= llama_tokens_dev_state::n_max) {
+        if (!tokens_dev->tok_dev) {
+            ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+            tokens_dev->ctx_dev = ggml_init(ip);
+            GGML_ASSERT(tokens_dev->ctx_dev);
+            tokens_dev->tok_dev = ggml_new_tensor_1d(tokens_dev->ctx_dev, GGML_TYPE_I32, llama_tokens_dev_state::n_max);
+            ggml_set_name(tokens_dev->tok_dev, "inp_tokens_dev");
+            tokens_dev->buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(tokens_dev->ctx_dev, ggml_backend_buffer_get_type(tok_embd->buffer));
+            GGML_ASSERT(tokens_dev->buf_dev && "failed to allocate the device token rows");
+        }
+        inp->tokens     = ggml_view_1d(ctx0, tokens_dev->tok_dev, ubatch.n_tokens, 0);
+        inp->tokens_dev = tokens_dev;
+        inp->dev_tokens = true;
     } else {
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         cb(inp->tokens, "inp_tokens", -1);
