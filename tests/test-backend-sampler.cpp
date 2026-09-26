@@ -732,6 +732,45 @@ static void test_backend_multi_sequence_sampling(const test_params & params) {
     printf("backend multi-sequence sampling test PASSED\n");
 }
 
+static void test_backend_multi_sequence_greedy_sampling(const test_params & params) {
+    // every row greedy: the rows share one argmax, and each candidate is filled from its sampled id
+    std::vector<llama_sampler_ptr> chains;
+    std::vector<llama_sampler_seq_config> backend_sampler_configs;
+    for (llama_seq_id seq_id = 0; seq_id < 3; ++seq_id) {
+        chains.emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(chains.back().get(), llama_sampler_init_greedy());
+        backend_sampler_configs.push_back({ seq_id, chains.back().get() });
+    }
+
+    test_context test_ctx(params, backend_sampler_configs);
+
+    if (!test_ctx.decode({{0, "Hello"}, {1, "Some"}, {2, "The capital of France"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    for (int step = 0; step < 4; step++) {
+        std::map<llama_seq_id, llama_token> tokens;
+        for (llama_seq_id seq_id : {0, 1, 2}) {
+            const int32_t idx = test_ctx.idx_for_seq(seq_id);
+            const llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), idx);
+            const llama_token * cands = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), idx);
+            const uint32_t n_cands = llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), idx);
+            const float * logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), idx);
+            const uint32_t n_logits = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), idx);
+            printf("  Seq %d, step %d: token id=%d, n_cands=%u, logit=%.6f, string='%s'\n", seq_id, step, token, n_cands,
+                    logits && n_logits > 0 ? logits[0] : 0.0f, test_ctx.token_to_piece(token, false).c_str());
+            GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+            GGML_ASSERT(n_cands == 1 && cands != nullptr && cands[0] == token);
+            tokens[seq_id] = token;
+        }
+        if (!test_ctx.decode_tokens(tokens)) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+
+    printf("backend multi-sequence greedy sampling test PASSED\n");
+}
+
 static void test_backend_dist_sampling(const test_params & params) {
     const int seq_id = 0;
     const int32_t seed = 88;
@@ -2007,6 +2046,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "temp_ext",        test_backend_temp_ext_sampling,       true  },
     { "top_k",           test_backend_top_k_sampling,          true  },
     { "multi_sequence",  test_backend_multi_sequence_sampling, true  },
+    { "multi_sequence_greedy", test_backend_multi_sequence_greedy_sampling, true },
     { "dist",            test_backend_dist_sampling,           true  },
     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },
     { "set_sampler",     test_backend_set_sampler,             true  },
