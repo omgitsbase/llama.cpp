@@ -61,7 +61,7 @@ uint64_t llama_draft_vocab_fingerprint(const std::vector<llama_draft_vocab_token
 
 bool llama_draft_vocab_off() {
     const char * env = getenv("LLAMA_DRAFT_VOCAB");
-    return env == nullptr || env[0] == '\0' || strcmp(env, "off") == 0 || strcmp(env, "0") == 0;
+    return env != nullptr && (strcmp(env, "off") == 0 || strcmp(env, "0") == 0);
 }
 
 // getenv returns ANSI code page bytes under MSVC, which u8path rejects
@@ -76,7 +76,9 @@ static fs::path llama_draft_vocab_env_dir() {
 }
 
 std::string llama_draft_vocab_path(const std::string & path_model, uint64_t fp) {
-    if (llama_draft_vocab_off()) {
+    // counts are kept only where LLAMA_DRAFT_VOCAB says; unset, the head is ranked without them
+    const char * env = getenv("LLAMA_DRAFT_VOCAB");
+    if (llama_draft_vocab_off() || env == nullptr || env[0] == '\0') {
         return {};
     }
     char name[64];

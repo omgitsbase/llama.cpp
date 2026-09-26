@@ -45,7 +45,7 @@ std::vector<llama_draft_vocab_token> llama_draft_vocab_tokens(const llama_vocab 
 // FNV-1a-64 over n_vocab and the token texts: attributes are rewritten at load, the texts are not
 uint64_t llama_draft_vocab_fingerprint(const std::vector<llama_draft_vocab_token> & tokens);
 
-// no reduced head unless LLAMA_DRAFT_VOCAB is "on" (counts next to the model) or a directory for the counts
+// LLAMA_DRAFT_VOCAB=off or 0: no reduced head; "on" keeps its counts next to the model, a directory keeps them there
 bool llama_draft_vocab_off();
 
 // the counts file for a vocabulary, empty when there is none; never throws

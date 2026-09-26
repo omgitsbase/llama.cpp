@@ -1719,7 +1719,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ggml_tensor * draft_src = nullptr;
     const bool mtp_draft = llama_model_has_mtp_head(this) && has_mtp_round() && !getenv("LLAMA_MTP_FULL_HEAD");
     const bool dft_model = params.draft_head && !mtp_draft && output_b == nullptr && (output_s == nullptr || ggml_nelements(output_s) == 1);
-    if ((mtp_draft || dft_model) && split_mode != LLAMA_SPLIT_MODE_TENSOR && !llama_draft_vocab_off()) {
+    // MTP drafts through the reduced head unless LLAMA_DRAFT_VOCAB=off; a draft model only when LLAMA_DRAFT_VOCAB is set
+    const bool dv_model = dft_model && getenv("LLAMA_DRAFT_VOCAB") != nullptr;
+    if ((mtp_draft || dv_model) && split_mode != LLAMA_SPLIT_MODE_TENSOR && !llama_draft_vocab_off()) {
         ggml_tensor * shared = mtp_draft ? layers[hparams.n_layer()].nextn.shared_head_head : nullptr;
         ggml_tensor * head   = shared ? shared : output;
         const int64_t n      = LLAMA_DRAFT_VOCAB_ROWS;
