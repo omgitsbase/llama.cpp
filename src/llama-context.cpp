@@ -4198,11 +4198,13 @@ int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n
     }
 
     // the attention part of the memory, for its rows and masks
-    const llama_kv_cache_context * mkv = nullptr;
-    if (llama_model_is_hybrid(&model)) {
-        mkv = static_cast<const llama_memory_hybrid_context *>(mctx.get())->get_attn();
-    } else {
-        mkv = static_cast<const llama_kv_cache_context *>(mctx.get());
+    const llama_kv_cache_context * mkv = dynamic_cast<const llama_kv_cache_context *>(mctx.get());
+    if (const auto * hyb = dynamic_cast<const llama_memory_hybrid_context *>(mctx.get())) {
+        mkv = hyb->get_attn();
+    }
+    if (mkv == nullptr) {
+        LLAMA_LOG_ERROR("%s: the loop needs a plain or hybrid KV cache\n", __func__);
+        return -1;
     }
     const int64_t n_kv = mkv->get_n_kv();
 

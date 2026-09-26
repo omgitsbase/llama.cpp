@@ -6589,13 +6589,16 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 // stop id. The host launches once and waits. Every call of the backend's
 // compute on the way there is a real iteration. Returns 2 when the loop ran
 // on the device, 1 when the host had to step it, 0 on failure.
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12030
+#define GGML_CUDA_LOOP_ON_DEVICE
 static __global__ void ggml_cuda_loop_cond_kernel(cudaGraphConditionalHandle handle, const float * counter, const float n_iter, const int32_t * tok, const int32_t stop) {
     const unsigned keep = (*counter < n_iter) && (*tok != stop);
     cudaGraphSetConditional(handle, keep);
 }
+#endif
 
 static int ggml_backend_cuda_loop(ggml_backend_t backend, ggml_cgraph * cgraph, const ggml_tensor * counter, int n_iter, const ggml_tensor * tok, int32_t stop) {
-#ifndef USE_CUDA_GRAPH
+#ifndef GGML_CUDA_LOOP_ON_DEVICE
     GGML_UNUSED(counter); GGML_UNUSED(tok); GGML_UNUSED(stop);
     for (int i = 0; i < n_iter; ++i) {
         if (ggml_backend_cuda_graph_compute(backend, cgraph) != GGML_STATUS_SUCCESS) {
