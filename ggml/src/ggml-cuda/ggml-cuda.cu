@@ -2988,7 +2988,6 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
-static int  ggml_cuda_fuse_off_mask();
 
 // An elementwise node: f32, contiguous, one of the ops the chain kernel
 // speaks, and for a binary op a second operand that broadcasts onto it.
@@ -3702,9 +3701,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
-// try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_fuse_off_mask() {
-    static const int mask = getenv("GGML_CUDA_FUSE_OFF") ? std::atoi(getenv("GGML_CUDA_FUSE_OFF")) : 0;
+// bits: 1 empty-skip, 2 l2 pair, 4 expert-sum, 8 nscale, 128 elt_chain, 256 norm fold / add+rms,
+// 512 float fold reader, 1024 quantized fold reader, 4096 matvec weight prefetch before the PDL wait,
+// 8192 matvec release after its own wait, 16384 quantize_q8_1_rms norm weight before the wait
+uint64_t ggml_cuda_fuse_off_mask() {
+    static const uint64_t mask = getenv("GGML_CUDA_FUSE_OFF") ? std::strtoull(getenv("GGML_CUDA_FUSE_OFF"), nullptr, 0) : 0;
     return mask;
 }
 

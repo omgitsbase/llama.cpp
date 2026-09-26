@@ -39,7 +39,25 @@ static __global__ void mul_mat_vec_f(
     int channel_y;
     int sample_dst;
 
+    if constexpr (!is_multi_token_id) {
+        if (fusion.pf_bytes != 0) {
+            constexpr int ws   = ggml_cuda_get_physical_warp_size();
+            const int     warp = tid / ws;
+            const int64_t offset = int64_t(fastdiv((uint32_t) blockIdx.z, sample_ratio))*stride_sample_x
+                + int64_t(fastdiv((uint32_t) channel_dst, channel_ratio))*stride_channel_x + int64_t(row)*stride_row;
+            if (warp == 0) {
+                ggml_cuda_prefetch_l2_warp(x + offset, fusion.pf_bytes, tid % ws);
+            }
+            // the gate row goes to the second warp when there is one
+            if (has_fusion && fusion.gate != nullptr && warp == (block_size > ws ? 1 : 0)) {
+                ggml_cuda_prefetch_l2_warp((const T *) fusion.gate + offset, fusion.pf_bytes, tid % ws);
+            }
+        }
+    }
     ggml_cuda_pdl_sync();
+    if (fusion.release) {
+        ggml_cuda_pdl_lc();
+    }
     if constexpr (is_multi_token_id) {
         // Multi-token MUL_MAT_ID path, adding these in the normal path causes a perf regression for n_tokens=1 case
         token_idx  = blockIdx.z;
@@ -322,7 +340,9 @@ static __global__ void mul_mat_vec_f(
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
 
-    ggml_cuda_pdl_lc();
+    if (!fusion.release) {
+        ggml_cuda_pdl_lc();
+    }
     // every column's warp sums go up together, one barrier where there were two per column; each column still
     // reduces over the same lanes in the same order
 #pragma unroll
@@ -472,52 +492,59 @@ void launch_mul_mat_vec_f_cuda(
     const int nbytes_shared = ncols_dst*warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
+
+    ggml_cuda_mm_fusion_args_device fusion_pf = fusion;
+    if (fusion.pf_bytes != 0) {
+        const bool pdl = ggml_cuda_kernel_uses_pdl((const void *) mul_mat_vec_f<T, type_acc, ncols_dst, 32, false, is_multi_token_id>);
+        fusion_pf.pf_bytes = pdl ? ggml_cuda_mv_prefetch_bytes(fusion.pf_bytes, fusion.gate ? 2 : 1,
+            (int64_t) nrows*nchannels_dst*nsamples_or_ntokens, ggml_cuda_info().devices[device].nsm) : 0;
+    }
     switch (block_size_best) {
         case   32: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 32, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case   64: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 64, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case   96: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 96, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  128: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 128, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  160: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 160, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  192: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 192, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  224: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 224, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  256: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 256, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                (x, y, ids, fusion_pf, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
@@ -741,6 +768,13 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    const uint64_t fo = ggml_cuda_fuse_off_mask();
+    if (!ids && !(fo & 4096) && ggml_cuda_tensor_is_constant(src0) &&
+            (fusion == nullptr || fusion->gate == nullptr || ggml_cuda_tensor_is_constant(fusion->gate))) {
+        fusion_local.pf_bytes = ne00*ts_src0; // at most a whole row; the launch sizes it to its grid
+    }
+    fusion_local.release = !(fo & 8192);
 
     switch (src0->type) {
         case GGML_TYPE_F32: {

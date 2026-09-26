@@ -132,6 +132,24 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// the calling warp asks for [p, p + nbytes) to be brought into L2, one 128-byte line per lane and step;
+// a hint only, it writes nothing and orders nothing
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2_warp(const void * p, const uint32_t nbytes, const int lane) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__)
+    const size_t g = __cvta_generic_to_global(p);
+    for (uint32_t off = 128*lane; off < nbytes; off += 128*WARP_SIZE) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(g + off));
+    }
+    if (lane == 0 && nbytes > 128) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(g + nbytes - 1));
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(nbytes);
+    GGML_UNUSED(lane);
+#endif
+}
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
@@ -1598,6 +1616,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    // mmvf launch hints: weight bytes per row to prefetch before the PDL wait, and releasing dependents right after it
+    uint32_t pf_bytes = 0;
+    bool     release  = false;
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -1704,16 +1725,28 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
 # define GGML_CUDA_RESTRICT __restrict__
 # endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 
-template<typename Kernel, typename... Args>
-static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
-#if defined(GGML_CUDA_USE_PDL)
-
-    static const bool env_pdl_enabled = []() {
+static bool ggml_cuda_pdl_env_enabled() {
+    static const bool enabled = []() {
         const char * env = getenv("GGML_CUDA_PDL");
         return env == nullptr || std::atoi(env) != 0;
     }();
+    return enabled;
+}
 
-    if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
+// whether ggml_cuda_kernel_launch starts this kernel with PDL on the current device
+static bool ggml_cuda_kernel_uses_pdl(const void * kernel) {
+#if defined(GGML_CUDA_USE_PDL)
+    return ggml_cuda_pdl_env_enabled() && ggml_cuda_kernel_can_use_pdl(kernel);
+#else
+    GGML_UNUSED(kernel);
+    return false;
+#endif // defined(GGML_CUDA_USE_PDL)
+}
+
+template<typename Kernel, typename... Args>
+static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
+#if defined(GGML_CUDA_USE_PDL)
+    if (ggml_cuda_kernel_uses_pdl(reinterpret_cast<const void *>(kernel))) {
         auto pdl_cfg = ggml_cuda_pdl_config(launch_params);
 
         CUDA_CHECK(cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... ));
@@ -1725,3 +1758,59 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     CUDA_CHECK(cudaGetLastError());
 }
 
+// GGML_CUDA_FUSE_OFF, one bit per path that can be turned off for an A/B (table next to its definition)
+uint64_t ggml_cuda_fuse_off_mask();
+
+// ggml_is_constant's rule: the data cannot change while graphs run, so a kernel may read it before its PDL wait
+static bool ggml_cuda_tensor_is_constant(const ggml_tensor * t) {
+    const ggml_tensor * root = t->view_src ? t->view_src : t;
+    return t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ((t->flags | root->flags) & GGML_TENSOR_FLAG_PARAM) == 0;
+}
+
+// resident blocks per SM of a kernel at a block size, cached per device
+static int ggml_cuda_max_active_blocks(const void * kernel, const int threads, const size_t smem) {
+    struct cache_key {
+        int          device;
+        const void * kernel;
+        int          threads;
+        size_t       smem;
+
+        bool operator==(const cache_key & other) const {
+            return device == other.device && kernel == other.kernel && threads == other.threads && smem == other.smem;
+        }
+    };
+
+    struct cache_key_hash {
+        size_t operator()(const cache_key & key) const {
+            size_t h = std::hash<const void *>()(key.kernel);
+            h ^= std::hash<size_t>()(key.smem*1024 + key.threads) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(key.device) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    static std::mutex                                         cache_mutex;
+    static std::unordered_map<cache_key, int, cache_key_hash> cache;
+
+    const cache_key             key = { ggml_cuda_get_device(), kernel, threads, smem };
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto                  it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    int nblocks = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nblocks, kernel, threads, smem));
+    cache.emplace(key, nblocks);
+    return nblocks;
+}
+
+// the weight bytes per row a matvec CTA prefetches into L2 before its PDL wait: whole rows while the
+// grid's weights fit 32 KB per SM, otherwise a 4 KB prefix per CTA
+static uint32_t ggml_cuda_mv_prefetch_bytes(const int64_t row_bytes, const int rows_per_cta, const int64_t nctas, const int nsm) {
+    if (nctas*rows_per_cta*row_bytes <= (int64_t) nsm*32768) {
+        return (uint32_t) row_bytes;
+    }
+    return (uint32_t) std::min<int64_t>(row_bytes, 4096/rows_per_cta);
+}
