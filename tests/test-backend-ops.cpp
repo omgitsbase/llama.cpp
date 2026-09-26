@@ -4685,8 +4685,7 @@ struct test_mul_mat_weights : public test_case {
         : type_a(type_a), m(m), n(n), k(k), row0(row0) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        GGML_UNUSED(ctx);
-        GGML_ABORT("needs the weights context");
+        return build_graph(ctx, ctx);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
@@ -6423,7 +6422,7 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        GGML_ASSERT(!use_weight_context());
+        GGML_ASSERT(!(use_id && with_lane_scale));
         return build_graph(ctx, nullptr);
     }
 
@@ -6434,7 +6433,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             std::array<int64_t, 4> ne       = { k, m, channels, samples };
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
-            ggml_context * ctx_w = weights ? ctx_weights : ctx;
+            ggml_context * ctx_w = weights && ctx_weights ? ctx_weights : ctx;
             ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
             ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx_w, type, 4, ne0.data()) : nullptr;
             ggml_tensor * up   = ggml_new_tensor(ctx_w, type, 4, ne0.data());
@@ -6477,7 +6476,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_set_name(out, "out");
             return out;
         } else {
-            ggml_context * ctx_w = weights ? ctx_weights : ctx;
+            ggml_context * ctx_w = weights && ctx_weights ? ctx_weights : ctx;
             ggml_tensor * gates = ggml_new_tensor_3d(ctx_w, type, k, n, n_mats);
             ggml_tensor * ups   = ggml_new_tensor_3d(ctx_w, type, k, n, n_mats);
             ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
