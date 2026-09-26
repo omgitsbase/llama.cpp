@@ -562,7 +562,7 @@ static __global__ void quantize_mmq_q8_1(
 template <int block_size>
 __launch_bounds__(block_size, 1)
 static __global__ void quantize_q8_1_rms(
-        const float * __restrict__ x, const float * __restrict__ w, const float eps, void * __restrict__ vy, float * __restrict__ scale_out,
+        const float * x_ptr, const float * w_ptr, const float eps, void * vy_ptr, float * scale_out_ptr,
         const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int ne0, const int ne1, const uint3 ne2) {
     ggml_cuda_pdl_lc();
@@ -573,8 +573,10 @@ static __global__ void quantize_q8_1_rms(
     const int tid = threadIdx.x;
     const int64_t row = ((int64_t) i3*ne2.z + i2) * ne1 + i1;
 
-    x += i3*s03 + i2*s02 + i1*s01;
-    block_q8_1 * y = (block_q8_1 *) vy + row * (ne0 / QK8_1);
+    const float * GGML_CUDA_RESTRICT x         = x_ptr + i3*s03 + i2*s02 + i1*s01;
+    const float * GGML_CUDA_RESTRICT w         = w_ptr;
+    float       * GGML_CUDA_RESTRICT scale_out = scale_out_ptr;
+    block_q8_1  * GGML_CUDA_RESTRICT y         = (block_q8_1 *) vy_ptr + row * (ne0 / QK8_1);
 
     ggml_cuda_pdl_sync();
     float tmp = 0.0f;
@@ -652,7 +654,7 @@ void rms_apply_cuda(const float * x, const float * w, const float * scale, float
 template <int block_size>
 __launch_bounds__(block_size, 1)
 static __global__ void rms_scale(
-        const float * __restrict__ x, const float eps, float * __restrict__ scale_out,
+        const float * x_ptr, const float eps, float * scale_out_ptr,
         const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int ne1, const uint3 ne2) {
     ggml_cuda_pdl_lc();
@@ -661,7 +663,8 @@ static __global__ void rms_scale(
     const int i2  = blockIdx.y - i3*ne2.z;
     const int tid = threadIdx.x;
 
-    x += i3*s03 + i2*s02 + i1*s01;
+    const float * GGML_CUDA_RESTRICT x         = x_ptr + i3*s03 + i2*s02 + i1*s01;
+    float       * GGML_CUDA_RESTRICT scale_out = scale_out_ptr;
 
     ggml_cuda_pdl_sync();
     float tmp = 0.0f;

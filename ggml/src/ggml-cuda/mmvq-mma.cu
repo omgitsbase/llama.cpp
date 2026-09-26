@@ -53,10 +53,13 @@ template <> struct mmvq_mma_traits<GGML_TYPE_IQ3_XXS> {
 template <ggml_type type, int ncols_dst, bool has_fusion>
 __launch_bounds__(mmvq_mma_nwarps*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q_mma(
-        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const ggml_cuda_mm_fusion_args_device fusion,
-        float * __restrict__ dst, const int nblocks_row, const int nrows_x, const int stride_row_x, const int stride_col_y,
+        const void * vx_ptr, const block_q8_1 * y_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst_ptr, const int nblocks_row, const int nrows_x, const int stride_row_x, const int stride_col_y,
         const int stride_col_dst) {
 #if defined(TURING_MMA_AVAILABLE)
+    const void       * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const block_q8_1 * GGML_CUDA_RESTRICT y   = y_ptr;
+    float            * GGML_CUDA_RESTRICT dst = dst_ptr;
     typedef mmvq_mma_traits<type>   traits;
     typedef typename traits::block block;
     constexpr int blocks_q8 = QK_K/QK8_1;
@@ -207,7 +210,7 @@ static __global__ void mul_mat_vec_q_mma(
         dst[col*stride_col_dst + row] = result;
     }
 #else
-    GGML_UNUSED_VARS(vx, y, fusion, dst, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
+    GGML_UNUSED_VARS(vx_ptr, y_ptr, fusion, dst_ptr, nblocks_row, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
     NO_DEVICE_CODE;
 #endif // defined(TURING_MMA_AVAILABLE)
 }

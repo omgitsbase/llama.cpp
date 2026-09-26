@@ -22,8 +22,11 @@ void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int 
 // columns so a warp reads 512 bytes per expert row, and the expert loop is
 // unrolled; columns of one token's experts are s1 apart, tokens s2 apart.
 template <int n_expert>
-static __global__ void sum_expert_rows_f32(const float * __restrict__ x, float * __restrict__ dst,
+static __global__ void sum_expert_rows_f32(const float * x_ptr, float * dst_ptr,
                                            const int ne0, const int64_t s1, const int64_t s2) {
+    ggml_cuda_pdl_sync();
+    const float * GGML_CUDA_RESTRICT x   = x_ptr;
+    float       * GGML_CUDA_RESTRICT dst = dst_ptr;
     const int t    = blockIdx.y;
     const int col4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
     if (col4 >= ne0) {
@@ -39,8 +42,11 @@ static __global__ void sum_expert_rows_f32(const float * __restrict__ x, float *
     *(float4 *) (dst + t*ne0 + col4) = acc;
 }
 
-static __global__ void sum_expert_rows_f32_any(const float * __restrict__ x, float * __restrict__ dst,
+static __global__ void sum_expert_rows_f32_any(const float * x_ptr, float * dst_ptr,
                                                const int ne0, const int n_expert, const int64_t s1, const int64_t s2) {
+    ggml_cuda_pdl_sync();
+    const float * GGML_CUDA_RESTRICT x   = x_ptr;
+    float       * GGML_CUDA_RESTRICT dst = dst_ptr;
     const int t   = blockIdx.y;
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= ne0) {
