@@ -1357,10 +1357,11 @@ private:
         }
 
         {
+            // LLAMA_DECODE_CHAIN=0 turns it off
             const char * env  = getenv("LLAMA_DECODE_CHAIN");
-            const bool   want = env && atoi(env) != 0;
+            const bool   want = env == nullptr || atoi(env) != 0;
             chain_on = want && !spec && params_base.sampling.backend_sampling && llama_decode_chain_enable(ctx_tgt);
-            if (want) {
+            if (want && params_base.sampling.backend_sampling) {
                 SRV_INF("decode chain %s\n", chain_on ? "on" : "off");
             }
         }
