@@ -10,7 +10,7 @@ seed ranking decides, and without one the vocabulary's own order does. This writ
     python scripts/draft-vocab-seed.py model.gguf --fingerprint
 
 ranking.npy holds token ids, most frequent first (int32). Point LLAMA_DRAFT_VOCAB at out_dir, or put the file next
-to the model.
+to the model and set LLAMA_DRAFT_VOCAB=on.
 """
 
 import argparse
@@ -33,8 +33,9 @@ HEADER  = struct.Struct("<IIIIQQ")
 def token_texts(path: str) -> list[bytes]:
     reader = gguf.GGUFReader(path)
     field = reader.fields["tokenizer.ggml.tokens"]
-    # the engine reads a token's text as a C string
-    return [bytes(field.parts[i]).split(b"\0")[0] for i in field.data]
+    # the engine reads a token's text as a C string and renames an empty one
+    texts = [bytes(field.parts[i]).split(b"\0")[0] for i in field.data]
+    return [t if t else f"[EMPTY_{i}]".encode() for i, t in enumerate(texts)]
 
 
 def fingerprint(texts: list[bytes]) -> int:

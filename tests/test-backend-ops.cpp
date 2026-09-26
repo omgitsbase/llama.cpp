@@ -9536,6 +9536,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {65536,  1, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1, 65536, 1, 1, 1, false));
+    // a draft model's reduced logits scattered into a -inf row, the ids broadcast over the outputs
+    test_cases.emplace_back(new test_fill(-INFINITY, GGML_TYPE_F32, {1, 262144, 4, 1}));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, {1, 262144, 1, 1}, {4, 1}, 65536));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, {1, 1024, 1, 1}, {3, 1}, 256));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
