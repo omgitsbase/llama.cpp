@@ -18,6 +18,7 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
+struct llama_draft_head;
 struct llama_layer;
 
 struct llama_memory_context_i;
@@ -1004,6 +1005,8 @@ struct llm_graph_params {
     const llama_loop_state       * loop;
     const llama_decode_chain_state * chain;
 
+    const llama_draft_head * draft_head; // a chained MTP round drafts through it, see build_mtp_round
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1088,7 +1091,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (cparams.mtp_chain != other.cparams.mtp_chain) {
+        if (cparams.mtp_chain != other.cparams.mtp_chain || draft_head != other.draft_head) {
             return false;
         }
 
@@ -1176,6 +1179,7 @@ public:
     bool chain_bad = false;
     // the recurrent states gathered into their step rows
     int32_t n_step_states = 0;
+    bool draft_head_unused = false;       // the MTP head did not multiply by the rows the draft head holds
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1264,6 +1268,11 @@ struct llm_graph_context {
     llama_tokens_dev_state * tokens_dev;
     const llama_loop_state       * loop;
     const llama_decode_chain_state * chain;
+
+    const llama_draft_head * draft_head;
+
+    // while set, build_lora_mm multiplies by draft_head->w where it would multiply by this
+    mutable const ggml_tensor * mm_subst = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

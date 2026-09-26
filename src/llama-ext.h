@@ -107,6 +107,11 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // state. 0 restores one step per decode.
 LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, int32_t n);
 
+// tokens of a sequence the target produced (prompt, samples, accepted drafts), noted on the drafter's context: it
+// drafts through the full LM head while the sequence's text is mostly outside its reduced one, and the counts rank
+// the reduced head's rows at the next load (LLAMA_DRAFT_VOCAB sets where they are kept, "off" keeps none)
+LLAMA_API void llama_draft_note_tokens(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens);
+
 // ids drafted by the last chained MTP decode, n of them
 LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx, int32_t * n);
 

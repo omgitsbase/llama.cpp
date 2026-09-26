@@ -26,11 +26,13 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1054,6 +1056,9 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    llama_draft_head draft_head;
+    std::mutex       draft_head_mutex;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1268,6 +1273,30 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     const auto kv = LLM_KV(arch);
 
     vocab.load(ml, kv);
+}
+
+// ids are ascending, so the rows for one span of the head land in one span of the draft head
+static void llama_model_fill_draft_head(const ggml_tensor * head, ggml_tensor * draft, ggml_tensor * draft_ids, const std::vector<int32_t> & ids) {
+    const int64_t n = (int64_t) ids.size();
+    ggml_backend_tensor_set(draft_ids, ids.data(), 0, n*sizeof(int32_t));
+
+    const size_t  row   = head->nb[1];
+    const int64_t chunk = std::max<int64_t>(1, (64 << 20) / row);
+    std::vector<uint8_t> src(chunk*row);
+    std::vector<uint8_t> dst(chunk*row);
+    int64_t k = 0;
+    for (int64_t r0 = 0; r0 < head->ne[1] && k < n; r0 += chunk) {
+        const int64_t r1 = std::min(head->ne[1], r0 + chunk);
+        if (ids[k] >= r1) {
+            continue;
+        }
+        ggml_backend_tensor_get(head, src.data(), r0*row, (r1 - r0)*row);
+        const int64_t k0 = k;
+        for (; k < n && ids[k] < r1; ++k) {
+            memcpy(dst.data() + (k - k0)*row, src.data() + (ids[k] - r0)*row, row);
+        }
+        ggml_backend_tensor_set(draft, dst.data(), k0*row, (k - k0)*row);
+    }
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -1687,6 +1716,55 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
 
+    // An MTP round drafts through a copy of the LM head's rows for the ranked tokens (llama-draft-vocab.h) when
+    // the head is on a GPU and the copy leaves out at least a quarter of it. It is added to ctxs_bufs even without
+    // allocation so that memory fitting counts it.
+    ggml_tensor * draft_src = nullptr;
+    if (llama_model_has_mtp_head(this) && has_mtp_round() && split_mode != LLAMA_SPLIT_MODE_TENSOR && !getenv("LLAMA_MTP_FULL_HEAD")) {
+        const auto & nextn = layers[hparams.n_layer()].nextn;
+        ggml_tensor * head = nextn.shared_head_head ? nextn.shared_head_head : output;
+        const int64_t n    = LLAMA_DRAFT_VOCAB_ROWS;
+
+        ggml_backend_buffer_type_t buft = nullptr;
+        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            if (head && !bufs.empty() && ggml_get_tensor(ctx.get(), head->name) == head) {
+                buft = ggml_backend_buffer_get_type(bufs[0].get());
+            }
+        }
+        ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        const bool on_gpu = dev && buft == ggml_backend_dev_buffer_type(dev) &&
+            (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU);
+
+        if (on_gpu && head->ne[1] >= (int64_t) vocab.n_tokens() && 3*(int64_t) vocab.n_tokens() >= 4*n) {
+            ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+            ggml_context_ptr ctx { ggml_init(ip) };
+            ggml_tensor * draft     = ggml_new_tensor_2d(ctx.get(), head->type, head->ne[0], n);
+            ggml_tensor * draft_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n);
+            ggml_set_name(draft,     "output_draft.weight");
+            ggml_set_name(draft_ids, "output_draft_ids.weight");
+            ggml_backend_buffer_t buf = ml.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) : ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            if (buf == nullptr) {
+                LLAMA_LOG_WARN("%s: no memory for the MTP draft head, MTP drafts with the full head\n", __func__);
+            } else {
+                if (ml.no_alloc) {
+                    draft->buffer     = buf;
+                    draft_ids->buffer = buf;
+                }
+                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                std::vector<ggml_backend_buffer_ptr> bufs;
+                bufs.emplace_back(buf);
+                pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+
+                auto & dh = pimpl->draft_head;
+                dh.src   = head;
+                dh.w     = draft;
+                dh.ids   = draft_ids;
+                dh.saved = 1.0f - (float) n / (float) vocab.n_tokens();
+                draft_src = head;
+            }
+        }
+    }
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -1720,6 +1798,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    if (draft_src) {
+        const int64_t t0 = ggml_time_us();
+        auto & dh = pimpl->draft_head;
+
+        const auto tokens = llama_draft_vocab_tokens(vocab);
+        dh.fp   = llama_draft_vocab_fingerprint(tokens);
+        dh.path = llama_draft_vocab_path(path_model, dh.fp);
+
+        llama_draft_vocab_counts counts;
+        const bool have = !dh.path.empty() && llama_draft_vocab_read(dh.path, dh.fp, (uint32_t) tokens.size(), counts);
+
+        const char * source = nullptr;
+        const auto ids = llama_draft_vocab_rank(tokens, dh.w->ne[1], have ? &counts : nullptr, &source);
+        llama_model_fill_draft_head(draft_src, dh.w, dh.ids, ids);
+
+        dh.mask.assign(tokens.size(), 0);
+        uint64_t n_covered = 0;
+        for (const int32_t id : ids) {
+            dh.mask[id] = 1;
+            n_covered += have ? counts.counts[id] : 0;
+        }
+        uint64_t n_counted = 0;
+        for (const uint32_t c : counts.counts) {
+            n_counted += c;
+        }
+
+        LLAMA_LOG_INFO("%s: MTP drafts through %" PRId64 " of the %" PRId64 " LM head rows (%.1f MiB, ranked by %s, built in %.0f ms)\n",
+            __func__, dh.w->ne[1], draft_src->ne[1], ggml_nbytes(dh.w) / 1024.0 / 1024.0, source, (ggml_time_us() - t0) / 1000.0);
+        LLAMA_LOG_INFO("%s: draft vocabulary counts: %s, %" PRIu64 " tokens, %.2f%% of them covered\n", __func__,
+            dh.path.empty() ? "off" : dh.path.c_str(), counts.n_seen, n_counted > 0 ? 100.0 * n_covered / n_counted : 0.0);
     }
 
     if (use_mmap_buffer) {
@@ -1777,6 +1887,27 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+const llama_draft_head * llama_model::draft_head() const {
+    return pimpl->draft_head.w ? &pimpl->draft_head : nullptr;
+}
+
+void llama_model::release_draft_head() const {
+    std::lock_guard<std::mutex> lock(pimpl->draft_head_mutex);
+    auto & dh = pimpl->draft_head;
+    if (!dh.w) {
+        return;
+    }
+    const ggml_tensor * w = dh.w;
+    for (auto it = pimpl->ctxs_bufs.begin(); it != pimpl->ctxs_bufs.end(); ++it) {
+        if (ggml_get_tensor(it->first.get(), w->name) == w) {
+            pimpl->ctxs_bufs.erase(it);
+            break;
+        }
+    }
+    dh = {};
+    LLAMA_LOG_INFO("%s: the MTP head does not read the LM head's rows, its draft head is freed\n", __func__);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

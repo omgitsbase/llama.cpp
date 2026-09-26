@@ -1634,6 +1634,7 @@ void llm_graph_result::reset() {
     t_candidates.clear();
     t_mtp_ids.clear();
     t_mtp_hpend = nullptr;
+    draft_head_unused = false;
 
     chain_ok  = false;
     chain_bad = false;
@@ -1804,6 +1805,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     tokens_dev       (params.tokens_dev),
     loop             (params.loop),
     chain            (params.chain),
+    draft_head       (params.draft_head),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1830,6 +1832,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    if (mm_subst && w == mm_subst && (!w_s || ggml_nelements(w_s) == 1)) {
+        ggml_tensor * res = ggml_mul_mat(ctx0, draft_head->w, cur);
+        return w_s ? ggml_mul(ctx0, res, w_s) : res;
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {
@@ -3017,15 +3024,30 @@ const llm_graph_mtp_attn & attn,
         return ggml_add(ctx0, m, extra);
     };
 
+    // the chain drafts through the reduced head where the MTP head multiplies by the LM head it was taken from;
+    // an adapter on that head keeps the full one
+    bool reduced = draft_head != nullptr;
+    for (const auto & lora : *loras) {
+        reduced = reduced && lora.first->get_weight(draft_head->src) == nullptr;
+    }
+    const int64_t n_draft = reduced ? draft_head->w->ne[1] : 0;
+
     for (int j = 0; j < K; ++j) {
         ggml_tensor * h_next = mtp.mtp_step(tok, h, pos_chain(j), V + j, false, mask_chain(j));
         cb(h_next, "mtp_chain_h", j);
 
+        mm_subst = reduced ? draft_head->src : nullptr;
         ggml_tensor * logits_j = mtp.mtp_head(h_next);
+        mm_subst = nullptr;
         cb(logits_j, "mtp_chain_logits", j);
 
         // the drafted token leaves the graph as an id; nothing else is read back
         ggml_tensor * next = ggml_argmax(ctx0, logits_j);
+        if (reduced && logits_j->ne[0] == n_draft) {
+            next = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, draft_head->ids, 1, n_draft), next), 1);
+        } else if (reduced) {
+            res->draft_head_unused = true;
+        }
         cb(next, "mtp_chain_next", j);
         ggml_set_output(next);
         ggml_build_forward_expand(gf, next);

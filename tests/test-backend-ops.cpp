@@ -9532,6 +9532,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {151936, 1, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 4, 1, 1}));
+    // a reduced MTP draft head: argmax over its rows, then that row's token id
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {65536,  1, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1, 65536, 1, 1, 1, false));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));

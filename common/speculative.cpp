@@ -182,12 +182,57 @@ struct common_speculative_impl {
     virtual bool arm_verify(llama_context * /*ctx_tgt*/, llama_seq_id /*seq_id*/, llama_pos /*pos0*/, int32_t /*n*/) { return false; }
 };
 
+// The tokens a drafter's vocabulary counts (llama_draft_note_tokens): a sequence's rows in a batch are a prompt,
+// noted whole, or a verify, whose first row is the target's and whose drafts are noted once accepted.
+struct common_speculative_draft_notes {
+    std::vector<llama_tokens> drafts; // per sequence, the drafts of the last verify batch
+
+    // skip: sequences whose rows the caller notes itself
+    void process(llama_context * ctx, const llama_batch & batch, int32_t n_max, const std::vector<bool> * skip = nullptr) {
+        for (auto & d : drafts) {
+            d.clear();
+        }
+        for (int32_t k = 0; k < batch.n_tokens; ) {
+            const llama_seq_id seq_id = batch.seq_id[k][0];
+            int32_t n_rows = 1;
+            while (k + n_rows < batch.n_tokens && batch.seq_id[k + n_rows][0] == seq_id) {
+                n_rows++;
+            }
+            if (skip && seq_id >= 0 && (size_t) seq_id < skip->size() && (*skip)[seq_id]) {
+                k += n_rows;
+                continue;
+            }
+            if (n_rows > n_max + 1) {
+                llama_draft_note_tokens(ctx, seq_id, batch.token + k, n_rows);
+            } else if (seq_id >= 0) {
+                llama_draft_note_tokens(ctx, seq_id, batch.token + k, 1);
+                if (drafts.size() <= (size_t) seq_id) {
+                    drafts.resize(seq_id + 1);
+                }
+                drafts[seq_id].assign(batch.token + k + 1, batch.token + k + n_rows);
+            }
+            k += n_rows;
+        }
+    }
+
+    void accept(llama_context * ctx, llama_seq_id seq_id, int32_t n_accepted) {
+        if (seq_id < 0 || (size_t) seq_id >= drafts.size()) {
+            return;
+        }
+        auto & d = drafts[seq_id];
+        llama_draft_note_tokens(ctx, seq_id, d.data(), std::min<int32_t>(n_accepted, (int32_t) d.size()));
+        d.clear();
+    }
+};
+
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
 
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
+
+    common_speculative_draft_notes notes;
 
     common_speculative_impl_draft_simple(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, n_seq)
@@ -267,6 +312,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
     bool process(const llama_batch & batch) override {
         auto * ctx_dft = params.ctx_dft;
+
+        if (batch.token && batch.seq_id) {
+            notes.process(ctx_dft, batch, params.n_max);
+        }
 
         llama_batch batch_dft = batch;
         batch_dft.logits = nullptr;
@@ -389,8 +438,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        notes.accept(params.ctx_dft, seq_id, n_accepted);
     }
 };
 
@@ -1329,6 +1378,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
     int32_t n_chain       = 0;       // > 0: the whole draft round runs as one graph, see draft_chained()
+    common_speculative_draft_notes notes;
 
     // a chained round replays the verify batch of every drafting sequence in one decode, launched in process() right
     // behind the verify when its inputs can come from the target's graph and from the host otherwise, see chain_launch()
@@ -1805,6 +1855,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 chain_reset(seq);
                 continue;
             }
+            // a verify batch: only its first token is the target's, the rest are drafts until accepted
+            llama_draft_note_tokens(ctx_dft, seq, batch_in.token + beg, 1);
             cs.replay_tok.assign(batch_in.token + beg, batch_in.token + beg + n_rows);
             cs.replay_pos.assign(batch_in.pos   + beg, batch_in.pos   + beg + n_rows);
             cs.replay_n   = n_rows;
@@ -1815,6 +1867,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         if (!all_deferred) {
+            notes.process(ctx_dft, batch_in, this->params.n_max, &is_deferred);
+
             common_batch_clear(batch);
 
             // each row pairs with the target's hidden row of its sequence's row before it
@@ -1933,6 +1987,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        if (batch_in.token && batch_in.seq_id) {
+            notes.process(ctx_dft, batch_in, this->params.n_max);
+        }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -2184,6 +2242,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto & cs = chain[seq_id];
             cs.last_accepted = n_accepted;
             if (cs.defer_last) {
+                llama_draft_note_tokens(params.ctx_dft, seq_id, cs.replay_tok.data() + 1, std::min<int32_t>(n_accepted, cs.replay_n - 1));
                 // a verify batch this drafter did not decode: the anchor's hidden
                 // row is the target's row after the ones it accepted
                 cs.defer_last = false;
@@ -2193,6 +2252,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return;
             }
         }
+
+        notes.accept(params.ctx_dft, seq_id, n_accepted);
 
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
@@ -2816,6 +2877,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        result.draft_head            = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) != params.speculative.types.end();
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;

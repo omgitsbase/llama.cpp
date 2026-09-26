@@ -1290,6 +1290,57 @@ void llama_context::set_mtp_chain(int32_t k) {
     cparams.mtp_chain = k;
 }
 
+// Spanish, a quarter of it outside a 65,536-row head on a 248,320-token vocabulary, drafts about as fast either
+// way; the thresholds scale with the share of the head the reduced one leaves out
+void llama_context::draft_note_tokens(llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens) {
+    const llama_draft_head * dh = model.draft_head();
+    if (!dh || !tokens || n_tokens <= 0) {
+        return;
+    }
+    if (!draft_counter && !dh->path.empty()) {
+        draft_counter = std::make_unique<llama_draft_vocab_counter>(dh->path, dh->fp, (uint32_t) dh->mask.size());
+    }
+    if (draft_counter) {
+        draft_counter->note(tokens, n_tokens);
+    }
+    if (seq_id < 0 || seq_id >= (llama_seq_id) cparams.n_seq_max) {
+        return;
+    }
+    if (draft_miss.size() <= (size_t) seq_id) {
+        draft_miss.resize(seq_id + 1, 0.0f);
+        draft_full.resize(seq_id + 1, 0);
+    }
+    float & miss = draft_miss[seq_id];
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            continue;
+        }
+        const bool out = tokens[i] < 0 || (size_t) tokens[i] >= dh->mask.size() || !dh->mask[tokens[i]];
+        miss += ((out ? 1.0f : 0.0f) - miss) / 64.0f;
+    }
+    const float scale = dh->saved / 0.736f;
+    const bool  full  = draft_full[seq_id] ? miss > 0.10f*scale : miss > 0.15f*scale;
+    if (full != (bool) draft_full[seq_id]) {
+        draft_full[seq_id] = full;
+        LLAMA_LOG_INFO("%s: seq %d drafts with the %s LM head (%.0f%% of recent tokens outside the reduced one)\n", __func__,
+            seq_id, full ? "full" : "reduced", 100.0f * miss);
+    }
+}
+
+const llama_draft_head * llama_context::draft_head_for(const llama_ubatch & ubatch) const {
+    const llama_draft_head * dh = model.draft_head();
+    if (!dh || cparams.mtp_chain == 0) {
+        return nullptr;
+    }
+    for (uint32_t s = 0; ubatch.seq_id_unq && s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        if (seq_id >= 0 && (size_t) seq_id < draft_full.size() && draft_full[seq_id]) {
+            return nullptr;
+        }
+    }
+    return dh;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1491,6 +1542,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             res->chain_ok = res->chain_ok && !res->chain_bad && inp_chain && res->t_inp_tokens == inp_chain->tokens &&
                             res->n_step_states == (memory ? memory->n_step_states() : 0);
+        }
+        if (res->draft_head_unused) {
+            model.release_draft_head();
         }
         if (rt.on) {
             const llama_kv_cache_context * mkv = nullptr;
@@ -2897,6 +2951,7 @@ llm_graph_params llama_context::graph_params(
         /*.tokens_dev  =*/ const_cast<llama_tokens_dev_state *>(&tokens_dev),
         /*.loop        =*/ loop_cur,
         /*.chain       =*/ chain_info.enabled && !loop_cur && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? &chain : nullptr,
+        /*.draft_head  =*/ draft_head_for(ubatch),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4230,6 +4285,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_set_mtp_chain(llama_context * ctx, int32_t k) {
     ctx->set_mtp_chain(k);
+}
+
+void llama_draft_note_tokens(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens) {
+    ctx->draft_note_tokens(seq_id, tokens, n_tokens);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

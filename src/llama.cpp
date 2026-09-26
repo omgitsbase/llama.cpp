@@ -363,6 +363,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        model->path_model = fname;
+
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }

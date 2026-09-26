@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-arch.h"
+#include "llama-draft-vocab.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
@@ -742,6 +743,14 @@ struct llama_model {
     // (llm_graph_context::build_mtp_round), so the draft runs one decode per
     // round with the accept decided on the device
     virtual bool has_mtp_round() const { return false; }
+
+    // the reduced head a chained MTP round drafts through, nullptr when there is none
+    const llama_draft_head * draft_head() const;
+
+    // frees the reduced head when the MTP head turns out not to read the LM head's rows
+    void release_draft_head() const;
+
+    std::string path_model; // the file the model was loaded from, empty when there is none
 
 protected:
     llama_model_params params;

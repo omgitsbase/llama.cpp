@@ -7,11 +7,13 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-draft-vocab.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -148,6 +150,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_chain(int32_t k);
+    void draft_note_tokens(llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens);
     void flush_outputs();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -387,6 +390,14 @@ private:
 
     // the recurrent states a seq_rm of a chained step put back, copied on the stream ahead of the next graph
     void flush_step_restores();
+
+    // per sequence, the share of recent tokens outside the reduced draft head (a moving average over about 64)
+    // and whether its chained rounds draft through the full head
+    std::vector<float>   draft_miss;
+    std::vector<uint8_t> draft_full;
+    std::unique_ptr<llama_draft_vocab_counter> draft_counter;
+
+    const llama_draft_head * draft_head_for(const llama_ubatch & ubatch) const;
 
     llama_loop_state          loop;
     bool                      loop_on_device = false; // the last loop ran as one device graph
