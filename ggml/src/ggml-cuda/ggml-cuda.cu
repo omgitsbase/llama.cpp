@@ -4688,7 +4688,6 @@ static int ggml_cuda_try_glu_pair_at(ggml_backend_cuda_context & ctx, const ggml
         if (ggml_cuda_try_mm_glu_pair(ctx, gate_mm, up_mm, gate_b, up_b, glu)) {
             return n_ops - 1;
         }
-        }
     }
     return 0;
 }

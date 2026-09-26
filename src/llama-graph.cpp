@@ -2775,7 +2775,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
 bool llm_graph_context::is_chain_form() const {
     return chain && chain->n_cm > 0 && !loop && ubatch.token && ubatch.n_tokens <= (uint32_t) chain->n_cm &&
-           !(tokens_dev && tokens_dev->enabled && ubatch.n_tokens <= llama_tokens_dev_state::n_max);
+           !(tokens_dev && tokens_dev->use_dev(ubatch));
 }
 
 llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv * inp) {

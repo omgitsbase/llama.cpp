@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_decode_chain_enable
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"

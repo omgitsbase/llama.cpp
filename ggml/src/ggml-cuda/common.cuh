@@ -1465,14 +1465,14 @@ struct ggml_cuda_stream_context {
     }
 };
 
-// GGML_CUDA_FUSE_OFF, parsed once; see its definition for the bits
+// GGML_CUDA_FUSE_OFF, one bit per path that can be turned off for an A/B (table next to its definition)
 uint64_t ggml_cuda_fuse_off_mask();
 
-// a tensor in a weights buffer: no graph writes it, so a kernel may read it before waiting on its producer
+// ggml_is_constant's rule: the data cannot change while graphs run, so a kernel may read it before its PDL wait
 static bool ggml_cuda_tensor_is_constant(const ggml_tensor * t) {
     const ggml_tensor * root = t->view_src ? t->view_src : t;
-    return root->buffer && ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-        !(root->flags & GGML_TENSOR_FLAG_PARAM);
+    return t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ((t->flags | root->flags) & GGML_TENSOR_FLAG_PARAM) == 0;
 }
 
 // the rms_norm factor from a row's sum of squares, with the division and the
@@ -1835,16 +1835,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
-}
-
-// GGML_CUDA_FUSE_OFF, one bit per path that can be turned off for an A/B (table next to its definition)
-uint64_t ggml_cuda_fuse_off_mask();
-
-// ggml_is_constant's rule: the data cannot change while graphs run, so a kernel may read it before its PDL wait
-static bool ggml_cuda_tensor_is_constant(const ggml_tensor * t) {
-    const ggml_tensor * root = t->view_src ? t->view_src : t;
-    return t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-        ((t->flags | root->flags) & GGML_TENSOR_FLAG_PARAM) == 0;
 }
 
 static int ggml_cuda_max_active_blocks(const void * kernel, const int threads, const size_t smem) {
