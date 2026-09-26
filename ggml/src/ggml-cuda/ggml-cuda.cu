@@ -3854,10 +3854,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // try and fuse nodes and return the number of nodes to skip
 // GGML_CUDA_FUSE_OFF (decimal or 0x): each bit set turns one path off.
 //   1 empty-skip, 2 l2 pair, 4 expert-sum, 8 nscale, 128 elt_chain, 256 norm fold / add+rms,
-//   512 float fold reader, 1024 quantized fold reader, 4096 matvec prefetch, 8192 matvec release,
+//   512 float fold reader, 1024 quantized fold reader, 2048 matvec pairs, 4096 matvec prefetch, 8192 matvec release,
 //   16384 norm weight read before the PDL wait (quantize_q8_1_rms, norm+rope), 65536 one_row, 131072 lane groups,
-//   67108864 multi-section rope in norm+rope(+set_rows), 4294967296 register-resident quantize_q8_1_rms,
-//   8589934592 topk_moe REDUX selection, 1<<37 ids-early prefetch, 1<<38 producer prefetch.
+//   262144 matvec epilogue, 524288 its one-column form, 1048576 gate/up pairs and merged GLU,
+//   4194304 a fold's float reader quantizes, 67108864 multi-section rope in norm+rope(+set_rows),
+//   1073741824 state fold, 4294967296 register-resident quantize_q8_1_rms, 8589934592 topk_moe REDUX selection,
+//   1<<34 get_rows into a copy, 1<<37 ids-early prefetch, 1<<38 producer prefetch.
 // GGML_CUDA_MMV_EXPERIMENTAL=0 turns the matvec bits in 0x2000037000 off together
 uint64_t ggml_cuda_fuse_off_mask() {
     static const uint64_t mask = [] {
