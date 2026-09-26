@@ -112,19 +112,23 @@ static __global__ void mul_mat_vec_f(
     const float2 * w2     = (const float2 *) fusion.norm_w;
     const float  * nscale = fusion.norm_scale;
 
+    // a warp's partial sum per column, all columns at once: [ncols_dst][warp_size], then the gate's the same
     extern __shared__ char data_mmv[];
     float * buf_iw = (float *) data_mmv;
     [[maybe_unused]] float * buf_iw_gate = nullptr;
     if constexpr (has_fusion) {
-        buf_iw_gate = (float *) (data_mmv + warp_size*sizeof(float));
+        buf_iw_gate = (float *) (data_mmv + ncols_dst*warp_size*sizeof(float));
     }
 
     if (block_size > warp_size) {
         if (tid < warp_size) {
-            buf_iw[tid] = 0.0f;
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    buf_iw_gate[tid] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                buf_iw[j*warp_size + tid] = 0.0f;
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        buf_iw_gate[j*warp_size + tid] = 0.0f;
+                    }
                 }
             }
         }
@@ -319,6 +323,8 @@ static __global__ void mul_mat_vec_f(
     }
 
     ggml_cuda_pdl_lc();
+    // every column's warp sums go up together, one barrier where there were two per column; each column still
+    // reduces over the same lanes in the same order
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
         sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
@@ -330,26 +336,27 @@ static __global__ void mul_mat_vec_f(
         }
 
         if (block_size > warp_size) {
-            buf_iw[tid/warp_size] = sumf[j];
+            buf_iw[j*warp_size + tid/warp_size] = sumf[j];
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    buf_iw_gate[tid/warp_size] = sumf_gate[j];
+                    buf_iw_gate[j*warp_size + tid/warp_size] = sumf_gate[j];
                 }
             }
-            __syncthreads();
-            if (tid < warp_size) {
-                sumf[j] = buf_iw[tid];
+        }
+    }
+    if (block_size > warp_size) {
+        __syncthreads();
+        if (tid < warp_size) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf[j] = buf_iw[j*warp_size + tid];
                 sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        sumf_gate[j] = buf_iw_gate[tid];
+                        sumf_gate[j] = buf_iw_gate[j*warp_size + tid];
                         sumf_gate[j] = warp_reduce_sum<warp_size>(sumf_gate[j]);
                     }
                 }
-            }
-
-            if (j < ncols_dst) {
-                __syncthreads();
             }
         }
     }
@@ -462,7 +469,7 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
-    const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+    const int nbytes_shared = ncols_dst*warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
     switch (block_size_best) {
