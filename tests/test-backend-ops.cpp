@@ -6757,6 +6757,100 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// rms_norm * w read by float, quantized and expert matvecs, so the CUDA norm fold
+// (factors and q8 copy made by its first reader) is taken
+struct test_norm_fold : public test_case {
+    const ggml_type type_f;
+    const ggml_type type_q;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool float_first;
+    const bool glu;
+    const bool split_view; // a view with another row length reads it too, which refuses the fold
+
+    std::vector<ggml_tensor *> checked;
+
+    test_norm_fold(ggml_type type_f, ggml_type type_q, int64_t n_embd, int64_t n_tokens,
+                   bool float_first = true, bool glu = false, bool split_view = false)
+        : type_f(type_f), type_q(type_q), n_embd(n_embd), n_tokens(n_tokens),
+          float_first(float_first), glu(glu), split_view(split_view) {}
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_f, type_q, n_embd, n_tokens, float_first, glu, split_view);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_FOLD";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("needs a weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        const int64_t n_expert = 8;
+        const int64_t n_used   = 2;
+        const int64_t n_ff     = 256;
+
+        checked.clear();
+
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * w   = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_embd);
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+
+        ggml_tensor * r_f = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_weights, type_f, n_embd, n_expert), cur);
+        ggml_tensor * r_q = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_weights, type_q, n_embd, n_ff), cur);
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
+        ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        ggml_tensor * exps = ggml_new_tensor_3d(ctx_weights, type_q, n_embd, n_ff, n_expert);
+        ggml_tensor * r_e  = ggml_mul_mat_id(ctx, exps, ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens), ids);
+
+        std::vector<ggml_tensor *> order;
+        if (float_first) {
+            order.push_back(r_f);
+        }
+        order.push_back(r_q);
+        if (glu) {
+            ggml_tensor * g = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_weights, type_q, n_embd, n_ff), cur);
+            ggml_tensor * u = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_weights, type_q, n_embd, n_ff), cur);
+            order.push_back(ggml_swiglu_split(ctx, g, u));
+        }
+        order.push_back(r_e);
+        if (!float_first) {
+            order.push_back(r_f);
+        }
+        if (split_view) {
+            ggml_tensor * v = ggml_reshape_2d(ctx, cur, n_embd / 2, 2 * n_tokens);
+            order.push_back(ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_weights, type_f, n_embd / 2, n_ff), v));
+        }
+
+        // the sums only fix the graph order of the readers
+        ggml_tensor * out = nullptr;
+        for (ggml_tensor * r : order) {
+            checked.push_back(r);
+            ggml_tensor * s = ggml_sum(ctx, r);
+            out = out ? ggml_add(ctx, out, s) : s;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -10385,6 +10479,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_mul_mat_epi(type, 64, 1, 2048, MM_EPI_RESIDUAL, {1, 1}, true));
+    }
+
+    for (ggml_type type_q : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n_embd : {768, 2048, 4096}) {
+            for (int64_t n_tokens = 1; n_tokens <= 4; ++n_tokens) {
+                for (bool float_first : {true, false}) {
+                    test_cases.emplace_back(new test_norm_fold(GGML_TYPE_F16, type_q, n_embd, n_tokens, float_first));
+                }
+                test_cases.emplace_back(new test_norm_fold(GGML_TYPE_F16, type_q, n_embd, n_tokens, true, true));
+            }
+        }
+    }
+    for (int64_t n_tokens : {1, 3}) {
+        test_cases.emplace_back(new test_norm_fold(GGML_TYPE_F32, GGML_TYPE_Q8_0, 2048, n_tokens));
+        test_cases.emplace_back(new test_norm_fold(GGML_TYPE_BF16, GGML_TYPE_Q8_0, 2048, n_tokens));
+        test_cases.emplace_back(new test_norm_fold(GGML_TYPE_F16, GGML_TYPE_Q8_0, 2048, n_tokens, true, false, true));
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
