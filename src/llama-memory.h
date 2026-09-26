@@ -109,6 +109,12 @@ struct llama_memory_i {
     // the ubatches applied next are chained steps, which seq_rm may undo
     virtual void set_chain_step(bool chain_step) { GGML_UNUSED(chain_step); }
 
+    // the last chained steps can no longer be undone from what they kept, e.g. because their graph did not run
+    virtual void forget_steps() {}
+
+    // the number of state tensors a chained step must gather for enable_step_rollback to hold
+    virtual int32_t n_step_states() const { return 0; }
+
     // the state copies a seq_rm of a chained step left: copy(src, dst) must run before the next graph, in stream order
     virtual void flush_step_restores(const std::function<void(ggml_tensor * src, ggml_tensor * dst)> & copy) { GGML_UNUSED(copy); }
 

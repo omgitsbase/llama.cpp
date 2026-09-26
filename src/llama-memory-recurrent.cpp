@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -163,6 +164,12 @@ bool llama_memory_recurrent::enable_step_rollback() {
         return true;
     }
 
+    // the recurrent step rollback is not validated yet: LLAMA_DECODE_CHAIN_RECURRENT=1 opts in
+    const char * env = getenv("LLAMA_DECODE_CHAIN_RECURRENT");
+    if (env == nullptr || atoi(env) == 0) {
+        return false;
+    }
+
     const int32_t n_layer = hparams.n_layer();
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
@@ -205,6 +212,14 @@ bool llama_memory_recurrent::enable_step_rollback() {
     LLAMA_LOG_INFO("%s: step rows = %7.2f MiB\n", __func__, total / (1024.0*1024.0));
 
     return !step_bufs.empty();
+}
+
+int32_t llama_memory_recurrent::n_step_states() const {
+    int32_t n = 0;
+    for (size_t il = 0; il < r_step_l.size(); ++il) {
+        n += r_step_l[il] ? 2 : 0;
+    }
+    return n;
 }
 
 ggml_tensor * llama_memory_recurrent::get_step_for(const ggml_tensor * t) const {
@@ -518,6 +533,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     for (const auto & [_, buf] : ctxs_bufs) {
         ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
     }
+    for (const auto & [_, buf] : step_bufs) {
+        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    }
     return ret;
 }
 
@@ -817,6 +835,9 @@ bool llama_memory_recurrent::get_can_shift() const {
 size_t llama_memory_recurrent::total_size() const {
     size_t size = 0;
     for (const auto & [_, buf] : ctxs_bufs) {
+        size += ggml_backend_buffer_get_size(buf.get());
+    }
+    for (const auto & [_, buf] : step_bufs) {
         size += ggml_backend_buffer_get_size(buf.get());
     }
 

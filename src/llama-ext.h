@@ -152,9 +152,8 @@ LLAMA_API bool llama_set_tokens_device_seq(struct llama_context * ctx, struct ll
 // Turns the chain form on for the context's small decodes. False, and nothing changes, when the context cannot chain.
 LLAMA_API bool llama_decode_chain_enable(struct llama_context * ctx);
 
-// Arms the next llama_decode: its batch row rows[k] takes, on the device, the token the backend sampler drew for batch
-// index idxs[k] of the last decode. The armed batch must have the last one's layout, every row armed. llama_decode
-// returns 3, and queues nothing, when it cannot run armed. False, and nothing armed, when the last decode cannot feed it.
+// Arms the next llama_decode: row rows[k] takes on the device the id sampled for index idxs[k] of the last decode.
+// It must repeat that layout, or llama_decode returns 3. False before llama_outputs_advance of an armed decode.
 LLAMA_API bool llama_set_tokens_sampled(struct llama_context * ctx, const int32_t * rows, const int32_t * idxs, int32_t n);
 
 // Waits for the outputs the accessors read: while an armed decode is queued, those of the decode before it.

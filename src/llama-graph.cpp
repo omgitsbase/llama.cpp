@@ -1638,6 +1638,8 @@ void llm_graph_result::reset() {
     chain_ok  = false;
     chain_bad = false;
 
+    n_step_states = 0;
+
     params = {};
 
     inputs.clear();
@@ -1800,8 +1802,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     mtp_round        (params.mtp_round),
     tokens_dev       (params.tokens_dev),
-    chain            (params.chain),
     loop             (params.loop),
+    chain            (params.chain),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2664,11 +2666,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         ggml_set_input(inp->tok_in);
 
         // the host ids land in tok_io first, so one gather serves host and device rows alike
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
-                    ggml_view_1d(ctx0, inp->tok_in, n, 0),
-                    ggml_view_1d(ctx0, io, n, chain->n_cm*ggml_element_size(io))));
+        ggml_tensor * table = ggml_set_1d_inplace(ctx0, io, ggml_view_1d(ctx0, inp->tok_in, n, 0),
+                chain->n_cm*ggml_element_size(io));
 
-        ggml_tensor * ids = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, io, 1, 2*chain->n_cm),
+        ggml_tensor * ids = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, table, 1, 2*chain->n_cm),
                 ggml_view_1d(ctx0, inp->tok_in, n, n*ggml_element_size(inp->tok_in)));
         inp->tokens = ggml_reshape_1d(ctx0, ids, n);
         cb(inp->tokens, "inp_tokens", -1);
@@ -4205,13 +4206,15 @@ ggml_tensor * llm_graph_context::build_rs(
     // {state_size, rs_size} -> {state_size, n_seqs}
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
 
-    // a chained step keeps the states it reads in the step rows of their cells, for seq_rm to put back
+    // a chained step gathers the states it reads into the step rows of their cells, for seq_rm to put back; only a
+    // plain gather is kept, since the state's readers must depend on the step rows
     if (step) {
         ggml_tensor * step_rows = ggml_view_2d(ctx0, step, state_size, n_seqs, step->nb[1], rs_head*step->nb[1]);
         if (output_states->op == GGML_OP_GET_ROWS && output_states->src[0] == states && output_states->src[1] == state_copy_main) {
             output_states = ggml_cpy(ctx0, output_states, step_rows);
+            res->n_step_states++;
         } else {
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_get_rows(ctx0, states, state_copy_main), step_rows));
+            res->chain_bad = true;
         }
     }
     ggml_build_forward_expand(gf, output_states);

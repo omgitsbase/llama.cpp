@@ -75,7 +75,6 @@ struct llama_context {
 
     bool has_backend_sampler(llama_seq_id seq_id) const;
 
-    // decode chain: see llama_decode_chain_enable and friends in llama-ext.h
     bool decode_chain_enable();
     bool set_tokens_sampled(const int32_t * rows, const int32_t * idxs, int32_t n);
     void outputs_wait();
@@ -384,6 +383,7 @@ private:
 
     bool decode_chain_check(const llama_batch & batch, const std::vector<std::pair<int32_t, int32_t>> & arm) const;
     void decode_chain_record(const llama_batch & batch, const llm_graph_result * res);
+    bool has_embeddings_layer_inp() const;
 
     // the recurrent states a seq_rm of a chained step put back, copied on the stream ahead of the next graph
     void flush_step_restores();

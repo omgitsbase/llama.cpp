@@ -1356,10 +1356,12 @@ private:
         }
 
         {
-            // LLAMA_DECODE_CHAIN=1 turns the chain on
-            const char * env = getenv("LLAMA_DECODE_CHAIN");
-            chain_on = !spec && params_base.sampling.backend_sampling && env && atoi(env) != 0 &&
-                       llama_decode_chain_enable(ctx_tgt);
+            const char * env  = getenv("LLAMA_DECODE_CHAIN");
+            const bool   want = env && atoi(env) != 0;
+            chain_on = want && !spec && params_base.sampling.backend_sampling && llama_decode_chain_enable(ctx_tgt);
+            if (want) {
+                SRV_INF("decode chain %s\n", chain_on ? "on" : "off");
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -4014,8 +4016,18 @@ private:
             if (llama_set_tokens_sampled(ctx_tgt, idx.data(), idx.data(), chain_n)) {
                 ret = llama_decode(ctx_tgt, view);
             }
-            if (ret != 0 && ret != 3) {
-                SRV_WRN("the chained decode failed (ret = %d); the step runs serially\n", ret);
+            if (ret < 0 || ret == 2) {
+                // as in the serial path: the memory no longer matches the slots' prompts
+                const std::string err = ret == -1 ? "Invalid input batch." : ret == 2 ? "Decode aborted." : "Compute error.";
+                SRV_ERR("%s chained decode, n = %d, ret = %d\n", err.c_str(), chain_n, ret);
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        send_error(slot, err);
+                        slot.release();
+                        slot.prompt_clear();
+                    }
+                }
+                throw std::runtime_error(err);
             }
             arm = ret == 0;
         }
@@ -4037,7 +4049,6 @@ private:
             return;
         }
 
-        // the queued decode consumes the tokens just read
         bool any = false;
         for (int32_t r = 0; r < chain_n; ++r) {
             server_slot & s = *rows[r];

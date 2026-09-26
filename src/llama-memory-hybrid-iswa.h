@@ -61,6 +61,8 @@ public:
     bool can_rollback_step() const override { return mem_attn->can_rollback_step() && mem_recr->can_rollback_step(); }
     bool enable_step_rollback() override { return mem_attn->enable_step_rollback() && mem_recr->enable_step_rollback(); }
     void set_chain_step(bool chain_step) override { mem_attn->set_chain_step(chain_step); mem_recr->set_chain_step(chain_step); }
+    void forget_steps() override { mem_attn->forget_steps(); mem_recr->forget_steps(); }
+    int32_t n_step_states() const override { return mem_attn->n_step_states() + mem_recr->n_step_states(); }
     void flush_step_restores(const std::function<void(ggml_tensor *, ggml_tensor *)> & copy) override {
         mem_attn->flush_step_restores(copy);
         mem_recr->flush_step_restores(copy);

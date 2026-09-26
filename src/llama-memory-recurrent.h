@@ -64,6 +64,8 @@ public:
     bool can_rollback_step() const override { return !step_bufs.empty(); }
     bool enable_step_rollback() override;
     void set_chain_step(bool chain_step) override { this->chain_step = chain_step; }
+    void forget_steps() override { step_reset(-1); }
+    int32_t n_step_states() const override;
     void flush_step_restores(const std::function<void(ggml_tensor *, ggml_tensor *)> & copy) override;
 
     // the rows a chained step gathers its input states into, for the state tensor t (an r_l or s_l); nullptr if none
@@ -120,8 +122,7 @@ public:
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
 
-    // A chained step reads its states from these rows, one per cell, and leaves them there: seq_rm of the step
-    // copies them back over what the step wrote, before the next decode.
+    // a chained step gathers its input states into these rows, one per cell; seq_rm of the step copies them back
     std::vector<ggml_tensor *> r_step_l;
     std::vector<ggml_tensor *> s_step_l;
 
