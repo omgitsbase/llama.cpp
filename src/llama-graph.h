@@ -1127,6 +1127,9 @@ public:
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
+    // the I32 id sampled on the device for output row i, or nullptr when the host finishes that row's sampling
+    ggml_tensor * get_sampled_id(int64_t i) const;
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 

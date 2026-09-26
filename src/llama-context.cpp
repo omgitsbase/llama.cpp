@@ -4385,8 +4385,12 @@ bool llama_context::get_last_rows(llama_seq_id seq, llama_pos pos0, int32_t n, i
         if (last_rows_seq[r] != seq || last_rows_pos[r] != pos0) {
             continue;
         }
+        const auto * res = static_cast<const llm_graph_result *>(gf_res_prev.get());
         for (int32_t i = 0; i < n; ++i) {
             if (last_rows_seq[r + i] != seq || last_rows_pos[r + i] != pos0 + i || last_rows_out[r + i] < 0) {
+                return false;
+            }
+            if (res == nullptr || res->get_sampled_id(last_rows_out[r] + i) == nullptr) {
                 return false;
             }
         }

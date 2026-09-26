@@ -391,11 +391,8 @@ void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
             mtp_round_copy(sched_tgt, sched, src_h, h_tgt, row_bytes * n_verify, h_off, (size_t) q.tgt_row*row_bytes);
 
             auto sampled_id = [&](int64_t i) {
-                ggml_tensor * src_c = res_tgt->t_sampled[q.tgt_out + i];
-                if (src_c == nullptr && q.tgt_out + i < (int64_t) res_tgt->t_candidates.size()) {
-                    src_c = res_tgt->t_candidates[q.tgt_out + i]; // the greedy sampler leaves one candidate
-                }
-                GGML_ASSERT(src_c && src_c->type == GGML_TYPE_I32 && "MTP round: the target must sample on the backend");
+                ggml_tensor * src_c = res_tgt->get_sampled_id(q.tgt_out + i);
+                GGML_ASSERT(src_c && "MTP round: the target must sample on the backend");
                 return src_c;
             };
             for (int64_t i = 0; i < n_verify; ) {
@@ -1657,6 +1654,14 @@ void llm_graph_result::reset() {
     ctx_compute.reset(ggml_init(params));
 
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+}
+
+ggml_tensor * llm_graph_result::get_sampled_id(int64_t i) const {
+    ggml_tensor * id = i < (int64_t) t_sampled.size() ? t_sampled[i] : nullptr;
+    if (id == nullptr && i < (int64_t) t_candidates.size() && t_candidates[i] && ggml_nelements(t_candidates[i]) == 1) {
+        id = t_candidates[i]; // the greedy sampler leaves one candidate
+    }
+    return id && id->type == GGML_TYPE_I32 ? id : nullptr;
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
