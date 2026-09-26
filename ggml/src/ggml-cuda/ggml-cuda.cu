@@ -3274,11 +3274,11 @@ static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml
         src->data == nullptr || ids->data == nullptr) {
         return false;
     }
-    // the cache is only written by graph nodes, and the id is uploaded before the graph starts
+    // the cache is only written by graph nodes, and the id is a leaf set before the graph starts
     const ggml_tensor * cache    = src->view_src ? src->view_src : src;
     const ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
     if (cache->buffer == nullptr || ggml_backend_buffer_get_usage(cache->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
-        !(ids_base->flags & GGML_TENSOR_FLAG_INPUT)) {
+        ids_base->op != GGML_OP_NONE) {
         return false;
     }
 
@@ -3340,9 +3340,12 @@ static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml
         ctx.state_writers_ready = true;
     }
 
-    // nothing may write the cache between the gather and its reader; a write before the gather
-    // only keeps the reader from loading the row before its wait
-    bool pre = true;
+    // nothing may write the cache between the gather and its reader; the row is loaded before the wait
+    // only when an earlier gated_delta_net, which exits after its own wait, orders all earlier work
+    bool pre = false;
+    for (int k = 0; k < g && !pre; ++k) {
+        pre = cgraph->nodes[k]->op == GGML_OP_GATED_DELTA_NET;
+    }
     for (const ggml_cuda_state_writer & w : ctx.state_writers) {
         if (w.node >= c) {
             break;
@@ -3372,7 +3375,9 @@ static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml
     fold.ids  = (const int32_t *) ids->data;
     fold.row  = src->nb[1] / sizeof(float);
     fold.pre  = pre && reader->op == GGML_OP_GATED_DELTA_NET;
+#ifdef GGML_CUDA_DEBUG
     GGML_LOG_DEBUG("%s: %s read in place by %s%s\n", __func__, node->name, reader->name, fold.pre ? " before its wait" : "");
+#endif
     return true;
 }
 

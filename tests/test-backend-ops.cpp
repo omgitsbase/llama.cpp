@@ -4519,7 +4519,6 @@ struct test_gdn_state_fold : public test_case {
         ggml_set_name(cache, "cache");
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1 + n_extra);
         ggml_set_name(ids, "ids");
-        ggml_set_input(ids);
 
         ggml_tensor * states     = ggml_reshape_2d(ctx, cache, D, cache->ne[1]);
         ggml_tensor * state_zero = ggml_view_1d(ctx, states, D * (zero_row >= 0), zero_row * states->nb[1] * (zero_row >= 0));
@@ -4628,7 +4627,6 @@ struct test_conv_state_fold : public test_case {
         ggml_set_name(cache, "cache");
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1 + n_extra);
         ggml_set_name(ids, "ids");
-        ggml_set_input(ids);
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_seq_tokens);
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
 
