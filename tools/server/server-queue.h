@@ -36,7 +36,7 @@ private:
         std::condition_variable cv;        // the worker sleeps on this until a yield starts
         std::exception_ptr      exception; // exception thrown while processing tasks, if any
         bool stop     = false;
-        bool busy     = false; // set by yield_to_queue(), cleared by the worker once it is done processing tasks
+        bool in_task  = false; // the worker is inside callback_new_task() for a task it took during a yield
         bool yielding = false; // work() is still running on the start_loop() thread
     };
     worker_t worker;

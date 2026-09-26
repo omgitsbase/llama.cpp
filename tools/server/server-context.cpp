@@ -827,6 +827,34 @@ struct srv_round_timing {
 };
 static srv_round_timing & srv_round_timer() { static srv_round_timing t; return t; }
 
+// LLAMA_ROUND_TIMING=1, plain decode: the host's time between the sync that ends one token and the next decode,
+// as medians per 100 tokens: the yield's end, post_decode (sampling, detokenize, send) and the loop back to decode
+struct srv_plain_timing {
+    bool    on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+    int64_t t_sync = 0, t_yield = 0, t_post = 0;
+    std::vector<float> yield, post, loop, total;
+    static float median(std::vector<float> & v) {
+        std::nth_element(v.begin(), v.begin() + v.size()/2, v.end());
+        return v[v.size()/2];
+    }
+    void decode_begin() {
+        const int64_t now = ggml_time_us();
+        if (t_sync && t_yield >= t_sync && t_post >= t_yield && now >= t_post) {
+            yield.push_back((t_yield - t_sync) / 1000.0f);
+            post .push_back((t_post  - t_yield) / 1000.0f);
+            loop .push_back((now     - t_post) / 1000.0f);
+            total.push_back((now     - t_sync) / 1000.0f);
+        }
+        t_sync = t_yield = t_post = 0;
+        if (total.size() == 100) {
+            fprintf(stderr, "[round] plain host gap (median ms): yield end %.4f  post_decode %.4f  loop %.4f  total %.4f\n",
+                    median(yield), median(post), median(loop), median(total));
+            yield.clear(); post.clear(); loop.clear(); total.clear();
+        }
+    }
+};
+static srv_plain_timing & srv_plain_timer() { static srv_plain_timing t; return t; }
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -2948,6 +2976,8 @@ private:
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
+                auto & spt = srv_plain_timer();
+                if (spt.on && spt.t_yield) { spt.t_post = ggml_time_us(); }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3766,10 +3796,12 @@ private:
             handoff_slot = nullptr;
             handoff_src  = nullptr;
         }
+        auto & spt = srv_plain_timer();
         queue_tasks.yield_to_queue([&]() {
             {
                 auto & srt = srv_round_timer();
                 const int64_t t0 = srt.on ? ggml_time_us() : 0;
+                if (spt.on && !spec) { spt.decode_begin(); }
                 ret = llama_decode(ctx_tgt, batch_view);
                 if (srt.on) { srt.decode += (ggml_time_us() - t0) / 1000.0; }
             }
@@ -3783,8 +3815,10 @@ private:
                 const int64_t t0 = srt.on ? ggml_time_us() : 0;
                 llama_synchronize(ctx_tgt);
                 if (srt.on) { srt.sync += (ggml_time_us() - t0) / 1000.0; }
+                if (spt.on) { spt.t_sync = ggml_time_us(); }
             }
         });
+        if (spt.on && spt.t_sync) { spt.t_yield = ggml_time_us(); }
 
         if (ret != 0) {
             {
