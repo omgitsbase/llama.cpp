@@ -11,12 +11,6 @@
 struct llama_vocab;
 struct ggml_tensor;
 
-// A reduced draft head: the LM head's rows for a ranked subset of the
-// vocabulary, which a chained MTP round drafts through in place of the full head.
-// The ranking works for any tokenizer: forced tokens, then the counts this
-// vocabulary has seen (kept in <dir>/<fingerprint>.draftvocab), then an optional
-// seed ranking from the same file, then the vocabulary's own order.
-
 #define LLAMA_DRAFT_VOCAB_ROWS     65536
 #define LLAMA_DRAFT_VOCAB_TRUSTED  16384 // counts rank the rows once this many tokens were seen
 
@@ -51,10 +45,10 @@ std::vector<llama_draft_vocab_token> llama_draft_vocab_tokens(const llama_vocab 
 // FNV-1a-64 over n_vocab and the token texts: attributes are rewritten at load, the texts are not
 uint64_t llama_draft_vocab_fingerprint(const std::vector<llama_draft_vocab_token> & tokens);
 
-// LLAMA_DRAFT_VOCAB=off: no reduced head and no counts
+// no reduced head unless LLAMA_DRAFT_VOCAB is "on" (counts next to the model) or a directory for the counts
 bool llama_draft_vocab_off();
 
-// the counts file for a vocabulary; empty when LLAMA_DRAFT_VOCAB=off or there is no directory
+// the counts file for a vocabulary, empty when there is none; never throws
 std::string llama_draft_vocab_path(const std::string & path_model, uint64_t fp);
 
 // false when the file is missing or was written for another vocabulary

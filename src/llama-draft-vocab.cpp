@@ -61,26 +61,41 @@ uint64_t llama_draft_vocab_fingerprint(const std::vector<llama_draft_vocab_token
 
 bool llama_draft_vocab_off() {
     const char * env = getenv("LLAMA_DRAFT_VOCAB");
-    return env && strcmp(env, "off") == 0;
+    return env == nullptr || env[0] == '\0' || strcmp(env, "off") == 0 || strcmp(env, "0") == 0;
+}
+
+// getenv returns ANSI code page bytes under MSVC, which u8path rejects
+static fs::path llama_draft_vocab_env_dir() {
+#if defined(_WIN32)
+    const wchar_t * env = _wgetenv(L"LLAMA_DRAFT_VOCAB");
+    return env ? fs::path(env) : fs::path();
+#else
+    const char * env = getenv("LLAMA_DRAFT_VOCAB");
+    return env ? fs::u8path(env) : fs::path();
+#endif
 }
 
 std::string llama_draft_vocab_path(const std::string & path_model, uint64_t fp) {
-    char name[64];
-    snprintf(name, sizeof(name), "%016" PRIx64 ".draftvocab", fp);
-
-    fs::path dir;
     if (llama_draft_vocab_off()) {
         return {};
     }
-    if (const char * env = getenv("LLAMA_DRAFT_VOCAB")) {
-        dir = fs::u8path(env);
-    } else if (!path_model.empty()) {
-        dir = fs::u8path(path_model).parent_path();
-    } else {
+    char name[64];
+    snprintf(name, sizeof(name), "%016" PRIx64 ".draftvocab", fp);
+
+    try {
+        fs::path dir = llama_draft_vocab_env_dir();
+        if (dir == fs::path("on") || dir == fs::path("1")) {
+            if (path_model.empty()) {
+                return {};
+            }
+            dir = fs::u8path(path_model).parent_path();
+        }
+        const auto p = (dir / fs::u8path(name)).u8string();
+        return std::string(p.begin(), p.end());
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: no draft vocabulary counts file: %s\n", __func__, e.what());
         return {};
     }
-    const auto p = (dir / fs::u8path(name)).u8string();
-    return std::string(p.begin(), p.end());
 }
 
 struct llama_draft_vocab_header {
@@ -100,11 +115,11 @@ enum llama_draft_vocab_status {
 };
 
 static llama_draft_vocab_status llama_draft_vocab_read_impl(const std::string & path, uint64_t fp, uint32_t n_vocab, llama_draft_vocab_counts & out) {
-    std::error_code ec;
-    if (!fs::exists(fs::u8path(path), ec)) {
-        return LLAMA_DRAFT_VOCAB_MISSING;
-    }
     try {
+        std::error_code ec;
+        if (!fs::exists(fs::u8path(path), ec)) {
+            return LLAMA_DRAFT_VOCAB_MISSING;
+        }
         llama_file f(path.c_str(), "rb");
         llama_draft_vocab_header hdr;
         if (f.size() < sizeof(hdr)) {
@@ -173,11 +188,16 @@ bool llama_draft_vocab_add(const std::string & path, uint64_t fp, const std::vec
         return false;
     }
 
-    std::error_code ec;
-    fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
-    if (ec) {
-        LLAMA_LOG_WARN("%s: cannot replace %s: %s\n", __func__, path.c_str(), ec.message().c_str());
-        fs::remove(fs::u8path(tmp), ec);
+    try {
+        std::error_code ec;
+        fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
+        if (ec) {
+            LLAMA_LOG_WARN("%s: cannot replace %s: %s\n", __func__, path.c_str(), ec.message().c_str());
+            fs::remove(fs::u8path(tmp), ec);
+            return false;
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: cannot replace %s: %s\n", __func__, path.c_str(), e.what());
         return false;
     }
     return true;
@@ -250,8 +270,7 @@ std::vector<int32_t> llama_draft_vocab_rank(
         return prior[a] < prior[b];
     };
 
-    // tokens a draft must be able to produce whatever the text: end of generation and bytes first, then the
-    // control and user-defined ones, at most an eighth of the rows
+    // forced rows are capped at n/8
     std::vector<int32_t> forced_a;
     std::vector<int32_t> forced_b;
     for (int32_t id = 0; id < n_vocab; ++id) {

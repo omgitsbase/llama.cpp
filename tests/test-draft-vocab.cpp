@@ -198,6 +198,39 @@ static void test_file(const fs::path & dir) {
     fs::remove(path);
 }
 
+static void set_env_dir(const char * value) {
+#if defined(_WIN32)
+    _wputenv_s(L"LLAMA_DRAFT_VOCAB", value ? fs::u8path(value).wstring().c_str() : L"");
+#else
+    if (value) {
+        setenv("LLAMA_DRAFT_VOCAB", value, 1);
+    } else {
+        unsetenv("LLAMA_DRAFT_VOCAB");
+    }
+#endif
+}
+
+static void test_env_path(const fs::path & dir) {
+    const std::string model = (dir / "m.gguf").u8string();
+
+    set_env_dir(nullptr);
+    CHECK(llama_draft_vocab_off() && llama_draft_vocab_path(model, 1).empty());
+    set_env_dir("off");
+    CHECK(llama_draft_vocab_off() && llama_draft_vocab_path(model, 1).empty());
+
+    set_env_dir("on");
+    CHECK(!llama_draft_vocab_off());
+    CHECK(llama_draft_vocab_path(model, 1) == (dir / "0000000000000001.draftvocab").u8string());
+    CHECK(llama_draft_vocab_path("", 1).empty());
+
+    // a non-ASCII directory, which is not in the ANSI code page on Windows
+    const fs::path dir_u8 = dir / fs::u8path("\xd1\x81\xd1\x87\xd1\x91\xd1\x82");
+    set_env_dir(dir_u8.u8string().c_str());
+    CHECK(llama_draft_vocab_path(model, 1) == (dir_u8 / "0000000000000001.draftvocab").u8string());
+
+    set_env_dir(nullptr);
+}
+
 int main(int argc, char ** argv) {
     const fs::path dir = argc > 1 ? fs::u8path(argv[1]) : fs::temp_directory_path();
 
@@ -205,6 +238,7 @@ int main(int argc, char ** argv) {
     test_prior();
     test_counts_and_seed();
     test_file(dir);
+    test_env_path(dir);
 
     printf("test-draft-vocab: OK\n");
     return 0;
