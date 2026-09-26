@@ -1048,6 +1048,7 @@ struct llama_model::impl {
     };
 
     layer_dev dev_input = {};
+    layer_dev dev_tok_embd = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
@@ -1372,6 +1373,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     } else {
         pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
     }
+    // the token table joins the device when every weight is there, so the lookup does not split the graph at every token;
+    // an override that sends weights to host memory keeps it on the CPU, where its VRAM would cost more than the split
+    bool overrides_to_host = false;
+    for (const auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
+        auto * o_dev = ggml_backend_buft_get_device(o->buft);
+        overrides_to_host = overrides_to_host || ggml_backend_buft_is_host(o->buft) ||
+            (o_dev && ggml_backend_dev_type(o_dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    const bool tok_embd_on_device = (input_env ? atoi(input_env) != 0 : !overrides_to_host) && n_gpu_layers > n_layer_all;
+    pimpl->dev_tok_embd = tok_embd_on_device ? get_layer_buft_list(0) : pimpl->dev_input;
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1709,8 +1720,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * buft_list_input = tn.tensor == LLM_TENSOR_TOKEN_EMBD ? pimpl->dev_tok_embd.buft_list : pimpl->dev_input.buft_list;
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 
