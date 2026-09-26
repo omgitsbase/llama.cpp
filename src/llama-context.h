@@ -333,6 +333,11 @@ private:
     // behind them waited for the whole verify
     struct output_copy { ggml_backend_t backend; ggml_tensor * tensor; void * dst; size_t size; };
     std::vector<output_copy> outputs_pending;
+    // rows whose bytes equal another output's row, filled on the host once that row has arrived
+    struct output_fill { void * dst; const void * src; size_t size; };
+    std::vector<output_fill> outputs_fill;
+    // the work epoch this context last waited for; synchronize() has nothing to wait for while it is current
+    uint64_t synced_epoch = 0;
     // pinned, so the id copies queue and are waited on once; a copy into pageable memory waits on its own
     ggml_backend_buffer_ptr mtp_ids_buf;
 

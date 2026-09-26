@@ -15,6 +15,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -758,7 +759,19 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// advanced before any context queues work on its backends, so a context that waited at the current value has nothing
+// in flight on its streams, including copies another context issued there
+static std::atomic<uint64_t> g_work_epoch{1};
+
+static void llama_work_queued() {
+    g_work_epoch.fetch_add(1);
+}
+
 void llama_context::flush_outputs() {
+    if (outputs_pending.empty()) {
+        return;
+    }
+    llama_work_queued();
     for (const auto & c : outputs_pending) {
         ggml_backend_tensor_get_async(c.backend, c.tensor, c.dst, 0, c.size);
     }
@@ -775,7 +788,17 @@ void llama_context::synchronize() {
 
     flush_outputs();
 
+    const uint64_t epoch = g_work_epoch.load();
+    if (epoch == synced_epoch && n_queued_tokens == 0 && outputs_fill.empty() && !llama_host_off(LLAMA_HOST_OFF_SYNC_ONCE)) {
+        return;
+    }
+
     ggml_backend_sched_synchronize(sched.get());
+    synced_epoch = epoch;
+    for (const auto & f : outputs_fill) {
+        memcpy(f.dst, f.src, f.size);
+    }
+    outputs_fill.clear();
     if (rt.on && ggml_time_us() - rt0 > 3000) {
         fprintf(stderr, "[round] sync ctx=%p waited %.2f ms\n", (void *) this, (ggml_time_us() - rt0) / 1000.0);
     }
@@ -1500,6 +1523,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    llama_work_queued();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1739,6 +1763,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    llama_work_queued();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1908,6 +1933,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (rt.on) { rt.p_t[2] = ggml_time_us(); }
     // outputs of an earlier decode nobody read: this one overwrites them
     outputs_pending.clear();
+    outputs_fill.clear();
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -2152,11 +2178,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const auto stride = n_vocab;
             const auto defer  = [this](ggml_backend_t b, ggml_tensor * t, void * d, size_t n) { outputs_pending.push_back({b, t, d, n}); };
 
+            // a candidate that is the sampled tensor itself (greedy) is not read back: its row is filled from the sampled id
+            const std::vector<ggml_tensor *> * t_candidates = &res->t_candidates;
+            std::vector<ggml_tensor *> t_candidates_left;
+            if (!llama_host_off(LLAMA_HOST_OFF_CAND_DEDUPE) && sampling.candidates.has_data() && sampling.sampled.has_data()) {
+                for (size_t i = 0; i < res->t_candidates.size(); ++i) {
+                    ggml_tensor * t = res->t_candidates[i];
+                    if (t == nullptr || i >= res->t_sampled.size() || t != res->t_sampled[i] || ggml_nelements(t) != 1) {
+                        continue;
+                    }
+                    if (t_candidates_left.empty()) {
+                        t_candidates_left = res->t_candidates;
+                        t_candidates      = &t_candidates_left;
+                    }
+                    const uint32_t row = n_outputs_prev + i;
+                    GGML_ASSERT(row < sampling.candidates_count.size() && (size_t) row*stride < sampling.candidates.size);
+                    outputs_fill.push_back({sampling.candidates.data + (size_t) row*stride, sampling.sampled.data + row, sizeof(llama_token)});
+                    sampling.candidates_count[row] = 1;
+                    t_candidates_left[i] = nullptr;
+                }
+            }
+
             // the sampling data comes back to the host at the first synchronize()
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get(), defer);
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), defer, &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), defer, &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), defer, &sampling.candidates_count);
+            copy_tensor_async_rows(*t_candidates,         sampling.candidates, stride, n_outputs_prev, sched.get(), defer, &sampling.candidates_count);
         }
 
         n_outputs_prev += n_outputs;
@@ -2712,6 +2759,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    llama_work_queued();
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -4059,6 +4107,7 @@ const llama_token * llama_context::get_mtp_chain_ids(int32_t & n) {
             }
         }
         llama_token * pinned = mtp_ids_buf ? (llama_token *) ggml_backend_buffer_get_base(mtp_ids_buf.get()) : dst;
+        llama_work_queued();
         for (size_t j = 0; j < k; ++j) {
             ggml_tensor * t = mtp_ids_pending[j];
             ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);

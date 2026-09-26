@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <sstream>
@@ -16,6 +17,14 @@ struct llama_logger_state {
 };
 
 static llama_logger_state g_logger_state;
+
+bool llama_host_off(uint32_t bit) {
+    static const uint32_t mask = [] {
+        const char * env = getenv("LLAMA_HOST_OFF");
+        return env ? (uint32_t) strtoul(env, nullptr, 0) : 0u;
+    }();
+    return (mask & bit) != 0;
+}
 
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
