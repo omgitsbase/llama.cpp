@@ -339,6 +339,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool draft_head;      // a draft model: it drafts through a copy of the LM head's rows for the likeliest tokens
     };
 
     struct llama_sampler_seq_config {

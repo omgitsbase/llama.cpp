@@ -1329,7 +1329,7 @@ void llama_context::draft_note_tokens(llama_seq_id seq_id, const llama_token * t
 
 const llama_draft_head * llama_context::draft_head_for(const llama_ubatch & ubatch) const {
     const llama_draft_head * dh = model.draft_head();
-    if (!dh || cparams.mtp_chain == 0) {
+    if (!dh || (!dh->whole && cparams.mtp_chain == 0)) {
         return nullptr;
     }
     for (uint32_t s = 0; ubatch.seq_id_unq && s < ubatch.n_seqs_unq; ++s) {

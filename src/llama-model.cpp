@@ -1716,14 +1716,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
 
-    // An MTP round drafts through a copy of the LM head's rows for the ranked tokens (llama-draft-vocab.h) when
-    // the head is on a GPU and the copy leaves out at least a quarter of it. It is added to ctxs_bufs even without
-    // allocation so that memory fitting counts it.
+    // An MTP round, or a draft model, drafts through a copy of the LM head's rows for the ranked tokens
+    // (llama-draft-vocab.h) when the head is on a GPU and the copy leaves out at least a quarter of it. It is added
+    // to ctxs_bufs even without allocation so that memory fitting counts it.
     ggml_tensor * draft_src = nullptr;
-    if (llama_model_has_mtp_head(this) && has_mtp_round() && split_mode != LLAMA_SPLIT_MODE_TENSOR && !getenv("LLAMA_MTP_FULL_HEAD")) {
-        const auto & nextn = layers[hparams.n_layer()].nextn;
-        ggml_tensor * head = nextn.shared_head_head ? nextn.shared_head_head : output;
-        const int64_t n    = LLAMA_DRAFT_VOCAB_ROWS;
+    const bool mtp_draft = llama_model_has_mtp_head(this) && has_mtp_round() && !getenv("LLAMA_MTP_FULL_HEAD");
+    const bool dft_model = params.draft_head && !mtp_draft && output_b == nullptr && (output_s == nullptr || ggml_nelements(output_s) == 1);
+    if ((mtp_draft || dft_model) && split_mode != LLAMA_SPLIT_MODE_TENSOR && !llama_draft_vocab_off()) {
+        ggml_tensor * shared = mtp_draft ? layers[hparams.n_layer()].nextn.shared_head_head : nullptr;
+        ggml_tensor * head   = shared ? shared : output;
+        const int64_t n      = LLAMA_DRAFT_VOCAB_ROWS;
 
         ggml_backend_buffer_type_t buft = nullptr;
         for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
@@ -1744,7 +1746,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_set_name(draft_ids, "output_draft_ids.weight");
             ggml_backend_buffer_t buf = ml.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) : ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
             if (buf == nullptr) {
-                LLAMA_LOG_WARN("%s: no memory for the MTP draft head, MTP drafts with the full head\n", __func__);
+                LLAMA_LOG_WARN("%s: no memory for the draft head, drafting uses the full LM head\n", __func__);
             } else {
                 if (ml.no_alloc) {
                     draft->buffer     = buf;
@@ -1760,6 +1762,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 dh.w     = draft;
                 dh.ids   = draft_ids;
                 dh.saved = 1.0f - (float) n / (float) vocab.n_tokens();
+                dh.whole = dft_model;
                 draft_src = head;
             }
         }
@@ -1826,8 +1829,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             n_counted += c;
         }
 
-        LLAMA_LOG_INFO("%s: MTP drafts through %" PRId64 " of the %" PRId64 " LM head rows (%.1f MiB, ranked by %s, built in %.0f ms)\n",
-            __func__, dh.w->ne[1], draft_src->ne[1], ggml_nbytes(dh.w) / 1024.0 / 1024.0, source, (ggml_time_us() - t0) / 1000.0);
+        LLAMA_LOG_INFO("%s: %s drafts through %" PRId64 " of the %" PRId64 " LM head rows (%.1f MiB, ranked by %s, built in %.0f ms)\n",
+            __func__, dh.whole ? "the draft model" : "MTP", dh.w->ne[1], draft_src->ne[1], ggml_nbytes(dh.w) / 1024.0 / 1024.0, source,
+            (ggml_time_us() - t0) / 1000.0);
         LLAMA_LOG_INFO("%s: draft vocabulary counts: %s, %" PRIu64 " tokens, %.2f%% of them covered\n", __func__,
             dh.path.empty() ? "off" : dh.path.c_str(), counts.n_seen, n_counted > 0 ? 100.0 * n_covered / n_counted : 0.0);
     }
@@ -1907,7 +1911,7 @@ void llama_model::release_draft_head() const {
         }
     }
     dh = {};
-    LLAMA_LOG_INFO("%s: the MTP head does not read the LM head's rows, its draft head is freed\n", __func__);
+    LLAMA_LOG_INFO("%s: the LM head is not read through its rows, the draft head is freed\n", __func__);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -2613,6 +2617,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
+    // a draft model's logits come from the reduced head; the rows it leaves out read -inf
+    llm->build_draft_logits();
+
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
@@ -2658,6 +2665,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.draft_head                  =*/ false,
     };
 
     return result;

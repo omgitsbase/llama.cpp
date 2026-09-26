@@ -27,6 +27,7 @@ struct llama_draft_head {
 
     std::vector<uint8_t> mask;   // [n_vocab] 1 when the token has a row
     float saved = 0.0f;          // share of the head's rows it leaves out
+    bool  whole = false;         // a draft model's: every graph of its contexts multiplies by it
 
     std::string path;            // the counts file contexts add to, empty for none
     uint64_t    fp = 0;          // the vocabulary's fingerprint
@@ -49,6 +50,9 @@ std::vector<llama_draft_vocab_token> llama_draft_vocab_tokens(const llama_vocab 
 
 // FNV-1a-64 over n_vocab and the token texts: attributes are rewritten at load, the texts are not
 uint64_t llama_draft_vocab_fingerprint(const std::vector<llama_draft_vocab_token> & tokens);
+
+// LLAMA_DRAFT_VOCAB=off: no reduced head and no counts
+bool llama_draft_vocab_off();
 
 // the counts file for a vocabulary; empty when LLAMA_DRAFT_VOCAB=off or there is no directory
 std::string llama_draft_vocab_path(const std::string & path_model, uint64_t fp);

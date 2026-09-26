@@ -1812,6 +1812,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+        if (draft_head && draft_head->whole) {
+            mm_subst = draft_head->src;
+            for (const auto & lora : *loras) {
+                mm_subst = lora.first->get_weight(draft_head->src) ? nullptr : mm_subst;
+            }
+        }
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -3189,6 +3195,34 @@ const llm_graph_mtp_attn & attn,
     ggml_build_forward_expand(gf, n_acc_i);
     ggml_build_forward_expand(gf, anchor_h);
     res->t_mtp_ids.push_back(n_acc_i);
+}
+
+void llm_graph_context::build_draft_logits() {
+    if (!mm_subst || !draft_head->whole) {
+        return;
+    }
+    mm_subst = nullptr;
+
+    ggml_tensor * logits  = res->t_logits;
+    const int64_t n_draft = draft_head->w->ne[1];
+    if (!logits) {
+        return;
+    }
+    if (logits->ne[0] != n_draft) {
+        res->draft_head_unused = true;
+        return;
+    }
+    if (!ggml_is_contiguous(logits)) {
+        logits = ggml_cont(ctx0, logits);
+    }
+    const int64_t n_vocab = draft_head->src->ne[1];
+    const int64_t n_out   = logits->ne[1];
+    ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+    full = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, logits, 1, n_draft, n_out), ggml_reshape_2d(ctx0, draft_head->ids, n_draft, 1));
+    full = ggml_reshape_2d(ctx0, full, n_vocab, n_out);
+    cb(full, "result_output", -1);
+    res->t_logits = full;
+    ggml_build_forward_expand(gf, full);
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {

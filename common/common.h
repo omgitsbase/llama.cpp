@@ -734,6 +734,7 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+    bool draft_head = false; // a draft model: it drafts through the LM head's rows for the likeliest tokens
 
     // TTS params
     std::string tts_lang = "";

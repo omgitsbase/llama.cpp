@@ -1005,7 +1005,7 @@ struct llm_graph_params {
     const llama_loop_state       * loop;
     const llama_decode_chain_state * chain;
 
-    const llama_draft_head * draft_head; // a chained MTP round drafts through it, see build_mtp_round
+    const llama_draft_head * draft_head; // the reduced head a drafter drafts through, see llama-draft-vocab.h
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1273,6 +1273,9 @@ struct llm_graph_context {
 
     // while set, build_lora_mm multiplies by draft_head->w where it would multiply by this
     mutable const ggml_tensor * mm_subst = nullptr;
+
+    // a draft model's reduced head: logits for every token, -inf for those it leaves out
+    void build_draft_logits();
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

@@ -59,15 +59,20 @@ uint64_t llama_draft_vocab_fingerprint(const std::vector<llama_draft_vocab_token
     return h;
 }
 
+bool llama_draft_vocab_off() {
+    const char * env = getenv("LLAMA_DRAFT_VOCAB");
+    return env && strcmp(env, "off") == 0;
+}
+
 std::string llama_draft_vocab_path(const std::string & path_model, uint64_t fp) {
     char name[64];
     snprintf(name, sizeof(name), "%016" PRIx64 ".draftvocab", fp);
 
     fs::path dir;
+    if (llama_draft_vocab_off()) {
+        return {};
+    }
     if (const char * env = getenv("LLAMA_DRAFT_VOCAB")) {
-        if (strcmp(env, "off") == 0) {
-            return {};
-        }
         dir = fs::u8path(env);
     } else if (!path_model.empty()) {
         dir = fs::u8path(path_model).parent_path();
