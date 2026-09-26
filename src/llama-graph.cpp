@@ -4615,6 +4615,10 @@ void llm_graph_context::build_sampling() const {
             res->t_candidates[r]     = id;
             res->t_sampled_logits[r] = lg;
         }
+        // the chain form's ids for the next decode, output row r at row r of tok_io
+        if (res->chain_ok) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ids, ggml_view_1d(ctx0, chain->tok_io, n_rows, 0)));
+        }
         return;
     }
 
