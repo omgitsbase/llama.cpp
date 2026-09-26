@@ -3256,8 +3256,8 @@ static bool ggml_cuda_ranges_overlap(const void * a, size_t na, const void * b, 
     return (const char *) a < (const char *) b + nb && (const char *) b < (const char *) a + na;
 }
 
-// a single-row gather from a recurrent state cache whose only reader is a gated_delta_net: the
-// reader takes the cache row in place and the gather is not launched
+// a single-row gather from a recurrent state cache whose only reader is a gated_delta_net, or the
+// concat that opens a conv window: the reader takes the cache row in place and the gather is not launched
 static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int g) {
     static const bool disabled = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION"))) ||
                                  (getenv("GGML_CUDA_GRAPH_OPT") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1);
@@ -3318,6 +3318,11 @@ static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml
                 return false;
             }
         }
+    } else if (reader->op == GGML_OP_CONCAT) {
+        // a conv state heading its input window
+        if (reader->src[0] != state || reader->src[1] == state || ggml_get_op_params_i32(reader, 0) == 3) {
+            return false;
+        }
     } else {
         return false;
     }
@@ -3366,8 +3371,8 @@ static bool ggml_cuda_try_state_fold(ggml_backend_cuda_context & ctx, const ggml
     fold.base = (const float *) src->data;
     fold.ids  = (const int32_t *) ids->data;
     fold.row  = src->nb[1] / sizeof(float);
-    fold.pre  = pre;
-    GGML_LOG_DEBUG("%s: %s read in place by %s%s\n", __func__, node->name, reader->name, pre ? " before its wait" : "");
+    fold.pre  = pre && reader->op == GGML_OP_GATED_DELTA_NET;
+    GGML_LOG_DEBUG("%s: %s read in place by %s%s\n", __func__, node->name, reader->name, fold.pre ? " before its wait" : "");
     return true;
 }
 

@@ -4581,6 +4581,95 @@ struct test_gdn_state_fold : public test_case {
     }
 };
 
+// a conv state gathered from its cache, joined with the new inputs and written back, in the node order
+// llama's build_rs and build_conv_state emit; the CUDA backend reads the cache row in place
+struct test_conv_state_fold : public test_case {
+    const int64_t d_conv;
+    const int64_t n_channels;
+    const int64_t n_seq_tokens;
+    const int64_t K;
+    const int     src_row;  // the row gathered
+    const int     zero_row; // the row cleared before the gather, -1 for none
+    const int     n_extra;  // rows copied past the sequence's own
+
+    static constexpr int64_t mem_size = 4;
+    static constexpr int64_t kv_head  = 1;
+
+    ggml_tensor * conv = nullptr;
+    ggml_tensor * last = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_STATE_FOLD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(d_conv, n_channels, n_seq_tokens, K, src_row, zero_row, n_extra);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { conv, last }; }
+
+    test_conv_state_fold(int64_t d_conv = 4, int64_t n_channels = 1024, int64_t n_seq_tokens = 1, int64_t K = 1,
+            int src_row = 1, int zero_row = -1, int n_extra = 0)
+        : d_conv(d_conv), n_channels(n_channels), n_seq_tokens(n_seq_tokens), K(K),
+          src_row(src_row), zero_row(zero_row), n_extra(n_extra) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t row = (d_conv - 1) * n_channels;
+        const auto expand = [&](ggml_tensor * t) {
+            if (mode != MODE_PERF) {
+                ggml_build_forward_expand(gf, t);
+            }
+        };
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, mem_size * K);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1 + n_extra);
+        ggml_set_name(ids, "ids");
+        ggml_set_input(ids);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_seq_tokens);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+
+        ggml_tensor * states     = ggml_reshape_2d(ctx, cache, row, cache->ne[1]);
+        ggml_tensor * state_zero = ggml_view_1d(ctx, states, row * (zero_row >= 0), zero_row * states->nb[1] * (zero_row >= 0));
+        expand(ggml_scale_inplace(ctx, state_zero, 0.0f));
+        ggml_tensor * state = ggml_get_rows(ctx, states, ggml_view_1d(ctx, ids, 1, 0));
+        expand(state);
+        ggml_tensor * extra = ggml_get_rows(ctx, states, ggml_view_1d(ctx, ids, n_extra, ids->nb[0]));
+        expand(ggml_cpy(ctx, extra, ggml_view_2d(ctx, cache, row, n_extra, cache->nb[1], (kv_head + 1) * cache->nb[1])));
+        state = ggml_reshape_3d(ctx, state, d_conv - 1, n_channels, 1);
+
+        ggml_tensor * input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx = std::max<int64_t>(0, input->ne[0] - (d_conv - 1) - K + t);
+            last = ggml_cpy(ctx,
+                    ggml_view_3d(ctx, input, d_conv - 1, n_channels, 1, input->nb[1], input->nb[2], ggml_row_size(GGML_TYPE_F32, s_idx)),
+                    ggml_view_2d(ctx, cache, row, 1, cache->nb[1], ((K - t) * mem_size + kv_head) * cache->nb[1]));
+            expand(last);
+        }
+        conv = ggml_silu(ctx, ggml_ssm_conv(ctx, input, w));
+        return conv;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> rows(1 + n_extra);
+                rows[0] = src_row;
+                for (int i = 1; i <= n_extra; ++i) {
+                    rows[i] = (src_row + i) % (mem_size * K);
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -10791,6 +10880,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_state_fold(4, 128, 4, 4, false, 1, -1, 1));
     test_cases.emplace_back(new test_gdn_state_fold(32, 128, 1, 1, false, 1));
     test_cases.emplace_back(new test_gdn_state_fold(48, 128, 4, 4, false, 5));
+
+    // the conv window: T of 1 takes the contiguous concat, T of 4 the strided one
+    for (int64_t T : { 1, 4 }) {
+        test_cases.emplace_back(new test_conv_state_fold(4, 1024, T, 1, 1));
+        test_cases.emplace_back(new test_conv_state_fold(4, 1024, T, 1, 3));
+        test_cases.emplace_back(new test_conv_state_fold(4, 1024, T, 4, 1));
+        test_cases.emplace_back(new test_conv_state_fold(4, 1024, T, 4, 9));
+        test_cases.emplace_back(new test_conv_state_fold(4, 1024, T, 1, 1, 1));
+        test_cases.emplace_back(new test_conv_state_fold(4, 1024, T, 1, 1, -1, 1));
+    }
+    test_cases.emplace_back(new test_conv_state_fold(4, 10240, 1, 1, 1));
+    test_cases.emplace_back(new test_conv_state_fold(4, 10240, 4, 4, 5));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

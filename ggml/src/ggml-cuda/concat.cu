@@ -12,11 +12,17 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(con
                                                                              int64_t   ne02,
                                                                              int64_t   ne0,
                                                                              int64_t   ne1,
-                                                                             int64_t   ne2) {
+                                                                             int64_t   ne2,
+                                                                             const int32_t * x_ids,
+                                                                             int64_t   x_row) {
     static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
 
     const int64_t n = ne0 * ne1 * ne2;
 
+    // x is a cache row picked by a graph input, uploaded before the graph starts
+    if (x_ids) {
+        x += x_ids[0] * x_row;
+    }
     ggml_cuda_pdl_sync();
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x * gridDim.x) {
         if constexpr (dim == 0) {
@@ -63,20 +69,22 @@ static void concat_cont_cuda(const T * x,
                              int64_t   ne1,
                              int64_t   ne2,
                              int       dim,
+                             const int32_t * x_ids,
+                             int64_t   x_row,
                              cudaStream_t stream) {
     const int64_t n          = ne0 * ne1 * ne2;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
 
     if (dim == 0) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
-        ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+        ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, x_ids, x_row);
         return;
     }
     if (dim == 1) {
-        concat_cont<T, 1><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+        concat_cont<T, 1><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, x_ids, x_row);
         return;
     }
-    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, x_ids, x_row);
 }
 
 // non-contiguous kernel (slow)
@@ -109,8 +117,14 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
           uint64_t   nb0,
           uint64_t   nb1,
           uint64_t   nb2,
-          uint64_t   nb3) {
+          uint64_t   nb3,
+    const int32_t *  src0_ids,
+           int64_t   src0_row) {
     static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
+
+    if (src0_ids) {
+        src0 += src0_ids[0] * src0_row;
+    }
 
     const int64_t i3 = blockIdx.z;
     const int64_t i2 = blockIdx.y;
@@ -140,9 +154,15 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 }
 
 template <typename T>
-static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream,
+                        const ggml_cuda_state_fold * fold = nullptr) {
+    // a folded src0 is a cache row read in place, with src0's layout
+    const char *    src0_data = fold ? (const char *) fold->base : (const char *) src0->data;
+    const int32_t * src0_ids  = fold ? fold->ids : nullptr;
+    const int64_t   src0_row  = fold ? fold->row * (int64_t) sizeof(float) : 0;
+    GGML_ASSERT(!fold || (dim != 3 && sizeof(T) == sizeof(float)));
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
-        const T * src0_d = (const T *) src0->data;
+        const T * src0_d = (const T *) src0_data;
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;
 
@@ -152,7 +172,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                     src1_d + i3*(src1->nb[3] / sizeof(T)),
                     dst_d  + i3*( dst->nb[3] / sizeof(T)),
                     ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
-                    ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, stream);
+                    ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, src0_ids, src0_row / (int64_t) sizeof(T), stream);
         }
     } else if (dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const size_t size0 = ggml_nbytes(src0);
@@ -166,13 +186,13 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
-                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0_data, (const char *) src1->data, (char *) dst->data,
                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
                 src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
                 src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
                 dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], src0_ids, src0_row);
         };
         switch (dim) {
             case 0:
@@ -204,6 +224,16 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(dst->type  == src0->type);
+
+    if (!ctx.state_folds.empty()) {
+        const auto it = ctx.state_folds.find(src0->view_src ? src0->view_src : src0);
+        if (it != ctx.state_folds.end()) {
+            const ggml_cuda_state_fold fold = it->second;
+            ctx.state_folds.erase(it);
+            concat_cuda<uint32_t>(src0, src1, dst, dim, stream, &fold);
+            return;
+        }
+    }
 
     if (ggml_is_quantized(src0->type)) {
         if (dim == 3) {
