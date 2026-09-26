@@ -590,6 +590,7 @@ static __global__ void mul_mat_vec_q(
     // the weights are constant, so their first bytes can be on their way into L2 while the producer finishes.
     // With ids the host asks for this only when an earlier kernel on this stream read the same ids after its
     // own wait, so they are final; they only choose what to prefetch, and are read again below after the wait
+#ifdef GGML_CUDA_PDL_DEVICE
     if (pf_bytes != 0 && threadIdx.y == 0) {
         const uint32_t channel_pf = ncols_dst == 1 && ids ? mmvq_ld_ids_early(ids + channel_dst) : fastdiv(channel_dst, channel_ratio);
         const int64_t  kb0 = (int64_t) fastdiv(blockIdx.z, sample_ratio)*stride_sample_x
@@ -604,6 +605,9 @@ static __global__ void mul_mat_vec_q(
             }
         }
     }
+#else
+    GGML_UNUSED_VARS(pf_bytes, nchannels_x);
+#endif // GGML_CUDA_PDL_DEVICE
     ggml_cuda_pdl_sync();
     if (release) {
         ggml_cuda_pdl_lc();

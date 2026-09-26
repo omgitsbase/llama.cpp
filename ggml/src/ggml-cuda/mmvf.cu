@@ -39,6 +39,7 @@ static __global__ void mul_mat_vec_f(
     int channel_y;
     int sample_dst;
 
+#ifdef GGML_CUDA_PDL_DEVICE
     if constexpr (!is_multi_token_id) {
         if (fusion.pf_bytes != 0) {
             constexpr int ws   = ggml_cuda_get_physical_warp_size();
@@ -54,6 +55,7 @@ static __global__ void mul_mat_vec_f(
             }
         }
     }
+#endif // GGML_CUDA_PDL_DEVICE
     ggml_cuda_pdl_sync();
     if (fusion.release) {
         ggml_cuda_pdl_lc();
