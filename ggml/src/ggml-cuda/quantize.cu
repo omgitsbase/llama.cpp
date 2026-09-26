@@ -631,16 +631,17 @@ static __global__ void quantize_q8_1_rms(
     }
 }
 
-// quantize_q8_1_rms for rows of at most nper*block_size values: each thread loads its nper values of the row
-// once, sums their squares in the loop kernel's order, and quantizes the one of them that falls in its block.
-// With w_pre the thread's weight, a constant, is read before waiting on the producer of x.
+// the sum of squares runs in the loop kernel's order; padding adds +0 to a sum that is already >= +0
 template <int block_size, int nper, bool w_pre>
 __launch_bounds__(block_size, 1)
 static __global__ void quantize_q8_1_rms_reg(
         const float * x_ptr, const float * w_ptr, const float eps, void * vy_ptr, float * scale_out_ptr,
         const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int ne0, const int ne1, const uint3 ne2) {
+        const int ne0, const int ne1, const uint3 ne2, const ggml_cuda_l2_pf pf) {
     ggml_cuda_pdl_lc();
+    if (pf.nrows != 0) {
+        ggml_cuda_l2_pf_issue(pf);
+    }
     constexpr int nwarps = block_size / WARP_SIZE;
     const int i1  = blockIdx.y;
     const int i3  = fastdiv(blockIdx.z, ne2);
@@ -715,21 +716,21 @@ static void quantize_q8_1_rms_reg_launch(
         const dim3 num_blocks, const bool w_pre, cudaStream_t stream,
         const float * x, const float * w, const float eps, void * vy, float * scale_out,
         const int ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int ne0, const int ne1, const uint3 ne2) {
+        const int ne0, const int ne1, const uint3 ne2, const ggml_cuda_l2_pf & pf) {
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(block_size, 1, 1), 0, stream);
     if (w_pre) {
         ggml_cuda_kernel_launch(quantize_q8_1_rms_reg<block_size, nper, true>, launch_params,
-            x, w, eps, vy, scale_out, ne00, s01, s02, s03, ne0, ne1, ne2);
+            x, w, eps, vy, scale_out, ne00, s01, s02, s03, ne0, ne1, ne2, pf);
     } else {
         ggml_cuda_kernel_launch(quantize_q8_1_rms_reg<block_size, nper, false>, launch_params,
-            x, w, eps, vy, scale_out, ne00, s01, s02, s03, ne0, ne1, ne2);
+            x, w, eps, vy, scale_out, ne00, s01, s02, s03, ne0, ne1, ne2, pf);
     }
 }
 
 void quantize_row_q8_1_rms_cuda(
         const float * x, const float * w, const bool w_const, const float eps, void * vy, float * scale_out,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const bool w_early,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
         const ggml_cuda_l2_pf & pf, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
@@ -746,7 +747,7 @@ void quantize_row_q8_1_rms_cuda(
         const dim3 num_blocks((nblk + 8 - 1) / 8, ne1, ne2*ne3);
         if (reg) {
             const int nper = (ne00 + 255) / 256;
-#define QUANTIZE_RMS_REG(nper) quantize_q8_1_rms_reg_launch<256, nper>(num_blocks, w_pre, stream, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv)
+#define QUANTIZE_RMS_REG(nper) quantize_q8_1_rms_reg_launch<256, nper>(num_blocks, w_pre, stream, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, pf_k)
             switch (nper) {
                 case 1: QUANTIZE_RMS_REG(1); break;
                 case 2: QUANTIZE_RMS_REG(2); break;
@@ -758,12 +759,12 @@ void quantize_row_q8_1_rms_cuda(
             return;
         }
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(256, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(quantize_q8_1_rms<256>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early, pf_k);
+        ggml_cuda_kernel_launch(quantize_q8_1_rms<256>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_pre, pf_k);
     } else {
         const dim3 num_blocks((nblk + 32 - 1) / 32, ne1, ne2*ne3);
         if (reg && ne00 <= 8*1024) {
             const int nper = (ne00 + 1023) / 1024;
-#define QUANTIZE_RMS_REG(nper) quantize_q8_1_rms_reg_launch<1024, nper>(num_blocks, w_pre, stream, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv)
+#define QUANTIZE_RMS_REG(nper) quantize_q8_1_rms_reg_launch<1024, nper>(num_blocks, w_pre, stream, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, pf_k)
             switch (nper) {
                 case 1: QUANTIZE_RMS_REG(1); break;
                 case 2: QUANTIZE_RMS_REG(2); break;
@@ -779,7 +780,7 @@ void quantize_row_q8_1_rms_cuda(
             return;
         }
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, dim3(1024, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(quantize_q8_1_rms<1024>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_early, pf_k);
+        ggml_cuda_kernel_launch(quantize_q8_1_rms<1024>, launch_params, x, w, eps, vy, scale_out, (int) ne00, s01, s02, s03, (int) ne0, (int) ne1, ne2_fastdiv, w_pre, pf_k);
     }
 }
 

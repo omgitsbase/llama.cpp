@@ -9469,7 +9469,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // every row length of the register-resident kernels (up to 4 x 256 and 8 x 1024 values) and the loop kernel above
     for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
-        for (int64_t ne00 : {256, 768, 1024, 2048, 2560, 5120, 8192, 12288}) {
+        for (int64_t ne00 : {256, 512, 768, 992, 1024, 2048, 2560, 4096, 5120, 6144, 7168, 8192, 12288}) {
+            if (ne00 % ggml_blck_size(type) != 0) {
+                continue;
+            }
             for (int64_t n_tokens : {1, 3, 8}) {
                 for (bool weights : {false, true}) {
                     test_cases.emplace_back(new test_rms_norm_mul_mat(type, ne00, n_tokens, weights));

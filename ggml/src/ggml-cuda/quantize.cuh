@@ -12,7 +12,7 @@
 void quantize_row_q8_1_rms_cuda(
         const float * x, const float * w, bool w_const, float eps, void * vy, float * scale_out,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
-        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool w_early, const ggml_cuda_l2_pf & pf, cudaStream_t stream);
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, const ggml_cuda_l2_pf & pf, cudaStream_t stream);
 
 // scale[row] * x * w written out, contiguous rows
 void rms_apply_cuda(const float * x, const float * w, const float * scale, float * dst, int64_t ne00, int64_t n_rows, cudaStream_t stream);

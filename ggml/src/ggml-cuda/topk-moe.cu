@@ -216,8 +216,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
 
     ggml_cuda_pdl_lc();
     if constexpr (redux) {
-        // the selection below on keys: each lane offers its best slot (lowest among equal keys), the warp
-        // reduces over the offers, and the winner's key becomes that of -INFINITY as the loop below marks it
+        // the lowest slot wins ties, as in the shuffle loop below
         uint32_t key[experts_per_thread];
 #pragma unroll
         for (int i = 0; i < experts_per_thread; i++) {

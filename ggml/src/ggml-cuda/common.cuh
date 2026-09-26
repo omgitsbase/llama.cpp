@@ -1465,8 +1465,6 @@ struct ggml_cuda_stream_context {
     }
 };
 
-// the rms_norm factor from a row's sum of squares, with the division and the
-// add pinned so every kernel that derives it agrees to the bit
 // GGML_CUDA_FUSE_OFF, parsed once; see its definition for the bits
 uint64_t ggml_cuda_fuse_off_mask();
 
@@ -1477,6 +1475,8 @@ static bool ggml_cuda_tensor_is_constant(const ggml_tensor * t) {
         !(root->flags & GGML_TENSOR_FLAG_PARAM);
 }
 
+// the rms_norm factor from a row's sum of squares, with the division and the
+// add pinned so every kernel that derives it agrees to the bit
 static __device__ __forceinline__ float ggml_cuda_rms_scale(const float sum_sq, const int ncols, const float eps) {
     return rsqrtf(__fadd_rn(__fdiv_rn(sum_sq, (float) ncols), eps));
 }
