@@ -3858,13 +3858,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 //   16384 norm weight read before the PDL wait (quantize_q8_1_rms, norm+rope), 65536 one_row, 131072 lane groups,
 //   67108864 multi-section rope in norm+rope(+set_rows), 4294967296 register-resident quantize_q8_1_rms,
 //   8589934592 topk_moe REDUX selection, 1<<37 ids-early prefetch, 1<<38 producer prefetch.
-// The bits in 0x2000037000 stay off until GGML_CUDA_MMV_EXPERIMENTAL=1: they have no clean speed number yet
+// GGML_CUDA_MMV_EXPERIMENTAL=0 turns the matvec bits in 0x2000037000 off together
 uint64_t ggml_cuda_fuse_off_mask() {
     static const uint64_t mask = [] {
         const char *   e   = getenv("GGML_CUDA_FUSE_OFF");
         const char *   x   = getenv("GGML_CUDA_MMV_EXPERIMENTAL");
         const uint64_t off = e ? std::strtoull(e, nullptr, 0) : 0;
-        return off | (x && atoi(x) != 0 ? 0 : 0x2000037000ull);
+        return off | (x && atoi(x) == 0 ? 0x2000037000ull : 0);
     }();
     return mask;
 }
