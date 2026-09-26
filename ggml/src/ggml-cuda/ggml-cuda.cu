@@ -1846,6 +1846,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 && b0 && a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
 static ggml_cuda_norm_fold * ggml_cuda_norm_fold_for(ggml_backend_cuda_context & ctx, const ggml_tensor * act) {
     if (ctx.norm_folds.empty()) {
         return nullptr;
@@ -1855,7 +1861,7 @@ static ggml_cuda_norm_fold * ggml_cuda_norm_fold_for(ggml_backend_cuda_context &
 }
 
 // GGML_CUDA_FOLD_CHECK=1 (graphs off): after a fold's factors exist, the reference
-// norm is run into the product's buffer and compared bit for bit with scale*x*w
+// norm is run into a scratch buffer and compared bit for bit with scale*x*w
 static void ggml_cuda_norm_fold_check(ggml_backend_cuda_context & ctx, ggml_cuda_norm_fold & fold) {
     static const bool on = getenv("GGML_CUDA_FOLD_CHECK") != nullptr;
     if (!on || !fold.scale_ready) {
@@ -1863,12 +1869,13 @@ static void ggml_cuda_norm_fold_check(ggml_backend_cuda_context & ctx, ggml_cuda
     }
     const int64_t n = ggml_nelements(fold.mul);
     ggml_cuda_pool_alloc<float> ours(ctx.pool(), n);
+    ggml_cuda_pool_alloc<float> ref(ctx.pool(), n);
     rms_apply_cuda((const float *) fold.x->data, (const float *) fold.w->data, fold.scale, ours.get(), fold.mul->ne[0], fold.n_rows, ctx.stream());
-    ggml_cuda_op_rms_norm_fused(ctx, fold.norm, fold.mul);
+    ggml_cuda_op_rms_norm_fused(ctx, fold.norm, fold.mul, ref.get());
     std::vector<float> a(n), b(n), s(fold.n_rows);
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
     CUDA_CHECK(cudaMemcpy(a.data(), ours.get(), n * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(b.data(), fold.mul->data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), ref.get(), n * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(s.data(), fold.scale, fold.n_rows * sizeof(float), cudaMemcpyDeviceToHost));
     int64_t bad = 0, first = -1;
     for (int64_t i = 0; i < n; ++i) {
@@ -1882,7 +1889,7 @@ static void ggml_cuda_norm_fold_check(ggml_backend_cuda_context & ctx, ggml_cuda
     if (fold.q8_ready) {
         const ggml_tensor * m = fold.mul;
         ggml_cuda_pool_alloc<char> q8ref(ctx.pool(), fold.q8_bytes);
-        quantize_row_q8_1_cuda((const float *) m->data, nullptr, q8ref.get(), GGML_TYPE_Q8_0, m->ne[0],
+        quantize_row_q8_1_cuda(ref.get(), nullptr, q8ref.get(), GGML_TYPE_Q8_0, m->ne[0],
             m->nb[1] / sizeof(float), m->nb[2] / sizeof(float), m->nb[3] / sizeof(float),
             GGML_PAD(m->ne[0], MATRIX_ROW_PADDING), m->ne[1], m->ne[2], m->ne[3], ctx.stream());
         std::vector<char> qa(fold.q8_bytes), qb(fold.q8_bytes);
@@ -3796,6 +3803,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     // when everything reading the view qualifies; it then shares the record
     std::vector<const ggml_tensor *> views;
     int found = 0;
+    int last  = i + 1;
     for (int j = i + 2; j < cgraph->n_nodes && found < n_uses; ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
         bool reads = false;
@@ -3806,11 +3814,13 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
             continue;
         }
         found++;
+        last = j;
         if (ggml_cuda_norm_fold_reader_ok(t, mul, cc)) {
             continue;
         }
         const bool plain_view = (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src == mul && t->view_offs == 0 &&
-                                t->type == mul->type && ggml_is_contiguous(t) && ggml_nelements(t) == ggml_nelements(mul);
+                                t->type == mul->type && t->ne[0] == mul->ne[0] && ggml_is_contiguous(t) &&
+                                ggml_nelements(t) == ggml_nelements(mul);
         if (!plain_view || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return false;
         }
@@ -3826,6 +3836,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
                 continue;
             }
             found_v++;
+            last = std::max(last, k);
             if (!ggml_cuda_norm_fold_reader_ok(u, t, cc)) {
                 return false;
             }
@@ -3837,6 +3848,21 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     }
     if (found != n_uses) {
         return false;
+    }
+    // the readers take x (and w) where the graph has them read the product: nothing up to
+    // the last reader may write there. An in-place product keeps x's bytes alive itself
+    if (mul->data != x->data) {
+        const ggml_tensor * w_root  = w->view_src ? w->view_src : w;
+        const bool          w_const = w_root->buffer && ggml_backend_buffer_get_usage(w_root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+        for (int j = i + 2; j <= last; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(t)) {
+                continue;
+            }
+            if (ggml_cuda_tensors_overlap(t, x) || (!w_const && ggml_cuda_tensors_overlap(t, w))) {
+                return false;
+            }
+        }
     }
 
     auto fold = std::make_shared<ggml_cuda_norm_fold>();
@@ -3880,18 +3906,25 @@ static bool ggml_cuda_norm_fold_diag() {
 
 static void ggml_cuda_norm_fold_diag2(ggml_backend_cuda_context & ctx, const ggml_tensor * act) {
     static const bool diag2 = getenv("GGML_CUDA_FOLD_DIAG2") != nullptr;
-    ggml_cuda_norm_fold * fold = diag2 ? ggml_cuda_norm_fold_for(ctx, act) : nullptr;
-    if (fold) {
-        ggml_cuda_op_rms_norm_fused(ctx, fold->norm, fold->mul);
-    }
     // GGML_CUDA_FOLD_POISON=1 (graphs off): the unwritten product filled with NaN, so
     // whatever reads it shows up as the first node whose output turns NaN
     static const bool poison = getenv("GGML_CUDA_FOLD_POISON") != nullptr;
-    ggml_cuda_norm_fold * pf = poison ? ggml_cuda_norm_fold_for(ctx, act) : nullptr;
-    if (pf) {
-        CUDA_CHECK(cudaMemsetAsync(pf->mul->data, 0xFF, ggml_nbytes(pf->mul), ctx.stream()));
-        if (pf->norm->data != pf->mul->data) {
-            CUDA_CHECK(cudaMemsetAsync(pf->norm->data, 0xFF, ggml_nbytes(pf->norm), ctx.stream()));
+    ggml_cuda_norm_fold * fold = diag2 || poison ? ggml_cuda_norm_fold_for(ctx, act) : nullptr;
+    if (!fold) {
+        return;
+    }
+    // either write would clobber the norm input the readers still take
+    if (ggml_cuda_tensors_overlap(fold->mul, fold->x) || ggml_cuda_tensors_overlap(fold->norm, fold->x)) {
+        GGML_LOG_INFO("%s: %s shares bytes with the norm input, left unwritten\n", __func__, fold->norm->name);
+        return;
+    }
+    if (diag2) {
+        ggml_cuda_op_rms_norm_fused(ctx, fold->norm, fold->mul);
+    }
+    if (poison) {
+        CUDA_CHECK(cudaMemsetAsync(fold->mul->data, 0xFF, ggml_nbytes(fold->mul), ctx.stream()));
+        if (fold->norm->data != fold->mul->data) {
+            CUDA_CHECK(cudaMemsetAsync(fold->norm->data, 0xFF, ggml_nbytes(fold->norm), ctx.stream()));
         }
     }
 }
