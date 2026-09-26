@@ -1480,6 +1480,8 @@ struct ggml_cuda_norm_fold {
     const ggml_tensor * w    = nullptr; // the norm weight, one value per column
     float eps          = 0.0f;
     bool  materialized = false;
+    // a quantized reader follows, so the first reader quantizes even when it reads floats
+    bool  has_q8_reader = false;
     // one pool buffer taken by the first reader: the quantized product, then one scale per row
     void *  q8          = nullptr;
     float * scale       = nullptr;

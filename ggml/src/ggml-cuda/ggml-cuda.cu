@@ -3802,8 +3802,9 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     // a plain view of the product (the experts read it reshaped) is a reader
     // when everything reading the view qualifies; it then shares the record
     std::vector<const ggml_tensor *> views;
-    int found = 0;
-    int last  = i + 1;
+    int  found         = 0;
+    int  last          = i + 1;
+    bool has_q8_reader = false;
     for (int j = i + 2; j < cgraph->n_nodes && found < n_uses; ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
         bool reads = false;
@@ -3816,6 +3817,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
         found++;
         last = j;
         if (ggml_cuda_norm_fold_reader_ok(t, mul, cc)) {
+            has_q8_reader |= ggml_is_quantized(t->src[0]->type);
             continue;
         }
         const bool plain_view = (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src == mul && t->view_offs == 0 &&
@@ -3840,6 +3842,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
             if (!ggml_cuda_norm_fold_reader_ok(u, t, cc)) {
                 return false;
             }
+            has_q8_reader |= ggml_is_quantized(u->src[0]->type);
         }
         if (found_v != n_uses_v || n_uses_v < 1) {
             return false;
@@ -3872,6 +3875,7 @@ static bool ggml_cuda_try_norm_fold(ggml_backend_cuda_context * ctx, const ggml_
     fold->w        = w;
     fold->n_rows   = ggml_nrows(mul);
     fold->q8_bytes = fold->n_rows * (GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
+    fold->has_q8_reader = has_q8_reader && !(ggml_cuda_fuse_off_mask() & 4194304);
     memcpy(&fold->eps, norm->op_params, sizeof(float));
     ctx->norm_folds[mul] = fold;
     for (const ggml_tensor * v : views) {

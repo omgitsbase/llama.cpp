@@ -749,8 +749,17 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_cuda_norm_fold_reserve(ctx, *fold);
         if (!fold->scale_ready) {
             const ggml_tensor * x = fold->x;
-            rms_scale_cuda((const float *) x->data, fold->eps, fold->scale,
-                ne10, x->nb[1] / ts_src1, x->nb[2] / ts_src1, x->nb[3] / ts_src1, ne11, ne12, ne13, ctx.stream());
+            // the same row loop and block size as rms_scale, so the factors are the bits it would write
+            if (fold->has_q8_reader) {
+                GGML_ASSERT(fold->q8_bytes == (size_t) ne11 * (GGML_PAD(ne10, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1));
+                quantize_row_q8_1_rms_cuda((const float *) x->data, (const float *) fold->w->data, fold->eps, fold->q8, fold->scale,
+                    ne10, x->nb[1] / ts_src1, x->nb[2] / ts_src1, x->nb[3] / ts_src1, GGML_PAD(ne10, MATRIX_ROW_PADDING), ne11, ne12, ne13,
+                    ctx.stream());
+                fold->q8_ready = true;
+            } else {
+                rms_scale_cuda((const float *) x->data, fold->eps, fold->scale,
+                    ne10, x->nb[1] / ts_src1, x->nb[2] / ts_src1, x->nb[3] / ts_src1, ne11, ne12, ne13, ctx.stream());
+            }
             fold->scale_ready = true;
         }
         // GGML_CUDA_FOLD_FLOAT_MATERIALIZE=1: the product written out and read as before, to bisect the in-kernel path
