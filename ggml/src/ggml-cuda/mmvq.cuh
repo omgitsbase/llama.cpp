@@ -46,6 +46,11 @@ bool ggml_cuda_mmvq_conv_supported(ggml_type type, int cc, int64_t ncols_dst);
 void ggml_cuda_mul_mat_vec_q_conv(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_cuda_norm_fold * fold,
     const ggml_cuda_mmvq_conv & conv);
 
+// router weights for the next multi-token expert matvec: it multiplies each (slot, token) result by w[slot*s_slot +
+// token*s_token] as it stores it, as a MUL by the weights right after would. The launch takes them; taken() says it did.
+void ggml_cuda_mmvq_set_router_weights(const float * w, int64_t s_slot, int64_t s_token);
+bool ggml_cuda_mmvq_router_weights_taken();
+
 // two quantized matvecs over one activation, each within one wave, in one launch
 bool ggml_cuda_mmvq_pair_ok(const ggml_tensor * a, const ggml_tensor * b, int device);
 void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b, ggml_cuda_norm_fold * fold);

@@ -1020,7 +1020,8 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride, const bool release) {
+        const uint32_t ncols_dst, const uint32_t ids_stride, const bool release,
+        const float * rw, const uint32_t rw_s_slot, const uint32_t rw_s_token) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1119,6 +1120,9 @@ static __global__ void mul_mat_vec_q_moe(
                     break;
             }
         }
+        if (rw != nullptr) {
+            result = result * rw[channel_dst*rw_s_slot + token_idx*rw_s_token];
+        }
         dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + lane] = result;
     }
 }
@@ -1204,6 +1208,24 @@ static int mmvq_force_env(const char * name) {
     return e ? atoi(e) : -1;
 }
 
+struct mmvq_router_weights {
+    const float * w       = nullptr;
+    uint32_t      s_slot  = 0;
+    uint32_t      s_token = 0;
+};
+
+static thread_local mmvq_router_weights g_mmvq_router_weights;
+static thread_local bool                g_mmvq_router_weights_taken = false;
+
+void ggml_cuda_mmvq_set_router_weights(const float * w, const int64_t s_slot, const int64_t s_token) {
+    g_mmvq_router_weights       = { w, (uint32_t) s_slot, (uint32_t) s_token };
+    g_mmvq_router_weights_taken = false;
+}
+
+bool ggml_cuda_mmvq_router_weights_taken() {
+    return g_mmvq_router_weights_taken;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1219,6 +1241,10 @@ static void mul_mat_vec_q_moe_launch(
     // only the gate travels with this kernel; biases and scales keep their own launches
     GGML_ASSERT(fusion.x_bias == nullptr && fusion.gate_bias == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr);
 
+    const mmvq_router_weights rw = g_mmvq_router_weights;
+    g_mmvq_router_weights = {};
+    g_mmvq_router_weights_taken = rw.w != nullptr;
+
     const auto launch = [&](auto c_lane_groups) {
         constexpr int g = decltype(c_lane_groups)::value;
         const int64_t nblocks_rows = (nrows_x + rows_per_block*g - 1) / (rows_per_block*g);
@@ -1230,14 +1256,14 @@ static void mul_mat_vec_q_moe_launch(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst,
-                ncols_dst, ids_stride, release);
+                ncols_dst, ids_stride, release, rw.w, rw.s_slot, rw.s_token);
             return;
         }
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, g, false>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, release);
+            ncols_dst, ids_stride, release, rw.w, rw.s_slot, rw.s_token);
     };
 
     if constexpr (lpb <= 8) {

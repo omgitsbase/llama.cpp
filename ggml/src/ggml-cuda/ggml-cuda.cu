@@ -5577,6 +5577,42 @@ static int ggml_cuda_try_mm_reshape_add(ggml_backend_cuda_context & ctx, const g
     return 2;
 }
 
+// a multi-token expert matvec and the multiply by its router weights after it: the weights ride the matvec's store, and
+// the expert sum after them (a plain sum then) never reads the weights while other blocks store
+static constexpr uint64_t GGML_CUDA_FUSE_MOE_ROUTER_WEIGHTS = 1ull << 47;
+
+static int ggml_cuda_try_moe_router_weights(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if ((ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MOE_ROUTER_WEIGHTS) || i + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[i];
+    ggml_tensor *       mul = cgraph->nodes[i + 1];
+    if (mm->op != GGML_OP_MUL_MAT_ID || mul->op != GGML_OP_MUL || mul->src[0] != mm || mm->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || ((mm->flags | mul->flags) & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+            !ggml_are_same_shape(mm, mul) || !ggml_is_contiguous(mm) || !ggml_is_contiguous(mul)) {
+        return 0;
+    }
+    const ggml_tensor * w    = mul->src[1];
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * ids  = mm->src[2];
+    // [1, n_used, n_tokens]: one weight per (slot, token), broadcast over the rows; the multi-token kernel only
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != 1 || w->ne[1] != mm->ne[1] || w->ne[2] != mm->ne[2] || w->ne[3] != 1 ||
+            mm->ne[2] < 2 || !ggml_is_quantized(src0->type) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm) ||
+            w->nb[1] % sizeof(float) != 0 || w->nb[2] % sizeof(float) != 0) {
+        return 0;
+    }
+    // the product lands where the multiply's output is; it may be the matvec's own, never the weights or the input
+    if (ggml_cuda_tensors_overlap(mul, w) || ggml_cuda_tensors_overlap(mul, src1) || ggml_cuda_tensors_overlap(mul, ids)) {
+        return 0;
+    }
+    ggml_cuda_mmvq_set_router_weights((const float *) w->data, w->nb[1] / sizeof(float), w->nb[2] / sizeof(float));
+    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, mul, nullptr, ggml_cuda_norm_fold_for(ctx, src1));
+    GGML_ASSERT(ggml_cuda_mmvq_router_weights_taken() && "the expert matvec did not take its router weights");
+    ggml_cuda_norm_fold_check_at(ctx, src1);
+    return 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5596,6 +5632,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_GET_ROWS && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GET_ROWS_CPY)) {
         const int nodes_to_skip = ggml_cuda_try_get_rows_cpy(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int nodes_to_skip = ggml_cuda_try_moe_router_weights(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
