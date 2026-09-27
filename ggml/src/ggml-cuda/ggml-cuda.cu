@@ -3043,7 +3043,13 @@ static int ggml_cuda_try_expert_wsum(ggml_backend_cuda_context & ctx, const ggml
             return 0;
         }
     }
-    ggml_cuda_op_sum_expert_rows_weighted(ctx, x, w, cgraph->nodes[j + n_adds - 1], (int) x->ne[1]);
+    // the router weights die at the multiply in the graph's order, so the sum's output may have been given their
+    // memory; one launch reads every token's weights while other blocks store, so neither input may lie under it
+    ggml_tensor * dst = cgraph->nodes[j + n_adds - 1];
+    if (ggml_cuda_tensors_overlap(dst, x) || ggml_cuda_tensors_overlap(dst, w)) {
+        return 0;
+    }
+    ggml_cuda_op_sum_expert_rows_weighted(ctx, x, w, dst, (int) x->ne[1]);
     return j + n_adds - 1 - i;
 }
 
@@ -5523,6 +5529,54 @@ static int ggml_cuda_try_mmvf_pair_epi(ggml_backend_cuda_context & ctx, const gg
     return last_b - i;
 }
 
+// a matvec, a plain reshape of it, and an add with a tensor of the reshape's shape (a residual after an output
+// projection): the add rides the matvec as its per-column bias, as when the add follows the matvec directly
+static constexpr uint64_t GGML_CUDA_FUSE_MM_RESHAPE_ADD = 1ull << 46;
+
+static int ggml_cuda_try_mm_reshape_add(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[i];
+    const ggml_tensor * rs  = cgraph->nodes[i + 1];
+    ggml_tensor *       add = cgraph->nodes[i + 2];
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || (rs->op != GGML_OP_RESHAPE && rs->op != GGML_OP_VIEW) ||
+            rs->view_src != mm || rs->view_offs != 0 || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+            ((mm->flags | rs->flags) & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(mm) || !ggml_is_contiguous(rs) ||
+            !ggml_is_contiguous(add) || ggml_nelements(rs) != ggml_nelements(mm) || rs->ne[0] != mm->ne[0] ||
+            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1) {
+        return 0;
+    }
+    const ggml_tensor * bias = add->src[0] == rs ? add->src[1] : (add->src[1] == rs ? add->src[0] : nullptr);
+    if (bias == nullptr || bias == rs || !ggml_are_same_shape(add->src[0], add->src[1]) || bias->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(bias)) {
+        return 0;
+    }
+    // the product is never written; the add's output may be the bias itself (each element read, then written, by one
+    // lane) but must not otherwise overlap what the matvec reads
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const bool exact = add->data == bias->data;
+    if ((!exact && ggml_cuda_tensors_overlap(add, bias)) || ggml_cuda_tensors_overlap(add, src0)) {
+        return 0;
+    }
+    ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, src1);
+    if (ggml_cuda_tensors_overlap(add, fold ? fold->x : src1)) {
+        return 0;
+    }
+    ggml_cuda_mm_fusion_args_host fusion_data{};
+    fusion_data.x_bias = bias;
+    if (ggml_cuda_should_fuse_mul_mat_vec_f(mm)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, add, &fusion_data, fold);
+    } else if (ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_cuda_should_use_mmvq(src0->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) {
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, add, &fusion_data, fold);
+    } else {
+        return 0;
+    }
+    ggml_cuda_norm_fold_check_at(ctx, src1);
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -6232,6 +6286,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT) {
         const int nodes_to_skip = ggml_cuda_try_mm_epilogue(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MM_RESHAPE_ADD)) {
+        const int nodes_to_skip = ggml_cuda_try_mm_reshape_add(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }

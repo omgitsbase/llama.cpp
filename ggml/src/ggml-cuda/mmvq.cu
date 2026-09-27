@@ -558,27 +558,42 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 template <int fusion_mode>
 using mmvq_epi_t = std::conditional_t<fusion_mode == 3, ggml_cuda_mmvq_conv, ggml_cuda_mm_epilogue_t<fusion_mode>>;
 
-// one channel's convolution as ssm_conv_f32 computes it, over the window [state, projected values], then its snapshots.
-// The state is read before any snapshot is written, and a snapshot row that is the state row is this channel's alone.
-template <int ncols_dst>
-static __device__ __forceinline__ void mmvq_conv_row(const ggml_cuda_mmvq_conv & e, const int c, const float * v) {
-    constexpr int d_conv = 4;
+// a channel's state, taps and bias, loaded by its lane while the partial sums still reduce
+struct mmvq_conv_operands {
+    float s[3];
+    float w[4];
+    float b;
+};
+
+static __device__ __forceinline__ void mmvq_conv_load(const ggml_cuda_mmvq_conv & e, const int c, mmvq_conv_operands & o) {
     const float * s = e.state + (e.state_ids ? (int64_t) e.state_ids[0]*e.state_row : 0) + (int64_t) c*e.state_s1;
+#pragma unroll
+    for (int m = 0; m < 3; ++m) {
+        o.s[m] = s[m];
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        o.w[j] = e.w[(int64_t) c*e.w_s1 + j];
+    }
+    o.b = e.bias != nullptr ? e.bias[c] : 0.0f;
+}
+
+// one channel's convolution as ssm_conv_f32 computes it, over the window [state, projected values], then its snapshots.
+// The state was read before any snapshot is written, and a snapshot row that is the state row is this channel's alone.
+template <int ncols_dst>
+static __device__ __forceinline__ void mmvq_conv_row(const ggml_cuda_mmvq_conv & e, const int c, const float * v, const mmvq_conv_operands & o) {
+    constexpr int d_conv = 4;
     float win[d_conv - 1 + ncols_dst];
 #pragma unroll
     for (int m = 0; m < d_conv - 1; ++m) {
-        win[m] = s[m];
+        win[m] = o.s[m];
     }
 #pragma unroll
     for (int t = 0; t < ncols_dst; ++t) {
         win[d_conv - 1 + t] = v[t];
     }
-    float w[d_conv];
-#pragma unroll
-    for (int j = 0; j < d_conv; ++j) {
-        w[j] = e.w[(int64_t) c*e.w_s1 + j];
-    }
-    const float b = e.bias != nullptr ? e.bias[c] : 0.0f;
+    const float * w = o.w;
+    const float   b = o.b;
 #pragma unroll
     for (int t = 0; t < ncols_dst; ++t) {
         float sumf = 0.0f;
@@ -805,6 +820,14 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
         }
     }
 
+    [[maybe_unused]] mmvq_conv_operands conv_o;
+    if constexpr (fusion_mode == 3) {
+        const int row = row0 + threadIdx.x;
+        if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row) < nrows_x)) {
+            mmvq_conv_load(epi, row, conv_o);
+        }
+    }
+
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
     [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
 
@@ -896,7 +919,7 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
 
     if constexpr (fusion_mode == 3) {
         if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-            mmvq_conv_row<ncols_dst>(epi, row0 + threadIdx.x, conv_v);
+            mmvq_conv_row<ncols_dst>(epi, row0 + threadIdx.x, conv_v, conv_o);
         }
     }
 
