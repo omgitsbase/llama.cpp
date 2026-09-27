@@ -89,3 +89,9 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+// q8_1 of silu(z)*m, a gated norm's product feeding a quantized matvec, over rows of ne0 values in groups of hd
+// (a multiple of 32, at most 256). With x set, m is rms_norm(x)*w per group, reduced exactly as rms_norm_f32<256>
+// reduces it; otherwise m is read. Each value is quantized as quantize_q8_1 quantizes it.
+void quantize_q8_1_gated_cuda(const float * m, const float * x, const float * w, float eps, const float * z, void * vy,
+    int64_t ne0, int64_t nrows, int hd, cudaStream_t stream);

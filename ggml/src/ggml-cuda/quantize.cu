@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -991,5 +992,84 @@ void quantize_mmq_fp4_cuda(
         const dim3    block_size(WARP_SIZE, nwarps, 1);
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+    }
+}
+
+template <int hd, bool from_x>
+static __global__ void quantize_q8_1_gated(const float * m, const float * x, const float * w, const float eps, const float * z,
+        void * vy, const int64_t ne0) {
+    constexpr int nseg = hd / WARP_SIZE;
+    const int     lane = threadIdx.x;
+    const int64_t c0   = (int64_t) blockIdx.x*hd;
+    const int64_t base = (int64_t) blockIdx.y*ne0 + c0;
+
+    ggml_cuda_pdl_sync();
+    float v[nseg];
+    if constexpr (from_x) {
+        // rms_norm_f32<256>: a thread per column, each warp's butterfly, then one over the eight warp sums (the
+        // warps past the row summed zeros) with the rest of the lanes empty
+        float xs[nseg];
+        float u = 0.0f;
+#pragma unroll
+        for (int seg = 0; seg < nseg; ++seg) {
+            xs[seg] = x[base + seg*WARP_SIZE + lane];
+            float t = 0.0f;
+            t += xs[seg] * xs[seg];
+            t = warp_reduce_sum(t);
+            u = lane == seg ? t : u;
+        }
+        const float scale = ggml_cuda_rms_scale(warp_reduce_sum(u), hd, eps);
+#pragma unroll
+        for (int seg = 0; seg < nseg; ++seg) {
+            v[seg] = scale * xs[seg] * w[seg*WARP_SIZE + lane];
+        }
+    } else {
+#pragma unroll
+        for (int seg = 0; seg < nseg; ++seg) {
+            v[seg] = m[base + seg*WARP_SIZE + lane];
+        }
+    }
+    ggml_cuda_pdl_lc();
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+#pragma unroll
+    for (int seg = 0; seg < nseg; ++seg) {
+        const float xi = ggml_cuda_op_silu_single(z[base + seg*WARP_SIZE + lane]) * v[seg];
+        float amax = fabsf(xi);
+        float sum  = xi;
+        amax = warp_reduce_max<QK8_1>(amax);
+        sum  = warp_reduce_sum<QK8_1>(sum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+        const int64_t ib = (base + seg*WARP_SIZE) / QK8_1;
+        y[ib].qs[lane] = q;
+        if (lane == 0) {
+            y[ib].ds = make_half2(d, sum);
+        }
+    }
+}
+
+void quantize_q8_1_gated_cuda(const float * m, const float * x, const float * w, const float eps, const float * z, void * vy,
+        const int64_t ne0, const int64_t nrows, const int hd, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % hd == 0 && ne0 % MATRIX_ROW_PADDING == 0 && nrows <= 65535);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((unsigned) (ne0/hd), (unsigned) nrows, 1), dim3(WARP_SIZE, 1, 1), 0, stream);
+    const auto launch = [&](auto hd_c) {
+        constexpr int h = decltype(hd_c)::value;
+        if (x) {
+            ggml_cuda_kernel_launch(quantize_q8_1_gated<h, true>, lp, m, x, w, eps, z, vy, ne0);
+        } else {
+            ggml_cuda_kernel_launch(quantize_q8_1_gated<h, false>, lp, m, x, w, eps, z, vy, ne0);
+        }
+    };
+    switch (hd) {
+        case  32: launch(std::integral_constant<int,  32>{}); break;
+        case  64: launch(std::integral_constant<int,  64>{}); break;
+        case  96: launch(std::integral_constant<int,  96>{}); break;
+        case 128: launch(std::integral_constant<int, 128>{}); break;
+        case 160: launch(std::integral_constant<int, 160>{}); break;
+        case 192: launch(std::integral_constant<int, 192>{}); break;
+        case 224: launch(std::integral_constant<int, 224>{}); break;
+        case 256: launch(std::integral_constant<int, 256>{}); break;
+        default: GGML_ABORT("fatal error");
     }
 }

@@ -1864,7 +1864,7 @@ static ggml_cuda_norm_fold * ggml_cuda_norm_fold_for(ggml_backend_cuda_context &
 // norm is run into a scratch buffer and compared bit for bit with scale*x*w
 static void ggml_cuda_norm_fold_check(ggml_backend_cuda_context & ctx, ggml_cuda_norm_fold & fold) {
     static const bool on = getenv("GGML_CUDA_FOLD_CHECK") != nullptr;
-    if (!on || !fold.scale_ready) {
+    if (!on || !fold.scale_ready || fold.norm->op != GGML_OP_RMS_NORM) {
         return;
     }
     const int64_t n = ggml_nelements(fold.mul);
@@ -1922,6 +1922,7 @@ static void ggml_cuda_norm_fold_check_at(ggml_backend_cuda_context & ctx, const 
 static void ggml_cuda_norm_fold_materialize(ggml_backend_cuda_context & ctx, const ggml_tensor * act) {
     ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, act);
     if (fold) {
+        GGML_ASSERT(fold->norm->op == GGML_OP_RMS_NORM && "a gated fold's product is only ever quantized");
         ggml_cuda_op_rms_norm_fused(ctx, fold->norm, fold->mul);
         fold->materialized = true;
     }
@@ -4959,6 +4960,229 @@ static int ggml_cuda_try_cpy_run(ggml_backend_cuda_context & ctx, const ggml_cgr
     return last - i;
 }
 
+// the two l2 norms of q and k that feed a delta-net recurrence and nothing else: the recurrence normalizes q and k as
+// it loads them, so neither norm launches. Nothing up to the recurrence may write their sources.
+static constexpr uint64_t GGML_CUDA_FUSE_GDN_QK_NORM = 1ull << 45;
+
+static int ggml_cuda_try_gdn_qk_norm(const ggml_cgraph * cgraph, const int i) {
+    if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GDN_QK_NORM) {
+        return 0;
+    }
+    const ggml_tensor * a = cgraph->nodes[i];
+    int j = i + 1;
+    while (j < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || ggml_is_empty(cgraph->nodes[j]))) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * b = cgraph->nodes[j];
+    if (a->op != GGML_OP_L2_NORM || b->op != GGML_OP_L2_NORM || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+            ((a->flags | b->flags) & GGML_TENSOR_FLAG_OUTPUT) || memcmp(a->op_params, b->op_params, sizeof(float)) != 0 ||
+            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, j) != 1) {
+        return 0;
+    }
+    const ggml_tensor * sa = a->src[0];
+    const ggml_tensor * sb = b->src[0];
+    if (sa->type != GGML_TYPE_F32 || sb->type != GGML_TYPE_F32 || !ggml_are_same_shape(sa, a) || !ggml_are_same_shape(sb, b) ||
+            !ggml_is_contiguous_rows(sa) || !ggml_is_contiguous_rows(sb) || !ggml_are_same_stride(sa, sb)) {
+        return 0;
+    }
+    int g = -1;
+    for (int k = j + 1; k < cgraph->n_nodes && g < 0; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t->src[0] == a || t->src[1] == a || t->src[0] == b || t->src[1] == b) {
+            g = k;
+        }
+    }
+    if (g < 0) {
+        return 0;
+    }
+    const ggml_tensor * gdn = cgraph->nodes[g];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[0] != a || gdn->src[1] != b || gdn->src[2] == nullptr ||
+            gdn->src[2]->ne[0] != a->ne[0]) {
+        return 0;
+    }
+    for (int k = j + 1; k < g; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (!ggml_cuda_is_view_or_noop(t) && (ggml_cuda_tensors_overlap(t, sa) || ggml_cuda_tensors_overlap(t, sb))) {
+            return 0;
+        }
+    }
+    float eps;
+    memcpy(&eps, a->op_params, sizeof(float));
+    ggml_cuda_gated_delta_net_set_qk_norm(gdn, sa, sb, eps);
+    return j - i;
+}
+
+// the gated norm in front of a quantized matvec, silu(z) * (rms_norm(x) * w): its product is quantized straight into
+// the matvec's q8_1 input, which the matvec takes as a norm fold whose quantized copy is ready. The SiLU and the
+// multiply never launch; when nothing between the norm and the SiLU writes x, neither does the norm.
+static constexpr uint64_t GGML_CUDA_FUSE_GATED_FOLD = 1ull << 44;
+
+struct ggml_cuda_gated_norm {
+    const ggml_tensor * m;
+    const ggml_tensor * x;
+    const ggml_tensor * w;
+    float               eps;
+};
+
+// the norms left for the gated quantize to do, until it runs
+static thread_local std::vector<ggml_cuda_gated_norm> g_cuda_gated;
+
+// the SiLU at i, the product with m right after it, maybe a plain reshape, and the one quantized matvec reading that
+static bool ggml_cuda_match_gated(const ggml_cgraph * cgraph, const int i, const int cc, const ggml_tensor ** m_out, int * i_f) {
+    if (i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * s = cgraph->nodes[i];
+    const ggml_tensor * p = cgraph->nodes[i + 1];
+    if (s->op != GGML_OP_UNARY || ggml_get_unary_op(s) != GGML_UNARY_OP_SILU || s->type != GGML_TYPE_F32 || p->op != GGML_OP_MUL ||
+            p->type != GGML_TYPE_F32 || (p->src[0] != s && p->src[1] != s) || ((s->flags | p->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * z = s->src[0];
+    const ggml_tensor * m = p->src[0] == s ? p->src[1] : p->src[0];
+    if (m == s || z->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 || !ggml_is_contiguous(z) || !ggml_is_contiguous(m) ||
+            !ggml_is_contiguous(p) || !ggml_are_same_shape(z, m) || !ggml_are_same_shape(p, m) ||
+            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1) {
+        return false;
+    }
+    int f_idx = i + 1;
+    const ggml_tensor * f = p;
+    if (i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * r = cgraph->nodes[i + 2];
+        if ((r->op == GGML_OP_RESHAPE || r->op == GGML_OP_VIEW) && r->view_src == p && r->view_offs == 0 && ggml_is_contiguous(r) &&
+                ggml_nelements(r) == ggml_nelements(p) && !(r->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            if (ggml_node_get_use_count(cgraph, i + 2) != 1) {
+                return false;
+            }
+            f     = r;
+            f_idx = i + 2;
+        }
+    }
+    if (f->ne[0] % MATRIX_ROW_PADDING != 0 || f->ne[2] != 1 || f->ne[3] != 1 || f->ne[1] > 65535) {
+        return false;
+    }
+    const ggml_tensor * reader = nullptr;
+    for (int k = f_idx + 1; k < cgraph->n_nodes && reader == nullptr; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+            if (t->src[q] == f) {
+                reader = t;
+            }
+        }
+    }
+    if (reader == nullptr || reader->op != GGML_OP_MUL_MAT || !ggml_is_quantized(reader->src[0]->type) ||
+            !ggml_cuda_norm_fold_reader_ok(reader, f, cc)) {
+        return false;
+    }
+    *m_out = m;
+    *i_f   = f_idx;
+    return true;
+}
+
+// rms_norm at i and its weight multiply: left undone when the gated quantize after them will do it
+static int ggml_cuda_try_gated_norm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if ((ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GATED_FOLD) || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * norm = cgraph->nodes[i];
+    const ggml_tensor * mul  = cgraph->nodes[i + 1];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || mul->src[0] != norm || norm->type != GGML_TYPE_F32 ||
+            ((norm->flags | mul->flags) & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+            ggml_node_get_use_count(cgraph, i + 1) != 1) {
+        return 0;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[1];
+    // the norm's rows are the quantize's groups: whole q8_1 blocks, one warp's worth of rms_norm_f32<256> columns
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_are_same_shape(x, mul) ||
+            !ggml_is_contiguous(w) || ggml_nelements(w) != x->ne[0] || x->ne[0] % WARP_SIZE != 0 || x->ne[0] > 256) {
+        return 0;
+    }
+    // the product's reader: the multiply with a SiLU just before it
+    int ip = -1;
+    for (int k = i + 2; k < cgraph->n_nodes && ip < 0; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t->src[0] == mul || t->src[1] == mul) {
+            ip = k;
+        }
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * m = nullptr;
+    int i_f = 0;
+    if (ip < i + 3 || !ggml_cuda_match_gated(cgraph, ip - 1, cc, &m, &i_f) || m != mul || cgraph->nodes[i_f]->ne[0] % x->ne[0] != 0) {
+        return 0;
+    }
+    // what runs until the SiLU leaves x and w alone and cannot take the SiLU into a launch of its own
+    const ggml_tensor * w_root  = w->view_src ? w->view_src : w;
+    const bool          w_const = w_root->buffer && ggml_backend_buffer_get_usage(w_root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    for (int k = i + 2; k < ip - 1; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(t, x) || (!w_const && ggml_cuda_tensors_overlap(t, w))) {
+            return 0;
+        }
+        if (t->op == GGML_OP_MUL_MAT && k + ggml_cuda_try_mm_epilogue(ctx, cgraph, k, true) >= ip - 1) {
+            return 0;
+        }
+    }
+    ggml_cuda_gated_norm g;
+    g.m = mul;
+    g.x = x;
+    g.w = w;
+    memcpy(&g.eps, norm->op_params, sizeof(float));
+    g_cuda_gated.push_back(g);
+    return 1;
+}
+
+// the SiLU at i: the gated product quantized for its matvec, which finds it as a ready norm fold
+static int ggml_cuda_try_gated_fold(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GATED_FOLD) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * m = nullptr;
+    int i_f = 0;
+    if (!ggml_cuda_match_gated(cgraph, i, cc, &m, &i_f)) {
+        return 0;
+    }
+    const ggml_tensor * s = cgraph->nodes[i];
+    const ggml_tensor * p = cgraph->nodes[i + 1];
+    const ggml_tensor * f = cgraph->nodes[i_f];
+    const ggml_cuda_gated_norm * g = nullptr;
+    for (const ggml_cuda_gated_norm & c : g_cuda_gated) {
+        g = c.m == m ? &c : g;
+    }
+    if (g == nullptr && ggml_cuda_norm_fold_for(ctx, m) != nullptr) {
+        return 0; // m itself was never written
+    }
+    const int64_t ne0   = f->ne[0];
+    const int64_t nrows = f->ne[1];
+    auto fold = std::make_shared<ggml_cuda_norm_fold>();
+    fold->norm          = const_cast<ggml_tensor *>(s);
+    fold->mul           = const_cast<ggml_tensor *>(p);
+    fold->x             = g ? g->x : m;
+    fold->w             = g ? g->w : m;
+    fold->eps           = g ? g->eps : 0.0f;
+    fold->n_rows        = nrows;
+    fold->q8_bytes      = nrows * (ne0 / QK8_1) * sizeof(block_q8_1);
+    fold->has_q8_reader = true;
+    ggml_cuda_norm_fold_reserve(ctx, *fold);
+    quantize_q8_1_gated_cuda(g ? nullptr : (const float *) m->data, g ? (const float *) g->x->data : nullptr,
+        g ? (const float *) g->w->data : nullptr, fold->eps, (const float *) s->src[0]->data, fold->q8, ne0, nrows,
+        g ? (int) g->x->ne[0] : 256, ctx.stream());
+    fold->q8_ready = true;
+    ctx.norm_folds[f] = fold;
+    if (g) {
+        g_cuda_gated.erase(g_cuda_gated.begin() + (g - g_cuda_gated.data()));
+    }
+    return i_f - i;
+}
+
 // a delta-net layer's input projection through its convolution: the matvec, the transpose and concat that put each
 // channel's state ahead of its tokens, the per-token state snapshot copies, and the convolution with its SiLU, as
 // one matvec launch whose row lanes convolve and publish the snapshots. It launches at the matvec. The convolution
@@ -4979,13 +5203,22 @@ static bool ggml_cuda_take_absorbed(const ggml_tensor * node) {
     return false;
 }
 
+// GGML_CUDA_TRACE_CONV=1: why a matvec was not taken with its convolution
+static int ggml_cuda_conv_reject(const int line, const int i) {
+    static const bool on = getenv("GGML_CUDA_TRACE_CONV") != nullptr;
+    if (on) {
+        fprintf(stderr, "[conv] node %d not taken at line %d\n", i, line);
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_CONV_PROJ) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * mm = cgraph->nodes[i];
     if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(mm)) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
@@ -4997,7 +5230,7 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
             !ggml_is_contiguous(src0) || ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
             !ggml_cuda_should_fuse_mul_mat_vec_q(mm) || !ggml_cuda_mmvq_conv_supported(src0->type, cc, T) ||
             ggml_node_get_use_count(cgraph, i) != 1) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
 
     // the concat: the first node after the matvec that is not a view, reading the transposed product after the state
@@ -5006,31 +5239,31 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
         ic++;
     }
     if (ic >= cgraph->n_nodes) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * cat = cgraph->nodes[ic];
     if (cat->op != GGML_OP_CONCAT || cat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cat, 0) != 0 || !ggml_is_contiguous(cat) ||
             cat->ne[0] != 3 + T || cat->ne[1] != C || cat->ne[2] != 1 || cat->ne[3] != 1) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * tr = cat->src[1];
     const ggml_tensor * st = cat->src[0];
     if (tr->op != GGML_OP_TRANSPOSE || tr->data != mm->data || tr->ne[0] != T || tr->ne[1] != C ||
             tr->nb[0] != (size_t) C*sizeof(float) || tr->nb[1] != sizeof(float)) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * rs = tr->src[0];
     if (rs != mm && !(rs->op == GGML_OP_RESHAPE && rs->src[0] == mm)) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     for (int k = i + 1; k < ic; ++k) {
         if ((cgraph->nodes[k] == tr || cgraph->nodes[k] == rs) && ggml_node_get_use_count(cgraph, k) != 1) {
-            return 0;
+            return ggml_cuda_conv_reject(__LINE__, i);
         }
     }
     if (st->type != GGML_TYPE_F32 || st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 ||
             st->nb[0] != sizeof(float) || st->nb[1] != 3*sizeof(float)) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
 
     // after the concat: its snapshot copies, unrelated nodes, and the convolution
@@ -5046,14 +5279,14 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
         const ggml_tensor * n = cgraph->nodes[k];
         if (n->op == GGML_OP_SSM_CONV) {
             if (n->src[0] != cat) {
-                return 0;
+                return ggml_cuda_conv_reject(__LINE__, i);
             }
             ik = k;
             break;
         }
         if (n->op == GGML_OP_VIEW && n->view_src == cat) {
             if (n_views == GGML_CUDA_CONV_SNAP_MAX) {
-                return 0;
+                return ggml_cuda_conv_reject(__LINE__, i);
             }
             snap_views[n_views] = n;
             view_idx[n_views++] = k;
@@ -5073,7 +5306,7 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
                     v->ne[0] != 3 || v->ne[1] != C || v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != sizeof(float) ||
                     v->nb[1] != cat->nb[1] || v->view_offs % sizeof(float) != 0 || v->view_offs/sizeof(float) > (size_t) T ||
                     d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || ggml_nelements(d) != 3*C || d->data == nullptr) {
-                return 0;
+                return ggml_cuda_conv_reject(__LINE__, i);
             }
             conv.snap[conv.n_snap]     = (float *) d->data;
             conv.snap_idx[conv.n_snap] = (int) (v->view_offs/sizeof(float));
@@ -5093,12 +5326,12 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
         others.push_back(k);
     }
     if (ik < 0 || ggml_node_get_use_count(cgraph, ic) != n_views + 1) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * sc = cgraph->nodes[ik];
     const ggml_tensor * cw = sc->src[1];
     if (sc->type != GGML_TYPE_F32 || cw->type != GGML_TYPE_F32 || cw->ne[0] != 4 || cw->ne[1] != C || cw->nb[0] != sizeof(float)) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * add  = nullptr;
     const ggml_tensor * out  = sc;
@@ -5109,7 +5342,7 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
         last = ik + 2;
         const ggml_tensor * bias = add->src[0] == sc ? add->src[1] : add->src[0];
         if (ggml_nelements(bias) != C || !ggml_is_contiguous(bias)) {
-            return 0;
+            return ggml_cuda_conv_reject(__LINE__, i);
         }
         conv.bias = (const float *) bias->data;
     } else if (ggml_cuda_can_fuse(cgraph, ik, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
@@ -5117,7 +5350,7 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
         last = ik + 1;
     }
     if (out->ne[0] != C || out->ne[1] != T || out->nb[0] != sizeof(float) || (out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-        return 0;
+        return ggml_cuda_conv_reject(__LINE__, i);
     }
 
     // the nodes that still run between the copies and the convolution neither read nor write what the launch writes
@@ -5129,48 +5362,51 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
                 continue;
             }
             if (ggml_cuda_tensors_overlap(t, out)) {
-                return 0;
+                return ggml_cuda_conv_reject(__LINE__, i);
             }
             for (int q = 0; q < conv.n_snap; ++q) {
                 const char * b = (const char *) conv.snap[q];
                 const char * e = b + 3*C*sizeof(float);
                 if (t->data && (const char *) t->data < e && b < (const char *) t->data + ggml_nbytes(t)) {
-                    return 0;
+                    return ggml_cuda_conv_reject(__LINE__, i);
                 }
             }
         }
     }
+    // a folded gather leaves the state in the cache, read in place as the concat would have read it; st itself is
+    // then never written, and its memory may be the output's
+    const ggml_cuda_state_fold * sfold = nullptr;
+    if (!ctx.state_folds.empty()) {
+        const auto it = ctx.state_folds.find(st->view_src ? st->view_src : st);
+        sfold = it != ctx.state_folds.end() ? &it->second : nullptr;
+    }
     // the output is written while the state, activation and taps are read by other lanes; the snapshots are distinct rows
     ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, src1);
-    for (const ggml_tensor * t : { st, src1, cw, fold ? fold->x : nullptr, fold ? fold->w : nullptr }) {
+    for (const ggml_tensor * t : { sfold ? nullptr : st, src1, cw, fold ? fold->x : nullptr, fold ? fold->w : nullptr }) {
         if (t != nullptr && ggml_cuda_tensors_overlap(t, out)) {
-            return 0;
+            return ggml_cuda_conv_reject(__LINE__, i);
         }
     }
     for (int q = 0; q < conv.n_snap; ++q) {
         const char * b = (const char *) conv.snap[q];
         if (b < (const char *) out->data + ggml_nbytes(out) && (const char *) out->data < b + 3*C*sizeof(float)) {
-            return 0;
+            return ggml_cuda_conv_reject(__LINE__, i);
         }
         for (int r = 0; r < q; ++r) {
             const char * o = (const char *) conv.snap[r];
             if (b < o + 3*C*sizeof(float) && o < b + 3*C*sizeof(float)) {
-                return 0;
+                return ggml_cuda_conv_reject(__LINE__, i);
             }
         }
     }
 
-    // the state row a folded gather left unread, as the concat would have read it
     conv.state_s1 = 3;
     conv.state    = (const float *) st->data;
-    if (!ctx.state_folds.empty()) {
-        const auto it = ctx.state_folds.find(st->view_src ? st->view_src : st);
-        if (it != ctx.state_folds.end()) {
-            conv.state     = it->second.base;
-            conv.state_ids = it->second.ids;
-            conv.state_row = it->second.row;
-            ctx.state_folds.erase(it);
-        }
+    if (sfold) {
+        conv.state     = sfold->base;
+        conv.state_ids = sfold->ids;
+        conv.state_row = sfold->row;
+        ctx.state_folds.erase(st->view_src ? st->view_src : st);
     }
     conv.w       = (const float *) cw->data;
     conv.w_s1    = (int) (cw->nb[1] / sizeof(float));
@@ -5306,6 +5542,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_GET_ROWS && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GET_ROWS_CPY)) {
         const int nodes_to_skip = ggml_cuda_try_get_rows_cpy(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_L2_NORM) {
+        const int nodes_to_skip = ggml_cuda_try_gdn_qk_norm(cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int nodes_to_skip = ggml_cuda_try_gated_norm(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_UNARY) {
+        const int nodes_to_skip = ggml_cuda_try_gated_fold(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
@@ -6381,6 +6638,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->state_writers_ready = false;
             g_cuda_absorbed.clear();
             g_cuda_no_fuse_until = 0;
+            g_cuda_gated.clear();
+            ggml_cuda_gated_delta_net_qk_norm_clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 // GGML_CUDA_TRACE_OPS=1: every op before its launch, for a synchronous fault hunt
@@ -6541,6 +6800,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->norm_folds.clear();
             cuda_ctx->ids_ready = nullptr;
             GGML_ASSERT(cuda_ctx->state_folds.empty() && "a recurrent state gather was folded into a reader that never ran");
+            GGML_ASSERT(g_cuda_gated.empty() && "a gated norm was left for a quantize that never ran");
+            GGML_ASSERT(ggml_cuda_gated_delta_net_qk_norm_pending() == 0 && "q/k norms were left for a recurrence that never ran");
             cuda_ctx->state_writers_ready = false;
             if (op_stats) { ggml_cuda_op_timer_get().flush(cuda_ctx->stream(), cgraph->n_nodes); }
         }
