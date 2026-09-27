@@ -42,6 +42,51 @@ static __global__ void sum_expert_rows_f32(const float * x_ptr, float * dst_ptr,
     *(float4 *) (dst + t*ne0 + col4) = acc;
 }
 
+template <int n_expert>
+static __global__ void sum_expert_rows_weighted_f32(const float * x_ptr, const float * w_ptr, float * dst_ptr,
+                                                    const int ne0, const int64_t s1, const int64_t s2, const int64_t ws1, const int64_t ws2) {
+    ggml_cuda_pdl_sync();
+    const float * GGML_CUDA_RESTRICT x   = x_ptr;
+    const float * GGML_CUDA_RESTRICT w   = w_ptr;
+    float       * GGML_CUDA_RESTRICT dst = dst_ptr;
+    const int t    = blockIdx.y;
+    const int col4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (col4 >= ne0) {
+        return;
+    }
+    const float * src = x + t*s2 + col4;
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int e = 0; e < n_expert; ++e) {
+        const float4 v  = *(const float4 *) (src + e*s1);
+        const float  we = w[e*ws1 + t*ws2];
+        acc.x = __fadd_rn(acc.x, __fmul_rn(v.x, we));
+        acc.y = __fadd_rn(acc.y, __fmul_rn(v.y, we));
+        acc.z = __fadd_rn(acc.z, __fmul_rn(v.z, we));
+        acc.w = __fadd_rn(acc.w, __fmul_rn(v.w, we));
+    }
+    *(float4 *) (dst + t*ne0 + col4) = acc;
+}
+
+static __global__ void sum_expert_rows_weighted_f32_any(const float * x_ptr, const float * w_ptr, float * dst_ptr, const int ne0,
+                                                        const int n_expert, const int64_t s1, const int64_t s2, const int64_t ws1, const int64_t ws2) {
+    ggml_cuda_pdl_sync();
+    const float * GGML_CUDA_RESTRICT x   = x_ptr;
+    const float * GGML_CUDA_RESTRICT w   = w_ptr;
+    float       * GGML_CUDA_RESTRICT dst = dst_ptr;
+    const int t   = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= ne0) {
+        return;
+    }
+    const float * src = x + t*s2 + col;
+    float acc = 0.0f;
+    for (int e = 0; e < n_expert; ++e) {
+        acc = __fadd_rn(acc, __fmul_rn(src[e*s1], w[e*ws1 + t*ws2]));
+    }
+    dst[t*ne0 + col] = acc;
+}
+
 static __global__ void sum_expert_rows_f32_any(const float * x_ptr, float * dst_ptr,
                                                const int ne0, const int n_expert, const int64_t s1, const int64_t s2) {
     ggml_cuda_pdl_sync();
@@ -58,6 +103,43 @@ static __global__ void sum_expert_rows_f32_any(const float * x_ptr, float * dst_
         acc += src[e*s1];
     }
     dst[t*ne0 + col] = acc;
+}
+
+void ggml_cuda_op_sum_expert_rows_weighted(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst, int n_expert) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int     ne0 = experts->ne[0];
+    const int     nt  = dst->ne[1];
+    const int64_t s1  = experts->nb[1] / sizeof(float);
+    const int64_t s2  = experts->nb[2] / sizeof(float);
+    const int64_t ws1 = weights->nb[1] / sizeof(float);
+    const int64_t ws2 = weights->nb[2] / sizeof(float);
+    cudaStream_t stream = ctx.stream();
+
+    const float * x = (const float *) experts->data;
+    const float * w = (const float *) weights->data;
+    float       * d = (float *) dst->data;
+
+    const bool vec4 = (ne0 % 4 == 0) && (s1 % 4 == 0) && (s2 % 4 == 0) &&
+                      ((uintptr_t) experts->data % 16 == 0) && ((uintptr_t) dst->data % 16 == 0);
+    if (vec4 && (n_expert == 4 || n_expert == 6 || n_expert == 8 || n_expert == 10 || n_expert == 16)) {
+        const dim3 block_dims(128, 1, 1);
+        const dim3 block_nums((ne0/4 + 127) / 128, nt, 1);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        switch (n_expert) {
+            case  4: ggml_cuda_kernel_launch(sum_expert_rows_weighted_f32< 4>, lp, x, w, d, ne0, s1, s2, ws1, ws2); break;
+            case  6: ggml_cuda_kernel_launch(sum_expert_rows_weighted_f32< 6>, lp, x, w, d, ne0, s1, s2, ws1, ws2); break;
+            case  8: ggml_cuda_kernel_launch(sum_expert_rows_weighted_f32< 8>, lp, x, w, d, ne0, s1, s2, ws1, ws2); break;
+            case 10: ggml_cuda_kernel_launch(sum_expert_rows_weighted_f32<10>, lp, x, w, d, ne0, s1, s2, ws1, ws2); break;
+            case 16: ggml_cuda_kernel_launch(sum_expert_rows_weighted_f32<16>, lp, x, w, d, ne0, s1, s2, ws1, ws2); break;
+        }
+        return;
+    }
+    const dim3 block_dims(256, 1, 1);
+    const dim3 block_nums((ne0 + 255) / 256, nt, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(sum_expert_rows_weighted_f32_any, lp, x, w, d, ne0, n_expert, s1, s2, ws1, ws2);
 }
 
 void ggml_cuda_op_sum_expert_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, ggml_tensor * dst, int n_expert) {

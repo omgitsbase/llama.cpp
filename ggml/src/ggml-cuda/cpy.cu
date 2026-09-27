@@ -41,6 +41,44 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+static __global__ void cpy_run_4b(const ggml_cuda_cpy_run run) {
+    ggml_cuda_pdl_lc();
+    const ggml_cuda_cpy_run_item & it = run.item[blockIdx.y];
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= it.ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(it.ne0[0]*it.ne0[1]*it.ne0[2]);
+    const int64_t i02 = (i - i03*it.ne0[0]*it.ne0[1]*it.ne0[2]) / (it.ne0[0]*it.ne0[1]);
+    const int64_t i01 = (i - i03*it.ne0[0]*it.ne0[1]*it.ne0[2] - i02*it.ne0[1]*it.ne0[0]) / it.ne0[0];
+    const int64_t i00 = i - i03*it.ne0[0]*it.ne0[1]*it.ne0[2] - i02*it.ne0[1]*it.ne0[0] - i01*it.ne0[0];
+
+    const int64_t i13 = i/(it.ne1[0]*it.ne1[1]*it.ne1[2]);
+    const int64_t i12 = (i - i13*it.ne1[0]*it.ne1[1]*it.ne1[2]) / (it.ne1[0]*it.ne1[1]);
+    const int64_t i11 = (i - i13*it.ne1[0]*it.ne1[1]*it.ne1[2] - i12*it.ne1[0]*it.ne1[1]) / it.ne1[0];
+    const int64_t i10 = i - i13*it.ne1[0]*it.ne1[1]*it.ne1[2] - i12*it.ne1[0]*it.ne1[1] - i11*it.ne1[0];
+
+    const char * x = it.src + i00*it.nb0[0] + i01*it.nb0[1] + i02*it.nb0[2] + i03*it.nb0[3];
+    char       * d = it.dst + i10*it.nb1[0] + i11*it.nb1[1] + i12*it.nb1[2] + i13*it.nb1[3];
+
+    ggml_cuda_pdl_sync();
+    *(uint32_t *) d = *(const uint32_t *) x;
+}
+
+void ggml_cuda_cpy_run_4b(const ggml_cuda_cpy_run & run, cudaStream_t stream) {
+    GGML_ASSERT(run.n >= 1 && run.n <= GGML_CUDA_CPY_RUN_MAX);
+    int64_t ne_max = 0;
+    for (int k = 0; k < run.n; ++k) {
+        ne_max = std::max(ne_max, run.item[k].ne);
+    }
+    const int64_t num_blocks = (ne_max + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3((unsigned) num_blocks, (unsigned) run.n, 1), CUDA_CPY_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(cpy_run_4b, launch_params, run);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,

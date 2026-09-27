@@ -153,6 +153,48 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// concat_non_cont for narrow rows (a conv window is a handful of columns over thousands of channels): a thread per
+// element over the flattened destination, each element taken exactly as concat_non_cont takes it
+template <typename T, int dim>
+static __global__ void concat_non_cont_flat(
+        const char * src0, const char * src1, char * dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t n,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3,
+        const int32_t * src0_ids, const int64_t src0_row) {
+    ggml_cuda_pdl_lc();
+    const int64_t k = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) {
+        return;
+    }
+    const int64_t i0 = k % ne0;
+    int64_t       t  = k / ne0;
+    const int64_t i1 = t % ne1;
+    t /= ne1;
+    const int64_t i2 = t % ne2;
+    const int64_t i3 = t / ne2;
+
+    ggml_cuda_pdl_sync();
+    if (src0_ids) {
+        src0 += src0_ids[0] * src0_row;
+    }
+    const T * x;
+    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+        x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+    } else if constexpr (dim == 0) {
+        x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+    } else if constexpr (dim == 1) {
+        x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+    } else if constexpr (dim == 2) {
+        x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+    } else {
+        x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+    }
+    *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream,
                         const ggml_cuda_state_fold * fold = nullptr) {
@@ -183,6 +225,27 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
+        const int64_t n_flat = ggml_nelements(dst);
+        if (dst->ne[0] < 32 && n_flat <= (int64_t) INT_MAX * CUDA_CONCAT_BLOCK_SIZE) {
+            const int64_t n_blocks = (n_flat + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((unsigned) n_blocks, 1, 1), CUDA_CONCAT_BLOCK_SIZE, 0, stream);
+            auto launch_flat = [&](auto d) {
+                ggml_cuda_kernel_launch(concat_non_cont_flat<T, decltype(d)::value>, lp,
+                    src0_data, (const char *) src1->data, (char *) dst->data,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                    src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                    dst->ne[0], dst->ne[1], dst->ne[2], n_flat,
+                    dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], src0_ids, src0_row);
+            };
+            switch (dim) {
+                case 0: launch_flat(std::integral_constant<int, 0>{}); return;
+                case 1: launch_flat(std::integral_constant<int, 1>{}); return;
+                case 2: launch_flat(std::integral_constant<int, 2>{}); return;
+                case 3: launch_flat(std::integral_constant<int, 3>{}); return;
+                default: GGML_ABORT("Invalid dim: %d", dim);
+            }
+        }
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(

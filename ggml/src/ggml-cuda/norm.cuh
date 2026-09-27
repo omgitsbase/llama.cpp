@@ -25,4 +25,7 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // two l2_norms over adjacent views of one tensor, as one launch
+// two l2 norms of one shape and eps whose sources share strides, anywhere: one launch
+void ggml_cuda_op_l2_norm_pair2(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b);
+
 void ggml_cuda_op_l2_norm_pair(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b);

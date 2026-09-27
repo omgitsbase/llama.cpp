@@ -2929,6 +2929,27 @@ static bool ggml_cuda_should_fuse_l2_norm_pair(const ggml_tensor * a, const ggml
     return src_adjacent && dst_adjacent;
 }
 
+// Two L2 norms of one shape, eps and source strides, 3-D at most, contiguous outputs: q and k of a delta-net layer at
+// any number of tokens. Neither may write what the other reads, since both run in one launch.
+static bool ggml_cuda_should_fuse_l2_norm_pair2(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->op != GGML_OP_L2_NORM || b->op != GGML_OP_L2_NORM || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * sa = a->src[0];
+    const ggml_tensor * sb = b->src[0];
+    if (sa->type != GGML_TYPE_F32 || sb->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, b) || a->ne[3] != 1 ||
+            memcmp(a->op_params, b->op_params, sizeof(float)) != 0) {
+        return false;
+    }
+    if (sa->nb[0] != sizeof(float) || sa->nb[1] != sb->nb[1] || sa->nb[2] != sb->nb[2] || !ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        return false;
+    }
+    if (a->ne[1] > 65535 || a->ne[2] > 65535) {
+        return false;
+    }
+    return !ggml_cuda_tensors_overlap(a, sb) && !ggml_cuda_tensors_overlap(b, sa) && !ggml_cuda_tensors_overlap(a, b);
+}
+
 // The mixture-of-experts combine is emitted as n_expert_used - 1 chained
 // ADDs over 2D views of one [n_embd, n_expert_used, n_tokens] tensor, each
 // view one expert row further along. That is one strided row-sum. Returns
@@ -2981,6 +3002,48 @@ static int ggml_cuda_match_expert_sum(const ggml_cgraph * cgraph, int i, const g
     }
     *experts_out = experts;
     return last - i + 1;
+}
+
+// x [ne0, n_expert, n_tokens] times the router weights [1, n_expert, n_tokens], then the combine over its expert rows:
+// the weighted sum in one launch, each product rounded before it is added, in the ADDs' order. Returns the nodes
+// covered past i.
+static constexpr uint64_t GGML_CUDA_FUSE_EXPERT_WSUM = 1ull << 41;
+
+static int ggml_cuda_try_expert_wsum(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * mul = cgraph->nodes[i];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * w = mul->src[1];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, mul) || !ggml_is_contiguous(x) ||
+            !ggml_is_contiguous(mul) || w->ne[0] != 1 || w->ne[1] != x->ne[1] || w->ne[2] != x->ne[2] || x->ne[3] != 1 || w->ne[3] != 1) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && cgraph->nodes[j]->op == GGML_OP_VIEW &&
+            cgraph->nodes[j]->view_src == mul) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * experts = nullptr;
+    const int n_adds = ggml_cuda_match_expert_sum(cgraph, j, &experts);
+    if (n_adds == 0 || experts != mul) {
+        return 0;
+    }
+    // the product is read only through the combine's views, each read once
+    if (ggml_node_get_use_count(cgraph, i) != j - i - 1) {
+        return 0;
+    }
+    for (int k = i + 1; k < j; ++k) {
+        if (ggml_node_get_use_count(cgraph, k) != 1) {
+            return 0;
+        }
+    }
+    ggml_cuda_op_sum_expert_rows_weighted(ctx, x, w, cgraph->nodes[j + n_adds - 1], (int) x->ne[1]);
+    return j + n_adds - 1 - i;
 }
 
 // rms_norm > scale(const) > mul(weight): the scalar folds into the weight
@@ -4818,6 +4881,75 @@ static int ggml_cuda_try_mmvq_pair(ggml_backend_cuda_context & ctx, const ggml_c
     return 0;
 }
 
+// consecutive copies (views between them are nothing to launch) of 4-byte elements, where none reads or writes what an
+// earlier one writes and none writes what an earlier one reads, run as one launch: the recurrent cache's per-token
+// snapshot copies are four of these a layer. Returns the nodes the run covers past i.
+static constexpr uint64_t GGML_CUDA_FUSE_CPY_RUN = 1ull << 40;
+
+static int ggml_cuda_try_cpy_run(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_CPY_RUN) {
+        return 0;
+    }
+    auto fits = [](const ggml_tensor * n) {
+        const ggml_tensor * src = n->src[0];
+        const ggml_tensor * dst = n->src[1];
+        return n->op == GGML_OP_CPY && !ggml_is_empty(n) && src && dst && src->type == dst->type &&
+               ggml_blck_size(src->type) == 1 && ggml_type_size(src->type) == 4 &&
+               ggml_nelements(src) == ggml_nelements(dst) && src->data && dst->data;
+    };
+    if (!fits(cgraph->nodes[i])) {
+        return 0;
+    }
+
+    const ggml_tensor * nodes[GGML_CUDA_CPY_RUN_MAX];
+    int n    = 0;
+    int last = i;
+    for (int j = i; j < cgraph->n_nodes && n < GGML_CUDA_CPY_RUN_MAX; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (j > i && (ggml_cuda_is_view_or_noop(node) || ggml_is_empty(node))) {
+            continue;
+        }
+        if (!fits(node)) {
+            break;
+        }
+        bool independent = true;
+        for (int k = 0; k < n && independent; ++k) {
+            independent = !ggml_cuda_tensors_overlap(node->src[0], nodes[k]->src[1]) &&
+                          !ggml_cuda_tensors_overlap(node->src[1], nodes[k]->src[1]) &&
+                          !ggml_cuda_tensors_overlap(node->src[1], nodes[k]->src[0]);
+        }
+        if (!independent) {
+            break;
+        }
+        nodes[n++] = node;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+
+    ggml_cuda_cpy_run run{};
+    run.n = n;
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * src = nodes[k]->src[0];
+        const ggml_tensor * dst = nodes[k]->src[1];
+        ggml_cuda_cpy_run_item & it = run.item[k];
+        it.src = (const char *) src->data;
+        it.dst = (char *) dst->data;
+        it.ne  = ggml_nelements(src);
+        for (int d = 0; d < 3; ++d) {
+            it.ne0[d] = src->ne[d];
+            it.ne1[d] = dst->ne[d];
+        }
+        for (int d = 0; d < 4; ++d) {
+            it.nb0[d] = src->nb[d];
+            it.nb1[d] = dst->nb[d];
+        }
+    }
+    ggml_cuda_cpy_run_4b(run, ctx.stream());
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4837,6 +4969,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_GET_ROWS && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GET_ROWS_CPY)) {
         const int nodes_to_skip = ggml_cuda_try_get_rows_cpy(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_CPY) {
+        const int nodes_to_skip = ggml_cuda_try_cpy_run(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
@@ -5607,6 +5746,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // the router-weight multiply of every expert's output and the combine after it, as one weighted sum
+    if (node->op == GGML_OP_MUL && !(ggml_cuda_fuse_off_mask() & (GGML_CUDA_FUSE_EXPERT_SUM | GGML_CUDA_FUSE_EXPERT_WSUM))) {
+        const int n_nodes = ggml_cuda_try_expert_wsum(*cuda_ctx, cgraph, i);
+        if (n_nodes > 0) {
+            return n_nodes;
+        }
+    }
+
     // the expert combine: a chain of ADDs over one tensor's rows, as one sum
     if (node->op == GGML_OP_ADD && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_EXPERT_SUM)) {
         const ggml_tensor * experts = nullptr;
@@ -5623,6 +5770,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_should_fuse_l2_norm_pair(node, cgraph->nodes[i + 1])) {
         ggml_cuda_op_l2_norm_pair(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // two l2_norms of one shape with views between them, as one launch over two sources
+    if (node->op == GGML_OP_L2_NORM && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_L2_PAIR)) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || ggml_is_empty(cgraph->nodes[j]))) {
+            j++;
+        }
+        if (j < cgraph->n_nodes && ggml_cuda_should_fuse_l2_norm_pair2(node, cgraph->nodes[j])) {
+            ggml_cuda_op_l2_norm_pair2(*cuda_ctx, node, cgraph->nodes[j]);
+            return j - i;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
