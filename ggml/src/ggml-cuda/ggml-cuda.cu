@@ -5994,7 +5994,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 const ggml_tensor * gate_scale = get_mul_mat_scale(gate_scale_n, gate_n);
                 const ggml_tensor * up_scale   = get_mul_mat_scale(up_scale_n, up_n);
-                if (!gate_scale || !up_scale) {
+                // the multi-token expert kernel carries the gate alone, not the per-expert scales
+                if (!gate_scale || !up_scale || up_n->ne[2] != 1) {
                     continue;
                 }
 
@@ -6091,7 +6092,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         cgraph->nodes[gate_idx + 3], gate_scale_n, gate_n);
                 const ggml_tensor * up_scale = get_mul_mat_id_scale(cgraph->nodes[up_idx + 1], cgraph->nodes[up_idx + 2],
                         cgraph->nodes[up_idx + 3], up_scale_n, up_n);
-                if (!gate_scale || !up_scale) {
+                // the multi-token expert kernel carries the gate alone, not the per-expert scales
+                if (!gate_scale || !up_scale || up_n->ne[2] != 1) {
                     continue;
                 }
 
@@ -6288,7 +6290,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             } else {
                 scale = get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3], scale_node, mm_node);
             }
-            if (!scale) {
+            // the multi-token expert kernel carries no per-expert scale
+            if (!scale || (op == GGML_OP_MUL_MAT_ID && mm_node->ne[2] != 1)) {
                 continue;
             }
 
