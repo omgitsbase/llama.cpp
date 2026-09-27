@@ -35,6 +35,7 @@
 #include <mutex>
 #include <numeric>
 #include <regex>
+#include <thread>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1276,14 +1277,49 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 // ids are ascending, so the rows for one span of the head land in one span of the draft head
+// the draft head's rows in its own type: a gathered row of another type is dequantized and quantized again, on
+// several threads, which only a proposal ever reads (every drafted token is checked against the full head)
+static void llama_model_requant_rows(const ggml_tensor * head, const ggml_tensor * draft, const uint8_t * src, uint8_t * dst, int64_t nrows) {
+    const int64_t ne0   = head->ne[0];
+    const size_t  srow  = head->nb[1];
+    const size_t  drow  = ggml_row_size(draft->type, ne0);
+    const auto *  tt    = ggml_get_type_traits(head->type);
+    const int     n_thr = (int) std::max<int64_t>(1, std::min<int64_t>(nrows, std::min(16u, std::max(1u, std::thread::hardware_concurrency()))));
+    std::vector<std::thread> workers;
+    for (int t = 0; t < n_thr; ++t) {
+        workers.emplace_back([&, t]() {
+            const int64_t a = nrows*t/n_thr;
+            const int64_t b = nrows*(t + 1)/n_thr;
+            std::vector<float> f(ne0);
+            for (int64_t r = a; r < b; ++r) {
+                if (head->type == GGML_TYPE_F32) {
+                    memcpy(f.data(), src + r*srow, ne0*sizeof(float));
+                } else {
+                    tt->to_float(src + r*srow, f.data(), ne0);
+                }
+                ggml_quantize_chunk(draft->type, f.data(), dst + r*drow, 0, 1, ne0, nullptr);
+            }
+        });
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
 static void llama_model_fill_draft_head(const ggml_tensor * head, ggml_tensor * draft, ggml_tensor * draft_ids, const std::vector<int32_t> & ids) {
     const int64_t n = (int64_t) ids.size();
     ggml_backend_tensor_set(draft_ids, ids.data(), 0, n*sizeof(int32_t));
 
-    const size_t  row   = head->nb[1];
-    const int64_t chunk = std::max<int64_t>(1, (64 << 20) / row);
+    const bool    requant = draft->type != head->type;
+    const size_t  row     = head->nb[1];
+    const size_t  drow    = draft->nb[1];
+    const int64_t chunk   = std::max<int64_t>(1, (64 << 20) / row);
     std::vector<uint8_t> src(chunk*row);
     std::vector<uint8_t> dst(chunk*row);
+    std::vector<uint8_t> qdst(requant ? chunk*drow : 0);
+    if (requant) {
+        ggml_quantize_init(draft->type);
+    }
     int64_t k = 0;
     for (int64_t r0 = 0; r0 < head->ne[1] && k < n; r0 += chunk) {
         const int64_t r1 = std::min(head->ne[1], r0 + chunk);
@@ -1295,7 +1331,12 @@ static void llama_model_fill_draft_head(const ggml_tensor * head, ggml_tensor * 
         for (; k < n && ids[k] < r1; ++k) {
             memcpy(dst.data() + (k - k0)*row, src.data() + (ids[k] - r0)*row, row);
         }
-        ggml_backend_tensor_set(draft, dst.data(), k0*row, (k - k0)*row);
+        if (requant) {
+            llama_model_requant_rows(head, draft, dst.data(), qdst.data(), k - k0);
+            ggml_backend_tensor_set(draft, qdst.data(), k0*drow, (k - k0)*drow);
+        } else {
+            ggml_backend_tensor_set(draft, dst.data(), k0*row, (k - k0)*row);
+        }
     }
 }
 
@@ -1724,7 +1765,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if ((mtp_draft || dv_model) && split_mode != LLAMA_SPLIT_MODE_TENSOR && !llama_draft_vocab_off()) {
         ggml_tensor * shared = mtp_draft ? layers[hparams.n_layer()].nextn.shared_head_head : nullptr;
         ggml_tensor * head   = shared ? shared : output;
-        const int64_t n      = LLAMA_DRAFT_VOCAB_ROWS;
+        // the proposal head: LLAMA_DRAFT_HEAD_ROWS of the most frequent rows (default LLAMA_DRAFT_VOCAB_ROWS) in
+        // LLAMA_DRAFT_HEAD_TYPE (default q4_K; "same" keeps the head's own type)
+        int64_t n = LLAMA_DRAFT_VOCAB_ROWS;
+        if (const char * e = getenv("LLAMA_DRAFT_HEAD_ROWS")) {
+            n = std::max<int64_t>(1024, atoll(e));
+        }
+        ggml_type dtype = GGML_TYPE_Q4_K;
+        if (const char * e = getenv("LLAMA_DRAFT_HEAD_TYPE")) {
+            dtype = head ? head->type : dtype;
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                const char * name = ggml_type_name((ggml_type) t);
+                if (strcmp(e, "same") != 0 && name && strcmp(name, e) == 0) {
+                    dtype = (ggml_type) t;
+                }
+            }
+        }
+        if (head && (head->ne[0] % ggml_blck_size(dtype) != 0 || ggml_get_type_traits(dtype)->from_float_ref == nullptr ||
+                ggml_quantize_requires_imatrix(dtype) ||
+                (head->type != GGML_TYPE_F32 && ggml_get_type_traits(head->type)->to_float == nullptr))) {
+            dtype = head->type;
+        }
 
         ggml_backend_buffer_type_t buft = nullptr;
         for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
@@ -1739,7 +1800,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (on_gpu && head->ne[1] >= (int64_t) vocab.n_tokens() && 3*(int64_t) vocab.n_tokens() >= 4*n) {
             ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
             ggml_context_ptr ctx { ggml_init(ip) };
-            ggml_tensor * draft     = ggml_new_tensor_2d(ctx.get(), head->type, head->ne[0], n);
+            ggml_tensor * draft     = ggml_new_tensor_2d(ctx.get(), dtype, head->ne[0], n);
             ggml_tensor * draft_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n);
             ggml_set_name(draft,     "output_draft.weight");
             ggml_set_name(draft_ids, "output_draft_ids.weight");

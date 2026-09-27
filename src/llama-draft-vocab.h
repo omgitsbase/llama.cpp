@@ -11,7 +11,7 @@
 struct llama_vocab;
 struct ggml_tensor;
 
-#define LLAMA_DRAFT_VOCAB_ROWS     65536
+#define LLAMA_DRAFT_VOCAB_ROWS     131072
 #define LLAMA_DRAFT_VOCAB_TRUSTED  16384 // counts rank the rows once this many tokens were seen
 
 struct llama_draft_head {
