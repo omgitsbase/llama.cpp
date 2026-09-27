@@ -554,7 +554,56 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-// fusion_mode: 0 none, 1 the lean epilogue (no gate), 2 gate, bias and scales
+// fusion_mode 3 carries the convolution epilogue in place of the elementwise one
+template <int fusion_mode>
+using mmvq_epi_t = std::conditional_t<fusion_mode == 3, ggml_cuda_mmvq_conv, ggml_cuda_mm_epilogue_t<fusion_mode>>;
+
+// one channel's convolution as ssm_conv_f32 computes it, over the window [state, projected values], then its snapshots.
+// The state is read before any snapshot is written, and a snapshot row that is the state row is this channel's alone.
+template <int ncols_dst>
+static __device__ __forceinline__ void mmvq_conv_row(const ggml_cuda_mmvq_conv & e, const int c, const float * v) {
+    constexpr int d_conv = 4;
+    const float * s = e.state + (e.state_ids ? (int64_t) e.state_ids[0]*e.state_row : 0) + (int64_t) c*e.state_s1;
+    float win[d_conv - 1 + ncols_dst];
+#pragma unroll
+    for (int m = 0; m < d_conv - 1; ++m) {
+        win[m] = s[m];
+    }
+#pragma unroll
+    for (int t = 0; t < ncols_dst; ++t) {
+        win[d_conv - 1 + t] = v[t];
+    }
+    float w[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        w[j] = e.w[(int64_t) c*e.w_s1 + j];
+    }
+    const float b = e.bias != nullptr ? e.bias[c] : 0.0f;
+#pragma unroll
+    for (int t = 0; t < ncols_dst; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += win[t + j] * w[j];
+        }
+        sumf += b;
+        e.y[(int64_t) t*e.y_s1 + c] = e.silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    }
+    for (int k = 0; k < e.n_snap; ++k) {
+        float * d = e.snap[k] + (int64_t) c*e.snap_s1;
+#pragma unroll
+        for (int i0 = 0; i0 <= ncols_dst; ++i0) {
+            if (i0 == e.snap_idx[k]) {
+#pragma unroll
+                for (int m = 0; m < d_conv - 1; ++m) {
+                    d[m] = win[i0 + m];
+                }
+            }
+        }
+    }
+}
+
+// fusion_mode: 0 none, 1 the lean epilogue (no gate), 2 gate, bias and scales, 3 the convolution
 // one_row: each block takes a single row, for batched launches too small to fill the GPU with two
 template <ggml_type type, int ncols_dst, int fusion_mode, bool small_k, bool one_row>
 static __device__ __forceinline__ void mul_mat_vec_q_impl(
@@ -564,7 +613,7 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const uint32_t ids_stride, const uint32_t nrows_x, const ggml_cuda_mv_pf & pf, const bool release, const uint32_t nchannels_x,
-        const ggml_cuda_mm_epilogue_t<fusion_mode> & epi, const uint32_t block_x) {
+        const mmvq_epi_t<fusion_mode> & epi, const uint32_t block_x) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -780,6 +829,9 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
+    // the convolution holds its row's values for every column until the last one is summed
+    [[maybe_unused]] float conv_v[ncols_dst];
+
     // sum up partial sums and write back result
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
@@ -833,8 +885,18 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
                 if constexpr (fusion_mode == 1) {
                     result = ggml_cuda_mm_epi_apply(epi, result, epi_arg[0][j], epi_arg[1][j], epi_arg[2][j]);
                 }
-                dst[j*stride_col_dst + i] = result;
+                if constexpr (fusion_mode == 3) {
+                    conv_v[j] = result;
+                } else {
+                    dst[j*stride_col_dst + i] = result;
+                }
             }
+        }
+    }
+
+    if constexpr (fusion_mode == 3) {
+        if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            mmvq_conv_row<ncols_dst>(epi, row0 + threadIdx.x, conv_v);
         }
     }
 
@@ -905,6 +967,20 @@ static __global__ void mul_mat_vec_q_members(const void * vy, const uint32_t nco
     mul_mat_vec_q_impl<type, ncols_dst, 0, small_k, false>(
         vx, vy, nullptr, fusion, dst, ncols_x, one, stride_row_x, stride_col_y, stride_col_dst,
         one, 0, 0, 0, one, 0, 0, 0, 0, nrows, pf, false, 1, ggml_cuda_mm_epilogue_none{}, blockIdx.x - block0);
+}
+
+// the input projection with its convolution: rows split into blocks as mul_mat_vec_q splits them, so every row sums
+// as it would there
+template <ggml_type type, int ncols_dst>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_conv(const void * vx, const void * vy, const uint32_t ncols_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t nrows, const ggml_cuda_mmvq_conv conv) {
+    const ggml_cuda_mm_fusion_args_device fusion{};
+    const ggml_cuda_mv_pf pf{};
+    const uint3 one = make_uint3(0, 0, 1);
+    mul_mat_vec_q_impl<type, ncols_dst, 3, false, false>(
+        vx, vy, nullptr, fusion, conv.y, ncols_x, one, stride_row_x, stride_col_y, 0,
+        one, 0, 0, 0, one, 0, 0, 0, 0, nrows, pf, false, 1, conv, blockIdx.x);
 }
 
 // Dedicated MoE multi-token kernel.
@@ -1791,6 +1867,97 @@ static void mul_mat_vec_q_pair_switch_type(const ggml_type type, const void * vy
         MMVQ_PAIR_CASE(GGML_TYPE_IQ4_XS)
         MMVQ_PAIR_CASE(GGML_TYPE_IQ3_S)
 #undef MMVQ_PAIR_CASE
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+template <ggml_type type, int ncols_dst>
+static void mul_mat_vec_q_conv_launch(const void * vx, const void * vy, const uint32_t ncols_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t nrows, const ggml_cuda_mmvq_conv & conv, const int device, cudaStream_t stream) {
+    const int cc        = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id);
+    const int rpb    = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+    const ggml_cuda_kernel_launch_params launch_params(dim3((nrows + rpb - 1) / rpb, 1, 1), dim3(warp_size, nwarps, 1), 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_conv<type, ncols_dst>, launch_params, vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv);
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_conv_switch_ncols_dst(const void * vx, const void * vy, const uint32_t ncols_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t nrows, const int ncols_dst, const ggml_cuda_mmvq_conv & conv, const int device,
+        cudaStream_t stream) {
+    switch (ncols_dst) {
+        case 2: mul_mat_vec_q_conv_launch<type, 2>(vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv, device, stream); break;
+        case 3: mul_mat_vec_q_conv_launch<type, 3>(vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv, device, stream); break;
+        case 4: mul_mat_vec_q_conv_launch<type, 4>(vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv, device, stream); break;
+        case 5: mul_mat_vec_q_conv_launch<type, 5>(vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv, device, stream); break;
+        case 6: mul_mat_vec_q_conv_launch<type, 6>(vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv, device, stream); break;
+        case 7: mul_mat_vec_q_conv_launch<type, 7>(vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv, device, stream); break;
+        case 8: mul_mat_vec_q_conv_launch<type, 8>(vx, vy, ncols_x, stride_row_x, stride_col_y, nrows, conv, device, stream); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+#define MMVQ_CONV_TYPES(X) \
+    X(GGML_TYPE_Q4_0) X(GGML_TYPE_Q4_1) X(GGML_TYPE_Q5_0) X(GGML_TYPE_Q5_1) X(GGML_TYPE_Q8_0) X(GGML_TYPE_MXFP4) \
+    X(GGML_TYPE_Q2_K) X(GGML_TYPE_Q3_K) X(GGML_TYPE_Q4_K) X(GGML_TYPE_Q5_K) X(GGML_TYPE_Q6_K) \
+    X(GGML_TYPE_IQ2_XXS) X(GGML_TYPE_IQ2_XS) X(GGML_TYPE_IQ2_S) X(GGML_TYPE_IQ3_XXS) X(GGML_TYPE_IQ1_S) X(GGML_TYPE_IQ1_M) \
+    X(GGML_TYPE_IQ4_NL) X(GGML_TYPE_IQ4_XS) X(GGML_TYPE_IQ3_S)
+
+bool ggml_cuda_mmvq_conv_supported(const ggml_type type, const int cc, const int64_t ncols_dst) {
+    if (ncols_dst < 2 || ncols_dst > MMVQ_MAX_BATCH_SIZE || !ggml_cuda_should_use_mmvq(type, cc, ncols_dst) ||
+            ggml_cuda_mmvq_mma_supported(type, cc, ncols_dst)) {
+        return false;
+    }
+    switch (type) {
+#define MMVQ_CONV_CASE(t) case t: return true;
+        MMVQ_CONV_TYPES(MMVQ_CONV_CASE)
+#undef MMVQ_CONV_CASE
+        default: return false;
+    }
+}
+
+void ggml_cuda_mul_mat_vec_q_conv(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_cuda_norm_fold * fold,
+        const ggml_cuda_mmvq_conv & conv) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_type     type = src0->type;
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t  q8_bytes    = ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const int64_t s11_src = src1->nb[1] / sizeof(float);
+    const int64_t s12_src = src1->nb[2] / sizeof(float);
+    const int64_t s13_src = src1->nb[3] / sizeof(float);
+
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    char * q8 = nullptr;
+    if (fold) {
+        GGML_ASSERT(fold->x->type == GGML_TYPE_F32 && fold->w->type == GGML_TYPE_F32 && fold->q8_bytes == q8_bytes);
+        ggml_cuda_norm_fold_reserve(ctx, *fold);
+        if (!fold->q8_ready) {
+            quantize_row_q8_1_rms_cuda((const float *) fold->x->data, (const float *) fold->w->data,
+                ggml_cuda_tensor_is_constant(fold->w), fold->eps, fold->q8, fold->scale,
+                ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, 1, 1, ggml_cuda_l2_pf{}, stream);
+            fold->q8_ready    = true;
+            fold->scale_ready = true;
+        }
+        q8 = (char *) fold->q8;
+    } else {
+        q8 = src1_q8_1.alloc(q8_bytes);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q8, type, ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, 1, 1, stream);
+    }
+
+    const uint32_t stride_row_x = src0->nb[1] / ggml_type_size(type);
+    const uint32_t stride_col_y = ne10_padded / QK8_1;
+    switch (type) {
+#define MMVQ_CONV_CASE(t) case t: mul_mat_vec_q_conv_switch_ncols_dst<t>(src0->data, q8, ne10, stride_row_x, stride_col_y, \
+            src0->ne[1], (int) ne11, conv, ctx.device, stream); break;
+        MMVQ_CONV_TYPES(MMVQ_CONV_CASE)
+#undef MMVQ_CONV_CASE
         default: GGML_ABORT("fatal error");
     }
 }
