@@ -4424,36 +4424,11 @@ static bool ggml_cuda_mm_epi_arg_of(const ggml_tensor * mm, const ggml_tensor * 
 
 // a matvec and the elementwise ops after it, applied in graph order by the matvec's epilogue before the store;
 // dry_run only reports how many nodes it would take
-static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, const bool dry_run = false) {
-    const ggml_tensor * mm = cgraph->nodes[i];
-    if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MM_EPILOGUE)) {
-        return 0;
-    }
-    const ggml_tensor * src0 = mm->src[0];
+// the elementwise ops after the matvec at node i as an epilogue over its output: fills epi and the tensors it reads,
+// and returns the last node taken (i when none)
+static int ggml_cuda_mm_epi_collect(const ggml_cgraph * cgraph, const int i, ggml_cuda_mm_epilogue & epi, const ggml_tensor ** args) {
+    const ggml_tensor * mm   = cgraph->nodes[i];
     const ggml_tensor * src1 = mm->src[1];
-    // a verify of several columns already has each row's loads well covered, and the epilogue's own cost it
-    if (src0->type == GGML_TYPE_NVFP4 || mm->type != GGML_TYPE_F32 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-        !ggml_is_contiguous(mm) || mm->ne[1] != 1 || src0->buffer == nullptr ||
-        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-        return 0;
-    }
-    const int  cc    = ggml_cuda_info().devices[ctx.device].cc;
-    const bool quant = ggml_is_quantized(src0->type);
-    if (quant) {
-        if ((mm->ne[1] == 1 && !ggml_cuda_mm_epi_lean_t1()) ||
-            !ggml_cuda_should_fuse_mul_mat_vec_q(mm) || !ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
-            return 0;
-        }
-    } else {
-        const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-            ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-        if (mm->ne[1] != 1 || bad_padding_clear || src1->type != GGML_TYPE_F32 || !ggml_cuda_should_fuse_mul_mat_vec_f(mm)) {
-            return 0;
-        }
-    }
-
-    ggml_cuda_mm_epilogue epi{};
-    const ggml_tensor * args[GGML_CUDA_MM_EPI_MAX_ARGS] = {};
     const ggml_tensor * cur = mm;
     int cur_idx = i;
     int last    = i;
@@ -4538,6 +4513,40 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
         cur_idx = j;
         last    = j;
     }
+    return last;
+}
+
+static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, const bool dry_run = false) {
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MM_EPILOGUE)) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    // a verify of several columns already has each row's loads well covered, and the epilogue's own cost it
+    if (src0->type == GGML_TYPE_NVFP4 || mm->type != GGML_TYPE_F32 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        !ggml_is_contiguous(mm) || mm->ne[1] != 1 || src0->buffer == nullptr ||
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return 0;
+    }
+    const int  cc    = ggml_cuda_info().devices[ctx.device].cc;
+    const bool quant = ggml_is_quantized(src0->type);
+    if (quant) {
+        if ((mm->ne[1] == 1 && !ggml_cuda_mm_epi_lean_t1()) ||
+            !ggml_cuda_should_fuse_mul_mat_vec_q(mm) || !ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
+            return 0;
+        }
+    } else {
+        const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+        if (mm->ne[1] != 1 || bad_padding_clear || src1->type != GGML_TYPE_F32 || !ggml_cuda_should_fuse_mul_mat_vec_f(mm)) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_mm_epilogue epi{};
+    const ggml_tensor * args[GGML_CUDA_MM_EPI_MAX_ARGS] = {};
+    const int last = ggml_cuda_mm_epi_collect(cgraph, i, epi, args);
     if (epi.n_steps == 0) {
         return 0;
     }
@@ -4950,6 +4959,99 @@ static int ggml_cuda_try_cpy_run(ggml_backend_cuda_context & ctx, const ggml_cgr
     return last - i;
 }
 
+// two float matvecs over one activation, each with its elementwise tail, as one launch: the gating projections of a
+// delta-net layer (alpha with its bias, softplus and scale, beta with its sigmoid) are this at any token count. Each
+// row sums as mul_mat_vec_f sums it, so the values are the separate launches' bits.
+static constexpr uint64_t GGML_CUDA_FUSE_MMVF_PAIR = 1ull << 42;
+
+static bool ggml_cuda_mmvf_pair_member(const ggml_tensor * mm, const int cc) {
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * y = mm->src[1];
+    return w->type == GGML_TYPE_F32 && y->type == GGML_TYPE_F32 && w->buffer != nullptr &&
+           ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+           ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, y->ne[1]) &&
+           ggml_is_contiguous(mm) && ggml_is_contiguous(w) && y->nb[0] == sizeof(float) &&
+           w->ne[2] == 1 && w->ne[3] == 1 && y->ne[2] == 1 && y->ne[3] == 1 &&
+           mm->ne[1] >= 1 && mm->ne[1] <= 8 && w->ne[0] % 2 == 0 && (y->nb[1] / sizeof(float)) % 2 == 0 &&
+           ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD;
+}
+
+static int ggml_cuda_try_mmvf_pair_epi(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MMVF_PAIR) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * ma = cgraph->nodes[i];
+    if (!ggml_cuda_mmvf_pair_member(ma, cc)) {
+        return 0;
+    }
+    ggml_cuda_mm_epilogue epi_a{};
+    const ggml_tensor * args_a[GGML_CUDA_MM_EPI_MAX_ARGS] = {};
+    const int last_a = ggml_cuda_mm_epi_collect(cgraph, i, epi_a, args_a);
+
+    int j = last_a + 1;
+    while (j < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || ggml_is_empty(cgraph->nodes[j]))) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mb = cgraph->nodes[j];
+    if (!ggml_cuda_mmvf_pair_member(mb, cc) || mb->src[1] != ma->src[1] || mb->src[0]->ne[0] != ma->src[0]->ne[0]) {
+        return 0;
+    }
+    ggml_cuda_mm_epilogue epi_b{};
+    const ggml_tensor * args_b[GGML_CUDA_MM_EPI_MAX_ARGS] = {};
+    const int last_b = ggml_cuda_mm_epi_collect(cgraph, j, epi_b, args_b);
+
+    // a gate and up product feeding a GLU belongs to the GLU paths
+    int k_next = last_b + 1;
+    while (k_next < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[k_next]) || ggml_is_empty(cgraph->nodes[k_next]))) {
+        k_next++;
+    }
+    if (k_next < cgraph->n_nodes && cgraph->nodes[k_next]->op == GGML_OP_GLU) {
+        return 0;
+    }
+
+    // the float reader of a folded norm reads its input with the factors applied, as mul_mat_vec_f would
+    const ggml_tensor * src1 = ma->src[1];
+    ggml_cuda_norm_fold * fold = ggml_cuda_norm_fold_for(ctx, src1);
+    if (fold && (!fold->scale_ready || getenv("GGML_CUDA_FOLD_FLOAT_MATERIALIZE") != nullptr ||
+            fold->x->type != GGML_TYPE_F32 || fold->w->type != GGML_TYPE_F32)) {
+        return 0;
+    }
+
+    // both launches run at once: neither output may sit under anything either of them reads, or under the other
+    const ggml_tensor * out_a = cgraph->nodes[last_a];
+    const ggml_tensor * out_b = cgraph->nodes[last_b];
+    const ggml_tensor * reads[4 + 2*GGML_CUDA_MM_EPI_MAX_ARGS] = { ma->src[0], mb->src[0], fold ? fold->x : src1, fold ? fold->w : nullptr };
+    int n_reads = 4;
+    for (int k = 0; k < epi_a.n_args; ++k) {
+        reads[n_reads++] = args_a[k];
+    }
+    for (int k = 0; k < epi_b.n_args; ++k) {
+        reads[n_reads++] = args_b[k];
+    }
+    for (const ggml_tensor * out : { out_a, out_b }) {
+        for (int k = 0; k < n_reads; ++k) {
+            if (reads[k] && ggml_cuda_tensors_overlap(out, reads[k])) {
+                return 0;
+            }
+        }
+    }
+    if (ggml_cuda_tensors_overlap(out_a, out_b)) {
+        return 0;
+    }
+
+    ggml_cuda_mul_mat_vec_f_pair_epi(ctx, ma->src[0], mb->src[0], src1, fold,
+        (float *) out_a->data, (float *) out_b->data, epi_a, epi_b, (int) ma->ne[1]);
+    ggml_cuda_norm_fold_check_at(ctx, src1);
+    return last_b - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4969,6 +5071,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_GET_ROWS && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_GET_ROWS_CPY)) {
         const int nodes_to_skip = ggml_cuda_try_get_rows_cpy(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int nodes_to_skip = ggml_cuda_try_mmvf_pair_epi(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
@@ -5915,7 +6024,8 @@ static bool ggml_cuda_skip_op(const ggml_tensor * node) {
     }
     const char * name = node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : ggml_op_name(node->op);
     for (const auto & o : ops) {
-        if (o == name) {
+        // name:<prefix> drops the nodes whose tensor name starts with the prefix
+        if (o == name || (o.rfind("name:", 0) == 0 && strncmp(node->name, o.c_str() + 5, o.size() - 5) == 0)) {
             return true;
         }
     }

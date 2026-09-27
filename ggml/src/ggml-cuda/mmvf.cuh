@@ -2,6 +2,11 @@
 
 #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
 
+// two float matvecs over one activation with their epilogues in one launch; each row sums as mul_mat_vec_f does
+void ggml_cuda_mul_mat_vec_f_pair_epi(ggml_backend_cuda_context & ctx, const ggml_tensor * wa, const ggml_tensor * wb,
+        const ggml_tensor * src1, const ggml_cuda_norm_fold * fold, float * dst_a, float * dst_b,
+        const ggml_cuda_mm_epilogue & epi_a, const ggml_cuda_mm_epilogue & epi_b, int ncols_dst);
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr, ggml_cuda_norm_fold * fold = nullptr);
 
