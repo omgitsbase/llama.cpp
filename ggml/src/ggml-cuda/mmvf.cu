@@ -472,6 +472,16 @@ static void mul_mat_vec_f_switch_fusion(
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mm_epilogue_none{});
             return;
        }
+    } else if constexpr (!is_multi_token_id) {
+        // a few columns (a speculative verify batch) take the gate as well; the fusion site sends no bias or epilogue here
+        if (has_fusion) {
+            GGML_ASSERT(epi == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr);
+            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false>, launch_params,
+                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mm_epilogue_none{});
+            return;
+        }
     }
 
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
@@ -521,7 +531,7 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || epi != nullptr;
 
-    const int nbytes_shared = ncols_dst*warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+    const int nbytes_shared = ncols_dst*warp_size*sizeof(float) + (has_fusion ? ncols_dst*warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
 
@@ -929,7 +939,9 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // a few columns carry the gate alone
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (dst->ne[1] <= MMVF_MAX_BATCH_SIZE && fusion->x_bias == nullptr &&
+                                                 fusion->gate_bias == nullptr && epi == nullptr));
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);

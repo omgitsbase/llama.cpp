@@ -5537,14 +5537,28 @@ static int ggml_cuda_try_mm_reshape_add(ggml_backend_cuda_context & ctx, const g
     if (i + 2 >= cgraph->n_nodes) {
         return 0;
     }
-    const ggml_tensor * mm  = cgraph->nodes[i];
-    const ggml_tensor * rs  = cgraph->nodes[i + 1];
-    ggml_tensor *       add = cgraph->nodes[i + 2];
+    const ggml_tensor * mm = cgraph->nodes[i];
+    // an NVFP4 weight's own scale may sit between the product and the reshape; it rides the matvec as well
+    const ggml_tensor * scale = nullptr;
+    int                 k     = i + 1;
+    if (mm->op == GGML_OP_MUL_MAT && mm->src[0]->type == GGML_TYPE_NVFP4 && i + 3 < cgraph->n_nodes) {
+        const ggml_tensor * mul = cgraph->nodes[i + 1];
+        if (mul->op == GGML_OP_MUL && mul->src[0] == mm && mul->src[1]->type == GGML_TYPE_F32 &&
+                ggml_nelements(mul->src[1]) == 1 && ggml_is_contiguous(mul->src[1]) && mul->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(mul, mm) && ggml_is_contiguous(mul) && !(mm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                ggml_node_get_use_count(cgraph, i) == 1) {
+            scale = mul->src[1];
+            k     = i + 2;
+        }
+    }
+    const ggml_tensor * prod = cgraph->nodes[k - 1];
+    const ggml_tensor * rs   = cgraph->nodes[k];
+    ggml_tensor *       add  = cgraph->nodes[k + 1];
     if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || (rs->op != GGML_OP_RESHAPE && rs->op != GGML_OP_VIEW) ||
-            rs->view_src != mm || rs->view_offs != 0 || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
-            ((mm->flags | rs->flags) & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(mm) || !ggml_is_contiguous(rs) ||
-            !ggml_is_contiguous(add) || ggml_nelements(rs) != ggml_nelements(mm) || rs->ne[0] != mm->ne[0] ||
-            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1) {
+            rs->view_src != prod || rs->view_offs != 0 || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+            ((prod->flags | rs->flags) & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(prod) || !ggml_is_contiguous(rs) ||
+            !ggml_is_contiguous(add) || ggml_nelements(rs) != ggml_nelements(prod) || rs->ne[0] != prod->ne[0] ||
+            ggml_node_get_use_count(cgraph, k - 1) != 1 || ggml_node_get_use_count(cgraph, k) != 1) {
         return 0;
     }
     const ggml_tensor * bias = add->src[0] == rs ? add->src[1] : (add->src[1] == rs ? add->src[0] : nullptr);
@@ -5565,8 +5579,9 @@ static int ggml_cuda_try_mm_reshape_add(ggml_backend_cuda_context & ctx, const g
         return 0;
     }
     ggml_cuda_mm_fusion_args_host fusion_data{};
-    fusion_data.x_bias = bias;
-    if (ggml_cuda_should_fuse_mul_mat_vec_f(mm)) {
+    fusion_data.x_bias  = bias;
+    fusion_data.x_scale = scale;
+    if (!scale && ggml_cuda_should_fuse_mul_mat_vec_f(mm)) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, add, &fusion_data, fold);
     } else if (ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_cuda_should_use_mmvq(src0->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, add, &fusion_data, fold);
@@ -5574,21 +5589,65 @@ static int ggml_cuda_try_mm_reshape_add(ggml_backend_cuda_context & ctx, const g
         return 0;
     }
     ggml_cuda_norm_fold_check_at(ctx, src1);
-    return 2;
+    return k + 1 - i;
 }
 
 // a multi-token expert matvec and the multiply by its router weights after it: the weights ride the matvec's store, and
 // the expert sum after them (a plain sum then) never reads the weights while other blocks store
 static constexpr uint64_t GGML_CUDA_FUSE_MOE_ROUTER_WEIGHTS = 1ull << 47;
 
+// NVFP4 per-expert scales carried by the multi-token expert kernel, where each was a repeat, a gather and a multiply
+static constexpr uint64_t GGML_CUDA_FUSE_EXPERT_SCALE_MT = 1ull << 48;
+
+// An NVFP4 expert matvec's second-level scale as the graph builds it: the per-expert scales reshaped, repeated
+// over the tokens, picked by the same ids, then multiplied in. Returns the scales when nodes i..i+4 are that and
+// nothing else reads the steps.
+static const ggml_tensor * ggml_cuda_expert_scale_chain(const ggml_cgraph * cgraph, const int i) {
+    if ((ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_EXPERT_SCALE_MT) || i + 4 >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    const ggml_tensor * mm      = cgraph->nodes[i];
+    const ggml_tensor * reshape = cgraph->nodes[i + 1];
+    const ggml_tensor * repeat  = cgraph->nodes[i + 2];
+    const ggml_tensor * getrows = cgraph->nodes[i + 3];
+    const ggml_tensor * mul     = cgraph->nodes[i + 4];
+    if (mm->op != GGML_OP_MUL_MAT_ID || reshape->op != GGML_OP_RESHAPE || repeat->op != GGML_OP_REPEAT ||
+            getrows->op != GGML_OP_GET_ROWS || mul->op != GGML_OP_MUL) {
+        return nullptr;
+    }
+    if (repeat->src[0] != reshape || getrows->src[0] != repeat || getrows->src[1] != mm->src[2] ||
+            !((mul->src[0] == mm && mul->src[1] == getrows) || (mul->src[0] == getrows && mul->src[1] == mm))) {
+        return nullptr;
+    }
+    const ggml_tensor * scale = reshape->src[0];
+    if (mm->src[0]->type != GGML_TYPE_NVFP4 || mul->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(scale) || ggml_nelements(scale) != mm->src[0]->ne[2] || !ggml_are_same_shape(mul, mm)) {
+        return nullptr;
+    }
+    for (int k = i; k <= i + 3; k++) {
+        if ((cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, k) != 1) {
+            return nullptr;
+        }
+    }
+    return scale;
+}
+
 static int ggml_cuda_try_moe_router_weights(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     if ((ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MOE_ROUTER_WEIGHTS) || i + 1 >= cgraph->n_nodes) {
         return 0;
     }
-    const ggml_tensor * mm  = cgraph->nodes[i];
-    ggml_tensor *       mul = cgraph->nodes[i + 1];
-    if (mm->op != GGML_OP_MUL_MAT_ID || mul->op != GGML_OP_MUL || mul->src[0] != mm || mm->type != GGML_TYPE_F32 ||
-            mul->type != GGML_TYPE_F32 || ((mm->flags | mul->flags) & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+    const ggml_tensor * mm    = cgraph->nodes[i];
+    // the weights multiply the matvec, or the matvec with its expert scale applied
+    const ggml_tensor * scale = ggml_cuda_expert_scale_chain(cgraph, i);
+    const int           j     = scale ? i + 5 : i + 1;
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * prod = cgraph->nodes[j - 1];
+    ggml_tensor *       mul  = cgraph->nodes[j];
+    if (mm->op != GGML_OP_MUL_MAT_ID || mul->op != GGML_OP_MUL || mul->src[0] != prod || mm->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || ((mm->flags | prod->flags | mul->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_node_get_use_count(cgraph, j - 1) != 1 ||
             !ggml_are_same_shape(mm, mul) || !ggml_is_contiguous(mm) || !ggml_is_contiguous(mul)) {
         return 0;
     }
@@ -5606,11 +5665,31 @@ static int ggml_cuda_try_moe_router_weights(ggml_backend_cuda_context & ctx, con
     if (ggml_cuda_tensors_overlap(mul, w) || ggml_cuda_tensors_overlap(mul, src1) || ggml_cuda_tensors_overlap(mul, ids)) {
         return 0;
     }
+    ggml_cuda_mm_fusion_args_host fusion{};
+    fusion.x_scale = scale;
     ggml_cuda_mmvq_set_router_weights((const float *) w->data, w->nb[1] / sizeof(float), w->nb[2] / sizeof(float));
-    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, mul, nullptr, ggml_cuda_norm_fold_for(ctx, src1));
+    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, mul, scale ? &fusion : nullptr, ggml_cuda_norm_fold_for(ctx, src1));
     GGML_ASSERT(ggml_cuda_mmvq_router_weights_taken() && "the expert matvec did not take its router weights");
     ggml_cuda_norm_fold_check_at(ctx, src1);
-    return 1;
+    return j - i;
+}
+
+// a float gate and up pair under a few columns (a speculative verify batch) as one launch with its GLU, as one column is
+static constexpr uint64_t GGML_CUDA_FUSE_MMVF_GATE_COLS = 1ull << 49;
+
+static bool ggml_cuda_should_fuse_mmvf_gate_cols(const ggml_tensor * mm) {
+    if ((ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MMVF_GATE_COLS) || mm->op != GGML_OP_MUL_MAT || mm->ne[1] < 2 ||
+            mm->ne[1] > MMVF_MAX_BATCH_SIZE || mm->ne[2] != 1 || mm->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) ||
+            src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -5639,6 +5718,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int nodes_to_skip = ggml_cuda_try_moe_router_weights(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    // an NVFP4 projection's scale and the residual after it, before the scale alone is taken below
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 &&
+            !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MM_RESHAPE_ADD)) {
+        const int nodes_to_skip = ggml_cuda_try_mm_reshape_add(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
@@ -6092,8 +6180,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         cgraph->nodes[gate_idx + 3], gate_scale_n, gate_n);
                 const ggml_tensor * up_scale = get_mul_mat_id_scale(cgraph->nodes[up_idx + 1], cgraph->nodes[up_idx + 2],
                         cgraph->nodes[up_idx + 3], up_scale_n, up_n);
-                // the multi-token expert kernel carries the gate alone, not the per-expert scales
-                if (!gate_scale || !up_scale || up_n->ne[2] != 1) {
+                // the multi-token expert kernel takes no biases
+                if (!gate_scale || !up_scale || ((with_bias || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_EXPERT_SCALE_MT)) && up_n->ne[2] != 1)) {
                     continue;
                 }
 
@@ -6203,7 +6291,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+            const bool gate_cols = ggml_cuda_should_fuse_mmvf_gate_cols(up) && gate->src[1] == up->src[1] &&
+                                   gate->src[0]->type == up->src[0]->type && ggml_are_same_shape(gate->src[0], up->src[0]) &&
+                                   ggml_are_same_stride(gate->src[0], up->src[0]) && ggml_are_same_shape(gate, up);
+            if (ggml_cuda_should_fuse_mul_mat_vec_f(up) || gate_cols) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -6290,8 +6381,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             } else {
                 scale = get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3], scale_node, mm_node);
             }
-            // the multi-token expert kernel carries no per-expert scale
-            if (!scale || (op == GGML_OP_MUL_MAT_ID && mm_node->ne[2] != 1)) {
+            // the multi-token expert kernel takes no biases
+            if (!scale || ((with_bias || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_EXPERT_SCALE_MT)) && op == GGML_OP_MUL_MAT_ID && mm_node->ne[2] != 1)) {
                 continue;
             }
 

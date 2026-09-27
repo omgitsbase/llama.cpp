@@ -879,14 +879,15 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
             if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x)) {
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
+                    // the scale rounds on its own, as the separate multiply did, before a bias or residual is added
                     if constexpr (type == GGML_TYPE_NVFP4) {
-                        result *= x_scales;
+                        result = __fmul_rn(result, x_scales);
                     }
                     result += x_biases[j];
                     if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
-                            gate_value *= gate_scales;
+                            gate_value = __fmul_rn(gate_value, gate_scales);
                         }
                         gate_value += gate_biases[j];
                         switch (active_glu) {
@@ -1103,8 +1104,19 @@ static __global__ void mul_mat_vec_q_moe(
     // Write results
     if (lane < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + lane) < nrows_x)) {
         float result = tmp[lane];
+        // an expert's own scale (NVFP4's second-level scale), applied where the separate multiply would have been
+        if constexpr (type == GGML_TYPE_NVFP4) {
+            if (fusion.x_scale != nullptr) {
+                result *= ((const float *) fusion.x_scale)[channel_x];
+            }
+        }
         if constexpr (has_fusion) {
-            const float gate_value = tmp_gate[lane];
+            float gate_value = tmp_gate[lane];
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                if (fusion.gate_scale != nullptr) {
+                    gate_value *= ((const float *) fusion.gate_scale)[channel_x];
+                }
+            }
             switch (fusion.glu_op) {
                 case GGML_GLU_OP_SWIGLU:
                     result *= ggml_cuda_op_silu_single(gate_value);
@@ -1238,8 +1250,8 @@ static void mul_mat_vec_q_moe_launch(
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     constexpr int lpb = ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
 
-    // only the gate travels with this kernel; biases and scales keep their own launches
-    GGML_ASSERT(fusion.x_bias == nullptr && fusion.gate_bias == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr);
+    // the gate and the per-expert scales travel with this kernel; biases keep their own launches
+    GGML_ASSERT(fusion.x_bias == nullptr && fusion.gate_bias == nullptr);
 
     const mmvq_router_weights rw = g_mmvq_router_weights;
     g_mmvq_router_weights = {};
@@ -1665,7 +1677,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!epi || (!ids && src0->type != GGML_TYPE_NVFP4));
 
     if (fusion) {
-        GGML_ASSERT( !ids || dst->ne[2] == 1 || (fusion->x_bias == nullptr && fusion->gate_bias == nullptr && fusion->x_scale == nullptr && fusion->gate_scale == nullptr));
+        GGML_ASSERT( !ids || dst->ne[2] == 1 || (fusion->x_bias == nullptr && fusion->gate_bias == nullptr));
         GGML_ASSERT(  ids || dst->ne[1] <= MMVQ_MAX_BATCH_SIZE);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
