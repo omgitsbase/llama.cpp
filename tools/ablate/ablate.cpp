@@ -648,6 +648,58 @@ struct Trial {
     double   kl_s     = 0;
 };
 
+// Per layer: the refusal direction as the difference of the two means, with the harmless mean's component
+// taken out, and how far apart the two sets sit along it in units of their spread. Reads nothing but the
+// residual stream, so it means the same thing on a dense model, a mixture of experts or a recurrent one.
+void directions_of(const std::vector<float> & res_h, const std::vector<float> & res_g, size_t nh, size_t ng,
+                   int n_layer, int n_embd, std::vector<std::vector<float>> & dirs, std::vector<double> & score) {
+    const size_t per = static_cast<size_t>(n_layer) * n_embd;
+    dirs.assign(n_layer, std::vector<float>(n_embd, 0.0f));
+    score.assign(n_layer, 0.0);
+    parallel_for(static_cast<size_t>(n_layer - 1), [&](size_t l) {
+        const int    il  = static_cast<int>(l);
+        const size_t off = static_cast<size_t>(il) * n_embd;
+        std::vector<double> mh(n_embd, 0.0), mg(n_embd, 0.0), d(n_embd);
+        for (size_t i = 0; i < nh; i++) for (int k = 0; k < n_embd; k++) mh[k] += res_h[i * per + off + k];
+        for (size_t i = 0; i < ng; i++) for (int k = 0; k < n_embd; k++) mg[k] += res_g[i * per + off + k];
+        double gn = 0;
+        for (int k = 0; k < n_embd; k++) {
+            mh[k] /= static_cast<double>(nh);
+            mg[k] /= static_cast<double>(ng);
+            d[k] = mh[k] - mg[k];
+            gn += mg[k] * mg[k];
+        }
+        if (gn > 0) {
+            double dg = 0;
+            for (int k = 0; k < n_embd; k++) dg += d[k] * mg[k];
+            for (int k = 0; k < n_embd; k++) d[k] -= dg / gn * mg[k];
+        }
+        double dn = 0;
+        for (int k = 0; k < n_embd; k++) dn += d[k] * d[k];
+        dn = std::sqrt(dn);
+        if (dn <= 0) {
+            return;
+        }
+        for (int k = 0; k < n_embd; k++) dirs[il][k] = static_cast<float>(d[k] / dn);
+        const auto proj = [&](const std::vector<float> & res, size_t i) {
+            double s = 0;
+            for (int k = 0; k < n_embd; k++) s += res[i * per + off + k] * dirs[il][k];
+            return s;
+        };
+        std::vector<double> xh(nh), xg(ng);
+        double ph = 0, pg = 0, vh = 0, vg = 0;
+        for (size_t i = 0; i < nh; i++) { xh[i] = proj(res_h, i); ph += xh[i]; }
+        for (size_t i = 0; i < ng; i++) { xg[i] = proj(res_g, i); pg += xg[i]; }
+        ph /= static_cast<double>(nh);
+        pg /= static_cast<double>(ng);
+        for (double x : xh) vh += (x - ph) * (x - ph);
+        for (double x : xg) vg += (x - pg) * (x - pg);
+        vh /= static_cast<double>(nh);
+        vg /= static_cast<double>(ng);
+        score[il] = (ph - pg) / std::sqrt(0.5 * (vh + vg) + 1e-12);
+    });
+}
+
 double kernel(const Trial & t, int il) {
     const double min_w = t.min_rel * t.max_w;
     const double x     = std::min(1.0, std::fabs(il - t.pos) / std::max(t.dist, 1e-6));
@@ -935,54 +987,12 @@ int main(int argc, char ** argv) {
     }
     t_capture = elapsed() - t_load;
 
-    // ---- per layer: the difference of means, orthogonal to the harmless mean, and how well it separates
+    // ---- per layer: the refusal direction and how well it separates (see directions_of)
     const size_t per = static_cast<size_t>(n_layer) * n_embd;
-    std::vector<std::vector<float>> dirs(n_layer, std::vector<float>(n_embd, 0.0f));
-    std::vector<double> score(n_layer, 0.0);
-    parallel_for(static_cast<size_t>(n_layer - 1), [&](size_t l) {
-        const int    il  = static_cast<int>(l);
-        const size_t off = static_cast<size_t>(il) * n_embd;
-        const size_t nh  = dir_h.size(), ng = dir_g.size();
-        std::vector<double> mh(n_embd, 0.0), mg(n_embd, 0.0), d(n_embd);
-        for (size_t i = 0; i < nh; i++) for (int k = 0; k < n_embd; k++) mh[k] += res_h[i * per + off + k];
-        for (size_t i = 0; i < ng; i++) for (int k = 0; k < n_embd; k++) mg[k] += res_g[i * per + off + k];
-        double gn = 0;
-        for (int k = 0; k < n_embd; k++) {
-            mh[k] /= static_cast<double>(nh);
-            mg[k] /= static_cast<double>(ng);
-            d[k] = mh[k] - mg[k];
-            gn += mg[k] * mg[k];
-        }
-        if (gn > 0) {
-            double dg = 0;
-            for (int k = 0; k < n_embd; k++) dg += d[k] * mg[k];
-            for (int k = 0; k < n_embd; k++) d[k] -= dg / gn * mg[k];
-        }
-        double dn = 0;
-        for (int k = 0; k < n_embd; k++) dn += d[k] * d[k];
-        dn = std::sqrt(dn);
-        if (dn <= 0) {
-            return;
-        }
-        for (int k = 0; k < n_embd; k++) dirs[il][k] = static_cast<float>(d[k] / dn);
-        // separation of the two sets along it, in units of their spread
-        const auto proj = [&](const std::vector<float> & res, size_t i) {
-            double s = 0;
-            for (int k = 0; k < n_embd; k++) s += res[i * per + off + k] * dirs[il][k];
-            return s;
-        };
-        std::vector<double> xh(nh), xg(ng);
-        double ph = 0, pg = 0, vh = 0, vg = 0;
-        for (size_t i = 0; i < nh; i++) { xh[i] = proj(res_h, i); ph += xh[i]; }
-        for (size_t i = 0; i < ng; i++) { xg[i] = proj(res_g, i); pg += xg[i]; }
-        ph /= static_cast<double>(nh);
-        pg /= static_cast<double>(ng);
-        for (double x : xh) vh += (x - ph) * (x - ph);
-        for (double x : xg) vg += (x - pg) * (x - pg);
-        vh /= static_cast<double>(nh);
-        vg /= static_cast<double>(ng);
-        score[il] = (ph - pg) / std::sqrt(0.5 * (vh + vg) + 1e-12);
-    });
+    std::vector<std::vector<float>> dirs;
+    std::vector<double> score;
+    directions_of(res_h, res_g, dir_h.size(), dir_g.size(), n_layer, n_embd, dirs, score);
+    GGML_UNUSED(per);
     res_h.clear();
     res_g.clear();
     res_h.shrink_to_fit();
@@ -1184,6 +1194,51 @@ int main(int argc, char ** argv) {
     llama_batch_free(batch);
     const double t_trials = elapsed() - t_load - t_capture - t_base;
 
+    // ---- the scan: is the refusal still in the stream once the vector is applied?
+    //
+    // The refusal count only sees whether an answer OPENS with one, and a model can learn to drop the opening
+    // and decline by answering something safer instead (Qwen3.5-4B leaves 22 of 100 requests unanswered that
+    // way, Qwen3.5-9B 52, where its own 27B leaves 2). Nothing about the search sees that. This does: with the
+    // chosen vector in place, take the residuals again over the same split and ask how far apart harmful and
+    // harmless prompts still sit along their best direction. If the model still tells them apart it still
+    // represents the refusal, whatever its answers open with. It reads only the residual stream, so it means
+    // the same on a dense model, a mixture of experts, or a recurrent one, and costs one capture.
+    const int  band_lo = std::max(1, n_layer / 4), band_hi = std::min(n_layer - 2, n_layer * 85 / 100);
+    double     sep_before = 0, sep_after = 0;
+    {
+        for (int il = band_lo; il <= band_hi; il++) {
+            sep_before = std::max(sep_before, score[il]);
+        }
+        llama_free(ctx);   // the trials context first, so only one of them is on the card
+        ctx = nullptr;
+
+        Capture cap;
+        cap.n_layer = n_layer;
+        cap.n_embd  = n_embd;
+        const int n_ub = std::max(2048, static_cast<int>(GGML_PAD(longest, 256)));
+        const int want = o.n_seq > 0 ? std::min(o.n_seq, 64) : 64;
+        if (llama_context * sctx = make_context(model, params, want, static_cast<int>(GGML_PAD(longest, 32)),
+                                                n_ub, n_ub, &cap)) {
+            const std::vector<float> data = cvec_data(best, dirs, n_layer, n_embd);
+            llama_set_adapter_cvec(sctx, data.data(), data.size(), n_embd, 1, n_layer - 1);
+            llama_set_adapter_cvec_mode(sctx, 1);
+            std::vector<float> ah, ag;
+            const auto quiet = [](size_t, size_t) {};
+            if (capture(sctx, cap, dir_h, equal_only, ah, quiet) &&
+                capture(sctx, cap, dir_g, equal_only, ag, quiet)) {
+                std::vector<std::vector<float>> after_dirs;
+                std::vector<double>             after_score;
+                directions_of(ah, ag, dir_h.size(), dir_g.size(), n_layer, n_embd, after_dirs, after_score);
+                for (int il = band_lo; il <= band_hi; il++) {
+                    sep_after = std::max(sep_after, after_score[il]);
+                }
+            }
+            llama_free(sctx);
+        }
+        say("scan separation=%.2f was=%.2f kept=%.2f", sep_after, sep_before,
+            sep_before > 0 ? sep_after / sep_before : 0.0);
+    }
+
     // ---- the KL guard: some models (Gemma's massive-activation family) cannot lose their refusal direction
     // without collapsing -- the best vector still lands at a huge KL. Refuse to write a vector that would ship a
     // broken model, so `llmash ablate` fails loudly instead of installing garbage. 1.0 is well clear of a healthy
@@ -1194,7 +1249,7 @@ int main(int argc, char ** argv) {
             "direction is entangled with its competence; removing it collapses the model). No vector written.",
             best.kl, kl_max);
         std::fprintf(stderr, "ablate: KL %.3f over the %.3f limit; not writing a broken vector\n", best.kl, kl_max);
-        llama_free(ctx);
+        if (ctx) { llama_free(ctx); }
         llama_backend_free();
         return 2;
     }
@@ -1252,6 +1307,7 @@ int main(int argc, char ** argv) {
           << "  \"direction_layer_by_separation\": " << best_il << ",\n"
           << "  \"refusal_prompts\": " << eval_h.size() << ",\n  \"kl_prompts\": " << eval_g.size() << ",\n"
           << "  \"refusals_before\": " << base_refusals << ",\n  \"seqs\": " << room.n_seq << ",\n"
+          << "  \"separation\": " << sep_before << ",\n  \"separation_after\": " << sep_after << ",\n"
           << "  \"seconds\": {\"load\": " << t_load << ", \"capture\": " << t_capture << ", \"baseline\": " << t_base
           << ", \"trials\": " << t_trials << ", \"total\": " << elapsed() << "},\n"
           << "  \"pruned_trials\": " << pruned << ",\n"
@@ -1290,7 +1346,7 @@ int main(int argc, char ** argv) {
     say("done refusals=%d before=%d of=%zu kl=%.4f seconds=%.1f pruned=%d", best.refusals, base_refusals, eval_h.size(),
         best.kl, elapsed(), pruned);
 
-    llama_free(ctx);
+    if (ctx) { llama_free(ctx); }
     llama_backend_free();
     return 0;
 }
