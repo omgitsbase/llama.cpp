@@ -440,6 +440,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+
+        // a control vector acts on every stream of the wide residual alike: [n_embd, hc, T] is hc*T rows to it
+        res_hc = build_cvec(res_hc, il);
     }
 
     // the final mixer is the output norm: there is no separate one

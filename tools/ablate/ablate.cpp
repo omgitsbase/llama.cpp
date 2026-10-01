@@ -265,10 +265,14 @@ struct Capture {
 
 bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     auto * c = static_cast<Capture *>(user_data);
-    if (!c->on || std::strncmp(t->name, "l_out-", 6) != 0) {
+    // a layer's output is l_out; a model with several residual streams (hyper-connections) names it l_last
+    // the name exactly, not a view of it ("l_last-3 (reshaped)")
+    const int skip = std::strncmp(t->name, "l_out-", 6) == 0 ? 6 : std::strncmp(t->name, "l_last-", 7) == 0 ? 7 : 0;
+    char *    end  = nullptr;
+    const int il   = skip ? static_cast<int>(std::strtol(t->name + skip, &end, 10)) : -1;
+    if (!c->on || skip == 0 || end == t->name + skip || *end != '\0') {
         return !ask;
     }
-    const int il = std::atoi(t->name + 6);
     // the last layer keeps only the output rows, and a direction there is never used
     if (il < 0 || il >= c->n_layer - 1) {
         return !ask;
@@ -276,13 +280,26 @@ bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     if (ask) {
         return true;
     }
-    if (t->type != GGML_TYPE_F32 || t->ne[0] != c->n_embd || t->ne[1] != c->n_tokens) {
+    // [n_embd, T], or [n_embd, streams, T] for parallel residual streams, of which a token's stream is their mean
+    const bool wide = ggml_n_dims(t) == 3 && t->ne[2] == c->n_tokens;
+    if (t->type != GGML_TYPE_F32 || t->ne[0] != c->n_embd || (!wide && t->ne[1] != c->n_tokens)) {
         c->odd = true;
         return true;
     }
     for (size_t j = 0; j < c->rows.size(); j++) {
-        ggml_backend_tensor_get(t, c->dst + (j * c->n_layer + il) * c->n_embd, static_cast<size_t>(c->rows[j]) * t->nb[1],
-                                static_cast<size_t>(c->n_embd) * sizeof(float));
+        float * dst = c->dst + (j * c->n_layer + il) * c->n_embd;
+        if (!wide) {
+            ggml_backend_tensor_get(t, dst, static_cast<size_t>(c->rows[j]) * t->nb[1], static_cast<size_t>(c->n_embd) * sizeof(float));
+            continue;
+        }
+        const int64_t      ns = t->ne[1];
+        std::vector<float> s(static_cast<size_t>(c->n_embd));
+        std::fill(dst, dst + c->n_embd, 0.0f);
+        for (int64_t k = 0; k < ns; k++) {
+            ggml_backend_tensor_get(t, s.data(), static_cast<size_t>(c->rows[j]) * t->nb[2] + static_cast<size_t>(k) * t->nb[1],
+                                    static_cast<size_t>(c->n_embd) * sizeof(float));
+            for (int e = 0; e < c->n_embd; e++) dst[e] += s[e] / static_cast<float>(ns);
+        }
     }
     c->got++;
     return true;
