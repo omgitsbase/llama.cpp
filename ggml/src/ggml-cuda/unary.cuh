@@ -83,6 +83,8 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -111,6 +113,13 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
     float out_glu = x / (1.0f + expf(-x * alpha));
     out_glu = out_glu * (1.0f + g);
     return out_glu;
+}
+
+__device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, float up, float limit) {
+    gate = fminf(gate, limit);
+    up = fmaxf(fminf(up, limit), -limit);
+
+    return ggml_cuda_op_silu_single(gate) * up;
 }
 
 static __device__ __forceinline__ float op_abs(float x) {
@@ -296,6 +305,7 @@ static __device__ __forceinline__ float ggml_cuda_glu_single(const int op, const
         case GGML_GLU_OP_GEGLU:       return op_gelu(g) * u;
         case GGML_GLU_OP_SWIGLU:      return op_silu(g) * u;
         case GGML_GLU_OP_SWIGLU_OAI:  return ggml_cuda_op_swiglu_oai_single(g, u, alpha, limit);
+        case GGML_GLU_OP_SWIGLU_CLAMP: return ggml_cuda_op_swiglu_clamp_single(g, u, limit);
         case GGML_GLU_OP_GEGLU_ERF:   return op_gelu_erf(g) * u;
         case GGML_GLU_OP_GEGLU_QUICK: return op_gelu_quick(g) * u;
         default:                      return u;

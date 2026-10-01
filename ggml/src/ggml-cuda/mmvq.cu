@@ -8,6 +8,36 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
+
+// only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
+// has little exposed latency left to hide and the extra requests cost more than they save.
+// For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+// returns true only for those quants that benefit from prefetch and false otherwise
+static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+#endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -130,7 +160,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
-    MMVQ_PARAMETERS_RDNA4
+    MMVQ_PARAMETERS_RDNA4,
+    MMVQ_PARAMETERS_GB10
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -144,6 +175,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    return MMVQ_PARAMETERS_GB10;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -164,6 +197,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
+        return MMVQ_PARAMETERS_GB10;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -428,7 +464,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
+static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -531,11 +567,32 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_GB10) {
+        const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
+        // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
+        if (ncols_dst == 1 && !small_k && halve_iters) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL:
+                    return 2 * generic;
+                default:
+                    break;
+            }
+        }
+        return generic;
+    }
     return 1;
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -700,6 +757,7 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
     const float * x_scale = nullptr;
     const float * gate_scale = nullptr;
     ggml_glu_op active_glu;
+    float glu_limit = 0.0f;
 
     if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
@@ -709,6 +767,7 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
+        glu_limit     = fusion.glu_limit;
         if constexpr (type == GGML_TYPE_NVFP4) {
             use_scale      = fusion.x_scale    != nullptr;
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
@@ -900,6 +959,9 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
                             case GGML_GLU_OP_SWIGLU_OAI:
                                 result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
                                 break;
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                                break;
                             default:
                                 result = result * gate_value;
                                 break;
@@ -925,7 +987,7 @@ static __device__ __forceinline__ void mul_mat_vec_q_impl(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1104,11 +1166,16 @@ static __global__ void mul_mat_vec_q_moe(
     // Write results
     if (lane < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + lane) < nrows_x)) {
         float result = tmp[lane];
+        // an expert's bias is its own row of the [nrows, n_expert] bias tensor
+        const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + lane;
         // an expert's own scale (NVFP4's second-level scale), applied where the separate multiply would have been
         if constexpr (type == GGML_TYPE_NVFP4) {
             if (fusion.x_scale != nullptr) {
                 result *= ((const float *) fusion.x_scale)[channel_x];
             }
+        }
+        if (fusion.x_bias != nullptr) {
+            result += ((const float *) fusion.x_bias)[bias_idx];
         }
         if constexpr (has_fusion) {
             float gate_value = tmp_gate[lane];
@@ -1116,6 +1183,9 @@ static __global__ void mul_mat_vec_q_moe(
                 if (fusion.gate_scale != nullptr) {
                     gate_value *= ((const float *) fusion.gate_scale)[channel_x];
                 }
+            }
+            if (fusion.gate_bias != nullptr) {
+                gate_value += ((const float *) fusion.gate_bias)[bias_idx];
             }
             switch (fusion.glu_op) {
                 case GGML_GLU_OP_SWIGLU:
@@ -1126,6 +1196,9 @@ static __global__ void mul_mat_vec_q_moe(
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI:
                     result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
                     break;
                 default:
                     result = result * gate_value;
@@ -1250,8 +1323,7 @@ static void mul_mat_vec_q_moe_launch(
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     constexpr int lpb = ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
 
-    // the gate and the per-expert scales travel with this kernel; biases keep their own launches
-    GGML_ASSERT(fusion.x_bias == nullptr && fusion.gate_bias == nullptr);
+    // the gate, the per-expert scales and the biases all travel with this kernel
 
     const mmvq_router_weights rw = g_mmvq_router_weights;
     g_mmvq_router_weights = {};
@@ -1364,6 +1436,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     const bool has_ids = ids != nullptr;
 
+    // How the K loop divides up at the baseline block width, both decisions below use these.
+    constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr                   = get_vdr_mmvq(type);
+    const int     blocks_per_row_x      = ncols_x / qk;
+    const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+
     const auto should_use_small_k = [&](int c_ncols_dst) {
         return mmvq_use_small_k<type>(ncols_x, ncols_dst, c_ncols_dst, cc, warp_size, table_id);
     };
@@ -1387,6 +1466,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         }
         return over_one_wave ? lane_groups : 1;
     };
+
 
     if (has_ids && ncols_dst > 1) {
         GGML_ASSERT(epi == nullptr);
@@ -1677,7 +1757,8 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!epi || (!ids && src0->type != GGML_TYPE_NVFP4));
 
     if (fusion) {
-        GGML_ASSERT( !ids || dst->ne[2] == 1 || (fusion->x_bias == nullptr && fusion->gate_bias == nullptr));
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
         GGML_ASSERT(  ids || dst->ne[1] <= MMVQ_MAX_BATCH_SIZE);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
@@ -1712,6 +1793,7 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_limit = fusion->glu_limit;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

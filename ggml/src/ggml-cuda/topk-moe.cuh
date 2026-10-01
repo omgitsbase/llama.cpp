@@ -6,6 +6,10 @@
 
 #include <initializer_list>
 
+// Rows that one CUDA block handles: upstream's name for the constant above, which this fork's kernel (warp
+// reduce, every warp reaching the barrier) is launch-bounded on.
+#define TOPK_MOE_ROWS_PER_BLOCK GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK
+
 struct ggml_cuda_topk_moe_args {
     bool sigmoid{};
     bool sqrt_softplus{};

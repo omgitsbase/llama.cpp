@@ -155,6 +155,9 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
         wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
     }
 
+    // Weights and IDs can alias logits, so wait until every row in the block reads its logits.
+    __syncthreads();
+
     if (!config.delayed_softmax) {
         if (config.use_sigmoid) {
            sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
