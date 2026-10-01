@@ -1336,6 +1336,20 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
+    // One .gguf can carry another model's weights beside this one's: a vision tower under v.*, and an MTP
+    // head written under its own mtp.* prefix instead of as a trailing block. Published Qwen3.5 builds have
+    // both. Those belong to another loader, so they are not tensors this one failed to take.
+    int n_sibling = 0;
+    for (const auto & it : weights_map) {
+        if (it.first.rfind("v.", 0) == 0 || it.first.rfind("mtp.", 0) == 0) {
+            n_sibling++;
+        }
+    }
+    if (n_created + n_sibling == n_tensors && n_sibling > 0) {
+        LLAMA_LOG_INFO("%s: used %d of %d tensors; %d belong to a sibling model on the same .gguf\n",
+                __func__, n_created, n_tensors, n_sibling);
+        return;
+    }
     if (n_created < n_tensors) {
         if (!partial) {
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));

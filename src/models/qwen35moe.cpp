@@ -76,7 +76,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         if (!hparams.is_recr(il)) {
             // Attention layers
-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+            // n_head_kv can be given per layer and is zero on the delta-net layers, so an attention
+            // layer's K/V width has to come from its own index; layer 0 is delta-net on some builds
+            // (Qwen3.5-9B) and reading the width there asked for a zero-wide attn_k
+            const int64_t kv_k = hparams.n_embd_k_gqa(il) > 0 ? hparams.n_embd_k_gqa(il) : n_embd_k_gqa;
+            const int64_t kv_v = hparams.n_embd_v_gqa(il) > 0 ? hparams.n_embd_v_gqa(il) : n_embd_v_gqa;
+            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, kv_k, kv_v, flags);
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
 
             // Q/K normalization for attention layers
@@ -88,7 +93,11 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
             layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
-            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
+            // see qwen35.cpp: the step bias comes either suffixed or bare depending on the converter
+            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags | TENSOR_NOT_REQUIRED);
+            if (layer.ssm_dt == nullptr) {
+                layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,                   il), { hparams.ssm_dt_rank }, flags);
+            }
             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
             layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
             layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
@@ -118,7 +127,9 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, mtp_flags);
 
-        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+        const int64_t kv_k = hparams.n_embd_k_gqa(il) > 0 ? hparams.n_embd_k_gqa(il) : n_embd_k_gqa;
+        const int64_t kv_v = hparams.n_embd_v_gqa(il) > 0 ? hparams.n_embd_v_gqa(il) : n_embd_v_gqa;
+        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, kv_k, kv_v, mtp_flags);
         layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
@@ -311,7 +322,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, hparams.n_head_kv(il), n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
@@ -322,7 +333,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
 
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, hparams.n_head_kv(il), n_tokens);
 
     // Apply IMRoPE
     Qcur = ggml_rope_multi(
@@ -706,12 +717,12 @@ ggml_tensor * llama_model_qwen35moe::graph_mtp::build_step(
     cb(gate, "mtp_gate", il);
 
     ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_rows);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, hparams.n_head_kv(il), n_rows);
     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "mtp_Kcur_normed", il);
 
     ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_rows);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, hparams.n_head_kv(il), n_rows);
     cb(Vcur, "mtp_Vcur", il);
 
     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
