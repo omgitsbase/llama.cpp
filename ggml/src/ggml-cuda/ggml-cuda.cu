@@ -5578,12 +5578,18 @@ static int ggml_cuda_try_mm_reshape_add(ggml_backend_cuda_context & ctx, const g
     if (ggml_cuda_tensors_overlap(add, fold ? fold->x : src1)) {
         return 0;
     }
+    // the matvec writes the add's rows as its columns: a product over [K, 1, n] sequences (a recurrent layer's output
+    // under several sequences) reshaped to [N, n] is n columns, read from src1 as columns only when it is contiguous
+    const int64_t ncols = ggml_nrows(add);
+    if (ncols > MMVQ_MAX_BATCH_SIZE || (mm->ne[2] * mm->ne[3] > 1 && !ggml_is_contiguous(src1))) {
+        return 0;
+    }
     ggml_cuda_mm_fusion_args_host fusion_data{};
     fusion_data.x_bias  = bias;
     fusion_data.x_scale = scale;
     if (!scale && ggml_cuda_should_fuse_mul_mat_vec_f(mm)) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, add, &fusion_data, fold);
-    } else if (ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_cuda_should_use_mmvq(src0->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) {
+    } else if (ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_cuda_should_use_mmvq(src0->type, ggml_cuda_info().devices[ctx.device].cc, ncols)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, add, &fusion_data, fold);
     } else {
         return 0;

@@ -1487,6 +1487,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+void llama_context::set_adapter_cvec_mode(int32_t mode) {
+    cvec->set_mode(mode);
+
+    sched_need_reserve = true;
+}
+
 
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -4990,6 +4996,15 @@ int32_t llama_set_adapter_cvec(
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
+}
+
+int32_t llama_set_adapter_cvec_mode(llama_context * ctx, int32_t mode) {
+    if (mode != 0 && mode != 1) {
+        return -1;
+    }
+    ctx->set_adapter_cvec_mode(mode);
+
+    return 0;
 }
 
 //

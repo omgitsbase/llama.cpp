@@ -19,6 +19,10 @@ struct llama_adapter_cvec {
 
     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;
 
+    // 0: the vector is added to the residual stream (a control vector);
+    // 1: the residual stream's component along it is removed (its square norm is the strength)
+    void set_mode(int32_t m) { mode = m; }
+
     bool apply(
             const llama_model & model,
             const float * data,
@@ -32,6 +36,9 @@ private:
 
     int32_t layer_start = -1;
     int32_t layer_end   = -1;
+    int32_t mode        = 0;
+
+    std::vector<bool> active; // per layer: whether the last apply() set a nonzero vector
 
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;

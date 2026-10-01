@@ -1456,6 +1456,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (err) {
             return res;
         }
+        llama_set_adapter_cvec_mode(lctx, cvec.mode);
     }
 
     if (llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK) {
@@ -2056,6 +2057,14 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         result.data.clear();
     }
 
+    {
+        const int64_t key = gguf_find_key(ctx_gguf, "controlvector.mode");
+        if (key >= 0 && gguf_get_kv_type(ctx_gguf, key) == GGUF_TYPE_STRING &&
+            std::string(gguf_get_val_str(ctx_gguf, key)) == "project") {
+            result.mode = 1;
+        }
+    }
+
     gguf_free(ctx_gguf);
     ggml_free(ctx);
 
@@ -2085,6 +2094,7 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
             for (size_t i = 0; i < cur.data.size(); i++) {
                 result.data[i] += cur.data[i];
             }
+            result.mode = std::max(result.mode, cur.mode);
         }
     }
 

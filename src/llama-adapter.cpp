@@ -15,17 +15,28 @@ ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
     if (il < 0 || il < layer_start || il > layer_end || (size_t) il >= tensors.size()) {
         return nullptr;
     }
+    if ((size_t) il < active.size() && !active[il]) {
+        return nullptr; // a zero vector changes nothing, so it costs nothing
+    }
 
     return tensors[il];
 }
 
 ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const {
     ggml_tensor * layer_dir = tensor_for(il);
-    if (layer_dir != nullptr) {
-        cur = ggml_add(ctx, cur, layer_dir);
+    if (layer_dir == nullptr) {
+        return cur;
+    }
+    if (mode == 1) {
+        // cur - v (v . cur): with v = sqrt(w) r for a unit r, the component along r is scaled by 1 - w
+        ggml_tensor * col = ggml_reshape_2d(ctx, layer_dir, layer_dir->ne[0], 1); // [n_embd, 1]
+        ggml_tensor * dot = ggml_mul_mat(ctx, col, cur);                           // [1, n_tokens]
+        ggml_tensor * row = ggml_reshape_2d(ctx, layer_dir, 1, layer_dir->ne[0]); // [1, n_embd]
+        ggml_tensor * prj = ggml_mul_mat(ctx, row, dot);                           // [n_embd, n_tokens]
+        return ggml_sub(ctx, cur, prj);
     }
 
-    return cur;
+    return ggml_add(ctx, cur, layer_dir);
 }
 
 bool llama_adapter_cvec::init(const llama_model & model) {
@@ -121,12 +132,19 @@ bool llama_adapter_cvec::apply(
     layer_start = il_start;
     layer_end   = il_end;
 
+    active.assign(hparams.n_layer(), false);
+    std::vector<float> zeros(n_embd, 0.0f);
     for (size_t il = 1; il < hparams.n_layer(); il++) {
         assert(tensors[il] != nullptr);
 
         const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
-        if (off + n_embd <= len) {
-            ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
+        const float * src = off + n_embd <= len ? data + off : zeros.data();
+        ggml_backend_tensor_set(tensors[il], src, 0, n_embd * ggml_element_size(tensors[il]));
+        for (int32_t k = 0; k < n_embd; k++) {
+            if (src[k] != 0.0f) {
+                active[il] = true;
+                break;
+            }
         }
     }
 

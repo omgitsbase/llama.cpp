@@ -1085,6 +1085,10 @@ struct common_control_vector_data {
 
     // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
     std::vector<float> data;
+
+    // 0: added to the residual stream; 1: the stream's component along it is removed
+    // (the file says controlvector.mode = "project")
+    int mode = 0;
 };
 
 struct common_control_vector_load_info {

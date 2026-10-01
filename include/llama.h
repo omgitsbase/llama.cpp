@@ -725,6 +725,10 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // How the loaded control vector acts on the residual stream: 0 adds it (the default),
+    // 1 removes the stream's component along it, scaled by the vector's square norm.
+    LLAMA_API int32_t llama_set_adapter_cvec_mode(struct llama_context * ctx, int32_t mode);
+
     //
     // Memory
     //
