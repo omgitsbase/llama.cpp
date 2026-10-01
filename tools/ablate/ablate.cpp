@@ -1194,6 +1194,21 @@ int main(int argc, char ** argv) {
     llama_batch_free(batch);
     const double t_trials = elapsed() - t_load - t_capture - t_base;
 
+    // ---- the KL guard: some models (Gemma's massive-activation family) cannot lose their refusal direction
+    // without collapsing -- the best vector still lands at a huge KL. Refuse to write a vector that would ship a
+    // broken model, so `llmash ablate` fails loudly instead of installing garbage. 1.0 is well clear of a healthy
+    // result (~0.1) and of a merely-aggressive one (Llama ~0.5), but far below a collapse (Gemma ~3.5+).
+    const double kl_max = o.max_kl > 0 ? o.max_kl : 1.0;
+    if (best.kl > kl_max) {
+        say("rejected kl=%.3f exceeds max_kl=%.3f: this model is not ablatable with this method (its refusal "
+            "direction is entangled with its competence; removing it collapses the model). No vector written.",
+            best.kl, kl_max);
+        std::fprintf(stderr, "ablate: KL %.3f over the %.3f limit; not writing a broken vector\n", best.kl, kl_max);
+        llama_free(ctx);
+        llama_backend_free();
+        return 2;
+    }
+
     // ---- the scan: is the refusal still in the stream once the vector is applied?
     //
     // The refusal count only sees whether an answer OPENS with one, and a model can learn to drop the opening
@@ -1202,9 +1217,10 @@ int main(int argc, char ** argv) {
     // chosen vector in place, take the residuals again over the same split and ask how far apart harmful and
     // harmless prompts still sit along their best direction. If the model still tells them apart it still
     // represents the refusal, whatever its answers open with. It reads only the residual stream, so it means
-    // the same on a dense model, a mixture of experts, or a recurrent one, and costs one capture.
+    // the same on a dense model, a mixture of experts, or a recurrent one, and costs one capture. A scan that
+    // could not run reports -1, never 0, which would read as the refusal fully gone.
     const int  band_lo = std::max(1, n_layer / 4), band_hi = std::min(n_layer - 2, n_layer * 85 / 100);
-    double     sep_before = 0, sep_after = 0;
+    double     sep_before = 0, sep_after = -1;
     {
         for (int il = band_lo; il <= band_hi; il++) {
             sep_before = std::max(sep_before, score[il]);
@@ -1220,38 +1236,29 @@ int main(int argc, char ** argv) {
         if (llama_context * sctx = make_context(model, params, want, static_cast<int>(GGML_PAD(longest, 32)),
                                                 n_ub, n_ub, &cap)) {
             const std::vector<float> data = cvec_data(best, dirs, n_layer, n_embd);
-            llama_set_adapter_cvec(sctx, data.data(), data.size(), n_embd, 1, n_layer - 1);
-            llama_set_adapter_cvec_mode(sctx, 1);
             std::vector<float> ah, ag;
             const auto quiet = [](size_t, size_t) {};
-            if (capture(sctx, cap, dir_h, equal_only, ah, quiet) &&
-                capture(sctx, cap, dir_g, equal_only, ag, quiet)) {
-                std::vector<std::vector<float>> after_dirs;
-                std::vector<double>             after_score;
-                directions_of(ah, ag, dir_h.size(), dir_g.size(), n_layer, n_embd, after_dirs, after_score);
-                for (int il = band_lo; il <= band_hi; il++) {
-                    sep_after = std::max(sep_after, after_score[il]);
+            if (llama_set_adapter_cvec(sctx, data.data(), data.size(), n_embd, 1, n_layer - 1) == 0) {
+                llama_set_adapter_cvec_mode(sctx, 1);
+                if (capture(sctx, cap, dir_h, equal_only, ah, quiet) &&
+                    capture(sctx, cap, dir_g, equal_only, ag, quiet)) {
+                    std::vector<std::vector<float>> after_dirs;
+                    std::vector<double>             after_score;
+                    directions_of(ah, ag, dir_h.size(), dir_g.size(), n_layer, n_embd, after_dirs, after_score);
+                    sep_after = 0;
+                    for (int il = band_lo; il <= band_hi; il++) {
+                        sep_after = std::max(sep_after, after_score[il]);
+                    }
                 }
             }
             llama_free(sctx);
         }
-        say("scan separation=%.2f was=%.2f kept=%.2f", sep_after, sep_before,
-            sep_before > 0 ? sep_after / sep_before : 0.0);
-    }
-
-    // ---- the KL guard: some models (Gemma's massive-activation family) cannot lose their refusal direction
-    // without collapsing -- the best vector still lands at a huge KL. Refuse to write a vector that would ship a
-    // broken model, so `llmash ablate` fails loudly instead of installing garbage. 1.0 is well clear of a healthy
-    // result (~0.1) and of a merely-aggressive one (Llama ~0.5), but far below a collapse (Gemma ~3.5+).
-    const double kl_max = o.max_kl > 0 ? o.max_kl : 1.0;
-    if (best.kl > kl_max) {
-        say("rejected kl=%.3f exceeds max_kl=%.3f: this model is not ablatable with this method (its refusal "
-            "direction is entangled with its competence; removing it collapses the model). No vector written.",
-            best.kl, kl_max);
-        std::fprintf(stderr, "ablate: KL %.3f over the %.3f limit; not writing a broken vector\n", best.kl, kl_max);
-        if (ctx) { llama_free(ctx); }
-        llama_backend_free();
-        return 2;
+        if (sep_after < 0) {
+            say("scan skipped: no context for the scan fits or its capture failed");
+        } else {
+            say("scan separation=%.2f was=%.2f kept=%.2f", sep_after, sep_before,
+                sep_before > 0 ? sep_after / sep_before : -1.0);
+        }
     }
 
     // ---- write the pick
