@@ -2745,11 +2745,8 @@ struct test_rms_norm_mul_rope : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
     const bool multi_add; // test a sequence of adds feeding into rms_norm
-    const bool mul;
-    const bool rope;
     const bool set_rows;
     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
-    const ggml_type set_rows_type;
     int mode;
     const int n_dims;     // 0: every element is rotated
     const bool weights;   // the broadcast weight lives in a weights buffer
@@ -2787,23 +2784,13 @@ struct test_rms_norm_mul_rope : public test_case {
         ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
         ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
 
-        ggml_tensor * b = nullptr;
-        ggml_tensor * c = nullptr;
-        ggml_tensor * w = nullptr;
-
-        if (multi_add || (mul && !broadcast)) {
-            b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
-        }
         if (multi_add) {
-            c = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
-        }
-        if (mul) {
-            w = broadcast ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]) : b;
+            a = ggml_add(ctx, ggml_add(ctx, a, b), c);
         }
 
         ggml_tensor * w = broadcast ? ggml_new_tensor_1d(ctx_weights ? ctx_weights : ctx, GGML_TYPE_F32, ne[0]) : b;
 
-        a = ggml_rms_norm(ctx, a, eps);
+        a = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
 
         const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
         const int  nd       = n_dims > 0 ? n_dims : (int) ne[0];
@@ -2824,14 +2811,7 @@ struct test_rms_norm_mul_rope : public test_case {
             rope = ggml_rope_ext(ctx, a, pos, nullptr, nd, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         }
 
-            if (is_mrope) {
-                const int n_dims = ne[0];
-                int sections[4] = { n_dims/3, n_dims/3, n_dims/3, 0 };
-                a = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-            } else {
-                a = ggml_rope(ctx, a, pos, ne[0], mode);
-            }
-        }
+        ggml_tensor * out;
 
         ggml_tensor * src = rope;
         if (hadamard) {
@@ -2848,7 +2828,7 @@ struct test_rms_norm_mul_rope : public test_case {
             ggml_tensor * dst = ggml_new_tensor_4d(ctx, hadamard ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
             ggml_set_name(dst, "dst");
 
-            ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, ne[2]);
+            ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, ne[2], 1, 1);
             ggml_set_name(row_idxs, "row_idxs");
 
             out = ggml_set_rows(ctx, dst, view, row_idxs);
@@ -2857,8 +2837,7 @@ struct test_rms_norm_mul_rope : public test_case {
             out = src;
         }
 
-        ggml_set_name(a, "out");
-        return a;
+        return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -2889,18 +2868,14 @@ struct test_rms_norm_mul_rope : public test_case {
                 if (ggml_is_view_op(t->op)) {
                     continue;
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+
+                init_set_rows_row_ids(t, ne[2]);
             } else {
                 init_tensor_uniform(t);
             }
         }
     }
-
-    double max_nmse_err() override {
-        return ne[0] == 8192 ? 5e-6 : test_case::max_nmse_err();
-    }
 };
-
 // upstream's form of the test above: the mul and the rope each optional, and the KV type it writes
 struct test_rms_norm_mul_rope_kv : public test_case {
     const std::array<int64_t, 4> ne;
@@ -5114,6 +5089,13 @@ struct test_conv_state_fold : public test_case {
                     rows[i] = (src_row + i) % (mem_size * K);
                 }
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -7584,6 +7566,8 @@ struct test_mul_mat_pair : public test_case {
     }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out0, out1 }; }
+};
+
 struct test_moe_weighted_reduction : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -11998,6 +11982,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_pair(type, 48, 80, n, 5120, with_norm, true));
             }
         }
+    }
+
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
@@ -12379,6 +12365,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K,
                                  GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 131072, bs, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {

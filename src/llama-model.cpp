@@ -1808,9 +1808,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (tok_embd && output && tok_embd != output && strcmp(output->name, tok_embd->name) == 0 &&
             !(input_env && atoi(input_env) == 0) && !pimpl->dev_layer.empty()) {
         auto buft_of = [&](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
-            for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+            for (auto & [key, ctx_ptr] : ml.ctx_map) {
                 if (ggml_get_tensor(ctx_ptr.get(), t->name) == t) {
-                    return buft;
+                    return key.buft;
                 }
             }
             return nullptr;

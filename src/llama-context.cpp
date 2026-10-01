@@ -4530,7 +4530,7 @@ bool llama_context::get_last_rows(llama_seq_id seq, llama_pos pos0, int32_t n, i
         if (last_rows_seq[r] != seq || last_rows_pos[r] != pos0) {
             continue;
         }
-        const auto * res = static_cast<const llm_graph_result *>(gf_res_prev.get());
+        const auto * res = static_cast<const llm_graph_result *>(gf_res_prev_active);
         for (int32_t i = 0; i < n; ++i) {
             if (last_rows_seq[r + i] != seq || last_rows_pos[r + i] != pos0 + i || last_rows_out[r + i] < 0) {
                 return false;
@@ -4804,8 +4804,8 @@ bool llama_sampler_on_backend(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->has_backend_sampler(seq_id);
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() const {
-    return static_cast<llm_graph_result *>(gf_res_prev.get());
+llm_graph_result * llama_context::get_gf_res_last() const {
+    return gf_res_prev_active;
 }
 
 int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n_max, llama_token stop, llama_token * out) {
@@ -5036,7 +5036,12 @@ int32_t llama_context::decode_loop(llama_token token0, llama_pos pos0, int32_t n
     }
 
     // the next plain decode must not reuse a graph whose memory the loop took
-    gf_res_prev->reset();
+    for (auto & r : gf_res_prev) {
+        if (r) {
+            r->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
     ggml_backend_sched_reset(sched.get());
 
     return n_out;

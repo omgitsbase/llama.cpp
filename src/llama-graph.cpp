@@ -379,7 +379,7 @@ void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
         } else {
             if (!res_tgt) {
                 GGML_ASSERT(st->ctx_tgt);
-                res_tgt   = st->ctx_tgt->get_gf_res_prev();
+                res_tgt   = st->ctx_tgt->get_gf_res_last();
                 sched_tgt = st->ctx_tgt->get_sched();
                 src_h     = res_tgt->get_h_nextn();
                 GGML_ASSERT(src_h && src_h->ne[0] == n_embd && ggml_is_contiguous(src_h));
@@ -2930,7 +2930,7 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
     }
 
     ggml_tensor * cur = build_attn_mha(q, k_all, v_all,
-            nullptr, mask, sinks, v_mla, kq_scale, il);
+            nullptr, mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (attn.k_rot) {

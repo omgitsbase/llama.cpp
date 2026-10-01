@@ -1476,7 +1476,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 float   * h = round_h.data() + (size_t) s*V*n_embd;
                 if (first) {
                     // nothing to replay: junk rows the chain never sees, the anchor at base
-                    cs.base = dp.n_past;
+                    cs.base = dp.pos0;
                     for (int k = 0; k < V; ++k) {
                         common_batch_add(batch, k == 0 ? dp.id_last : junk, cs.base + k, { seq }, false);
                     }
@@ -1621,7 +1621,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
             want.push_back(seq);
-            cs.expect = dparams[seq].n_past; // the next verify batch starts at the anchor, drafts or not
+            cs.expect = dparams[seq].pos0; // the next verify batch starts at the anchor, drafts or not
             if (!chain_launched || cs.col < 0) {
                 rest.push_back(seq);
             }
@@ -1636,7 +1636,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (llama_seq_id seq : want) {
                     const auto & cs = chain[seq];
                     if (cs.col >= 0) {
-                        take_ids(cs, cs.col, dparams[seq].n_past, *dparams[seq].result, false);
+                        take_ids(cs, cs.col, dparams[seq].pos0, *dparams[seq].result, false);
                     }
                 }
             }
@@ -1658,7 +1658,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result->insert(dp.result->end(), K, dp.id_last);
                 cs.ids_result = dp.result;
                 cs.ids_col    = cs.col;
-                cs.ids_n_past = dp.n_past;
+                cs.ids_n_past = dp.pos0;
                 cs.col        = -1;
             }
             return;
@@ -1676,7 +1676,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             // the round put the anchor after the rows it accepted; a server that
             // moved elsewhere (a restored checkpoint) gets no draft this time
-            take_ids(cs, cs.col, dparams[seq].n_past, *dparams[seq].result, false);
+            take_ids(cs, cs.col, dparams[seq].pos0, *dparams[seq].result, false);
             cs.col = -1;
         }
         if (spct.on) {

@@ -83,7 +83,8 @@ struct llama_context {
     void outputs_wait();
     void outputs_advance();
 
-    llm_graph_result * get_gf_res_prev() const;
+    // the graph result the last decode ran, or nullptr once it may no longer be read
+    llm_graph_result * get_gf_res_last() const;
 
     // the decode loop on the device: n_max steps from token0 at pos0, each
     // step fed by the last; the ids come back in out. Returns the count, or
