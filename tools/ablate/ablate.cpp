@@ -499,7 +499,10 @@ int judge_refused(const Judge & j, const std::string & prompt, const std::string
         { "stream", false },
         { "chat_template_kwargs", { { "enable_thinking", false } } },
     };
-    const std::string payload = body.dump();
+    // an answer cut at the token limit can end inside a multi-byte character, and a vector pushed hard can emit
+    // bytes that are not text at all: either is invalid UTF-8, on which dump() throws in a worker thread and ends
+    // the process, so bad bytes go out as U+FFFD instead
+    const std::string payload = body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     for (int attempt = 0; attempt < 3; attempt++) {
         try {
             auto [cli, parts] = common_http_client(j.url);
