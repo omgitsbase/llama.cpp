@@ -10,8 +10,8 @@
 // with controlvector.mode = "project": sqrt(weight) times the unit direction per layer, applied by llama.cpp as
 // cur - v (v . cur), so the model file is never touched and any quantization of it takes the vector unchanged.
 //
-//   llama-ablate -m model.gguf --harmful bad.txt --harmless good.txt --harmful-eval bad_test.txt \
-//                --harmless-eval good_test.txt --level balanced -o model.ablation.gguf --report report.json
+//   llama-ablate -m model.gguf --harmful bad.txt --harmless good.txt --harmful-eval bad_test.txt
+//     --harmless-eval good_test.txt --level balanced -o model.ablation.gguf --report report.json
 //
 // Prompt files hold one prompt per line. Progress goes to stdout as lines starting with "ablate: ", each a word
 // for the phase followed by key=value pairs.
