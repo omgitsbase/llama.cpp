@@ -809,7 +809,25 @@ std::string json_escape(const std::string & s) {
     return o;
 }
 
-// A context over the loaded model, halving the sequences until one fits.
+// Whether every GPU still has room after a context was made. On Windows the driver can back an allocation the
+// card has no room for with system memory instead of failing it, and every kernel then crawls (Flash Next at 128
+// sequences: 44 minutes for what 32 sequences do in 3), so a context that leaves a card nearly full does not fit.
+bool gpus_have_room() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total > 0 && free < (size_t(3) << 30)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A context over the loaded model, halving the sequences until one fits and leaves the cards room.
 llama_context * make_context(llama_model * model, const common_params & params, int n_seq, int n_ctx_per_seq,
                              int n_batch, int n_ubatch, Capture * cap) {
     for (; n_seq >= 1; n_seq /= 2) {
@@ -823,7 +841,10 @@ llama_context * make_context(llama_model * model, const common_params & params, 
         cp.cb_eval           = cap ? cb_eval : nullptr;
         cp.cb_eval_user_data = cap;
         if (llama_context * ctx = llama_init_from_model(model, cp)) {
-            return ctx;
+            if (n_seq == 1 || gpus_have_room()) {
+                return ctx;
+            }
+            llama_free(ctx);
         }
         if (n_seq == 1) {
             break;
