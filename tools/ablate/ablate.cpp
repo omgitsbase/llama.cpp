@@ -23,6 +23,7 @@
 #include "gguf.h"
 #include "http.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 
 #include <nlohmann/json.hpp>
 
@@ -37,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <numeric>
 #include <random>
 #include <string>
@@ -64,6 +66,7 @@ struct Options {
     int  n_seq  = -1;
     int  seed   = 1;
     bool think  = false;
+    bool dry    = false;   // report what each context would allocate, from a model that holds no weights, and stop
 };
 
 // Each level searches longer than the one before it, for a lower KL at the same refusal count.
@@ -150,6 +153,7 @@ bool take_options(int & argc, char ** argv, Options & o) {
         else if (a == "--seqs")          { if (!need(v)) return false; o.n_seq = std::atoi(v.c_str()); }
         else if (a == "--seed")          { if (!need(v)) return false; o.seed = std::atoi(v.c_str()); }
         else if (a == "--think")         { o.think = true; }
+        else if (a == "--dry")           { o.dry = true; }
         else { kept.push_back(argv[i]); }
     }
     for (size_t i = 0; i < kept.size(); i++) {
@@ -809,10 +813,9 @@ std::string json_escape(const std::string & s) {
     return o;
 }
 
-// Whether every GPU still has room after a context was made. On Windows the driver can back an allocation the
-// card has no room for with system memory instead of failing it, and every kernel then crawls (Flash Next at 128
-// sequences: 44 minutes for what 32 sequences do in 3), so a context that leaves a card nearly full does not fit.
-bool gpus_have_room() {
+// The least free memory on any GPU, in GiB; -1 with no GPU.
+double gpu_free_gib() {
+    double least = -1;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -820,35 +823,109 @@ bool gpus_have_room() {
         }
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
-        if (total > 0 && free < (size_t(3) << 30)) {
-            return false;
+        if (total > 0) {
+            const double f = static_cast<double>(free) / (1u << 30);
+            least = least < 0 ? f : std::min(least, f);
         }
     }
+    return least;
+}
+
+// A context's KV/state and compute bytes per GPU, simulated on a weightless copy of the model (what --fit does).
+bool context_need(llama_model * dry, const llama_context_params & cp, std::map<ggml_backend_dev_t, size_t> & need) {
+    need.clear();
+    llama_context_params c = cp;
+    c.cb_eval           = nullptr;
+    c.cb_eval_user_data = nullptr;
+    llama_context * ctx = llama_init_from_model(dry, c);
+    if (!ctx) {
+        return false;
+    }
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        if (ggml_backend_buft_is_host(buft)) {
+            continue;
+        }
+        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+            // twice the compute buffer: the CUDA pool grows with the same batch
+            need[dev] += mb.context + 2 * mb.compute;
+        }
+    }
+    llama_free(ctx);
     return true;
 }
 
-// A context over the loaded model, halving the sequences until one fits and leaves the cards room.
+// The parameters of every context this tool makes: n_seq sequences of n_ctx_per_seq tokens in one unified cache.
+llama_context_params context_params(const common_params & params, int n_seq, int n_ctx_per_seq, int n_batch,
+                                    int n_ubatch, Capture * cap) {
+    llama_context_params cp = common_context_params_to_llama(params);
+    cp.n_seq_max  = static_cast<uint32_t>(n_seq);
+    cp.n_ctx      = static_cast<uint32_t>(GGML_PAD(std::max(n_ctx_per_seq * n_seq, n_ubatch), 256));
+    cp.n_batch    = static_cast<uint32_t>(n_batch);
+    cp.n_ubatch   = static_cast<uint32_t>(n_ubatch);
+    cp.kv_unified = true;
+    // no draft-rollback snapshots: this tool never drafts, and they triple a recurrent model's state per sequence
+    cp.n_rs_seq   = 0;
+
+    cp.cb_eval           = cap ? cb_eval : nullptr;
+    cp.cb_eval_user_data = cap;
+    return cp;
+}
+
+// --dry: each buffer a context would hold (weights, KV and recurrent state, compute), from the simulation.
+void report_need(llama_model * dry, const llama_context_params & cp, const char * what, int n_seq) {
+    llama_context * ctx = llama_init_from_model(dry, cp);
+    if (!ctx) {
+        say("dry %s seqs=%d failed", what, n_seq);
+        return;
+    }
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        say("dry %s seqs=%d ctx=%u ubatch=%u buf=%s model_mib=%.0f context_mib=%.0f compute_mib=%.0f", what, n_seq,
+            cp.n_ctx, cp.n_ubatch, ggml_backend_buft_name(buft), mb.model / 1048576.0, mb.context / 1048576.0,
+            mb.compute / 1048576.0);
+    }
+    llama_free(ctx);
+}
+
+// As many sequences as fit with 4 GiB to spare, sized before allocating: on Windows an over-committed card spills
+// into system RAM instead of failing, and everything crawls.
 llama_context * make_context(llama_model * model, const common_params & params, int n_seq, int n_ctx_per_seq,
                              int n_batch, int n_ubatch, Capture * cap) {
-    for (; n_seq >= 1; n_seq /= 2) {
-        llama_context_params cp = common_context_params_to_llama(params);
-        cp.n_seq_max  = static_cast<uint32_t>(n_seq);
-        cp.n_ctx      = static_cast<uint32_t>(GGML_PAD(std::max(n_ctx_per_seq * n_seq, n_ubatch), 256));
-        cp.n_batch    = static_cast<uint32_t>(n_batch);
-        cp.n_ubatch   = static_cast<uint32_t>(n_ubatch);
-        cp.kv_unified = true;
+    common_params      pc = params;
+    llama_model_params mp = common_model_params_to_llama(pc);
+    mp.no_alloc           = true;
+    mp.load_mode          = LLAMA_LOAD_MODE_NONE;
+    llama_model * dry     = llama_model_load_from_file(params.model.path.c_str(), mp);
 
-        cp.cb_eval           = cap ? cb_eval : nullptr;
-        cp.cb_eval_user_data = cap;
-        if (llama_context * ctx = llama_init_from_model(model, cp)) {
-            if (n_seq == 1 || gpus_have_room()) {
-                return ctx;
+    const size_t margin = size_t(4) << 30;
+    for (; n_seq >= 1; n_seq /= 2) {
+        const llama_context_params cp = context_params(params, n_seq, n_ctx_per_seq, n_batch, n_ubatch, cap);
+
+        bool   fits = true;
+        double need_gib = -1, free_gib = -1;
+        if (dry) {
+            std::map<ggml_backend_dev_t, size_t> need;
+            fits = context_need(dry, cp, need);
+            for (const auto & [dev, bytes] : need) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                need_gib = std::max(need_gib, static_cast<double>(bytes) / (1u << 30));
+                free_gib = free_gib < 0 ? static_cast<double>(free) / (1u << 30)
+                                        : std::min(free_gib, static_cast<double>(free) / (1u << 30));
+                if (total > 0 && bytes + margin > free) {
+                    fits = false;
+                }
             }
-            llama_free(ctx);
         }
-        if (n_seq == 1) {
-            break;
+        say("context seqs=%d need_gib=%.1f free_gib=%.1f fits=%d", n_seq, need_gib, free_gib, fits ? 1 : 0);
+        if (fits) {
+            if (dry) {
+                llama_model_free(dry);
+            }
+            return llama_init_from_model(model, cp);
         }
+    }
+    if (dry) {
+        llama_model_free(dry);
     }
     return nullptr;
 }
@@ -904,9 +981,18 @@ int main(int argc, char ** argv) {
     params.n_ubatch   = 512;
     llama_backend_init();
     llama_numa_init(params.numa);
-    auto llama_init = common_init_from_params(params);
-    llama_model * model = llama_init->model();
-    if (!model || !llama_init->context()) {
+    common_init_result_ptr llama_init;
+    llama_model *          model = nullptr;
+    if (o.dry) {
+        llama_model_params mp = common_model_params_to_llama(params);
+        mp.no_alloc           = true;
+        mp.load_mode          = LLAMA_LOAD_MODE_NONE;
+        model                 = llama_model_load_from_file(params.model.path.c_str(), mp);
+    } else {
+        llama_init = common_init_from_params(params);
+        model      = llama_init->model();
+    }
+    if (!model || (!o.dry && !llama_init->context())) {
         std::fprintf(stderr, "failed to load the model\n");
         return 1;
     }
@@ -985,6 +1071,28 @@ int main(int argc, char ** argv) {
     t_load = elapsed();
     say("prompts direction=%zu+%zu eval=%zu+%zu trials=%d gen=%d longest=%zu recurrent=%d load_s=%.1f",
         dir_h.size(), dir_g.size(), eval_h.size(), eval_g.size(), trials, n_gen, longest, equal_only ? 1 : 0, t_load);
+
+    if (o.dry) {
+        say("dry gpu_free_gib=%.1f n_vocab=%d", gpu_free_gib(), n_vocab);
+        report_need(model, common_context_params_to_llama(params), "load", 1);
+        const int n_ub = std::max(2048, static_cast<int>(GGML_PAD(longest, 256)));
+        for (int s = o.n_seq > 0 ? std::min(o.n_seq, 64) : 64; s >= 4; s /= 2) {
+            report_need(model, context_params(params, s, static_cast<int>(GGML_PAD(longest, 32)), n_ub, n_ub, nullptr),
+                        "capture", s);
+        }
+        size_t th = 0, tg = 0;
+        for (const auto & p : eval_h) th += p.size();
+        for (const auto & p : eval_g) tg += p.size();
+        const int per_seq = static_cast<int>(GGML_PAD(longest + n_gen, 32));
+        const int n_batch = static_cast<int>(GGML_PAD(std::max({ th, tg, longest }), 256));
+        const int top     = std::max(1, std::min(o.n_seq > 0 ? o.n_seq : 128,
+                                                 static_cast<int>(std::max(eval_h.size(), eval_g.size()))));
+        for (int s = top; s >= 4; s /= 2) {
+            report_need(model, context_params(params, s, per_seq, n_batch, std::min(n_batch, 4096), nullptr), "trials", s);
+        }
+        llama_model_free(model);
+        return 0;
+    }
 
     // A judge, when asked for, decides each answer's refusal instead of the marker words. Check it answers before
     // the search leans on it, so a wrong URL fails now rather than scoring every trial as an error.
@@ -1142,8 +1250,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     t_base = elapsed() - t_load - t_capture;
-    say("baseline refusals=%d of=%zu seqs=%d ctx=%d base_s=%.1f prefill_s=%.2f gen_s=%.2f steps=%d metric=%s "
-        "judge_s=%.1f judge_errors=%d", base_refusals, eval_h.size(), room.n_seq, room.n_ctx, t_base,
+    say("baseline refusals=%d of=%zu seqs=%d ctx=%d free_gib=%.1f base_s=%.1f prefill_s=%.2f gen_s=%.2f steps=%d "
+        "metric=%s judge_s=%.1f judge_errors=%d", base_refusals, eval_h.size(), room.n_seq, room.n_ctx, gpu_free_gib(), t_base,
         base_st.prefill_s, base_st.gen_s, base_st.steps, judge.active() ? "judge" : "markers", base_st.judge_s,
         base_st.judge_errors);
 
