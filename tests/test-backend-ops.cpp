@@ -12430,12 +12430,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
-    // decode attention as the served models issue it: gemma-4 E4B (8 heads over 2), Qwen3.6-A3B (16 over 2), Qwen3.8-27B (24 over 4), head size 256
-    for (int64_t kv : {256, 1024, 4096}) {
-        for (int64_t nb : {1, 4}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256,  8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 24, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // decode attention as the served models issue it: gemma-4 E4B (8 heads over 2), Qwen3.6-A3B (16 over 2), Qwen3.8-27B (24 over 4), head size 256,
+    // with an f16 or a q8_0 cache, one token or an MTP verify's four
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {256, 1024, 4096, 32768, 131072}) {
+            for (int64_t nb : {1, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256,  8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 24, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

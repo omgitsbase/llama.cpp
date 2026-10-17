@@ -629,8 +629,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
+                // the MMA kernel reads a q8_0 cache once for a group of heads, the vector kernel once a head: from 5
+                // heads a group and 1k cells it is the faster of the two (sm_120, Qwen3.8-27B: 27% at 128k)
+                const bool q8_mma = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && gqa_opt_applies &&
+                    gqa_ratio > 4 && K->ne[1] >= 1024 && (K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256);
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    if (Q->ne[1] <= 2 && !q8_mma) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
