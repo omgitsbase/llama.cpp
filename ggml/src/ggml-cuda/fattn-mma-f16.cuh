@@ -2094,26 +2094,32 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // GGML_CUDA_FA_Q8=convert makes the f16 copy as before, for measuring the two
     static const bool q8_convert = getenv("GGML_CUDA_FA_Q8") && strcmp(getenv("GGML_CUDA_FA_Q8"), "convert") == 0;
     if constexpr (ggml_cuda_fattn_mma_reads_q8_0(DKQ, DV, ncols1, ncols2)) {
-        bool sparse = q8_convert;
+        bool sparse = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
-            sparse = ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst);
+            sparse = ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1);
         }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if (dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0 && logit_softcap == 0.0f && !sparse) {
-            const fattn_kernel_t q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, true>;
+        if (dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0 && logit_softcap == 0.0f && !q8_convert) {
+            // a sparse read gathers only the indexed rows; an f16 copy of the whole cache would cost more than the attention
+            fattn_kernel_t q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, true>;
+            if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
+                if (sparse) {
+                    q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, true, true>;
+                }
+            }
             const size_t nbytes_shared_q8 = std::max(nbytes_shared_combine, Q_in_reg ?
                 std::max(nbytes_shared_Q,  nbytes_shared_KV_1stage + nbytes_shared_mask) :
                          nbytes_shared_Q + nbytes_shared_KV_1stage + nbytes_shared_mask);
 #if !defined(GGML_USE_MUSA)
-            static bool shared_memory_limit_raised_q8[GGML_CUDA_MAX_DEVICES] = {false};
-            if (!shared_memory_limit_raised_q8[id]) {
+            static bool shared_memory_limit_raised_q8[2][GGML_CUDA_MAX_DEVICES] = {};
+            if (!shared_memory_limit_raised_q8[sparse][id]) {
                 CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(q8_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_q8));
-                shared_memory_limit_raised_q8[id] = true;
+                shared_memory_limit_raised_q8[sparse][id] = true;
             }
 #endif // !defined(GGML_USE_MUSA)
             launch_fattn<DV, ncols1, ncols2>
-                (ctx, dst, q8_kernel, nwarps, nbytes_shared_q8, nbatch_fa, false, false, true, false, warp_size_host);
+                (ctx, dst, q8_kernel, nwarps, nbytes_shared_q8, nbatch_fa, false, false, true, sparse, warp_size_host);
             return;
         }
     }
