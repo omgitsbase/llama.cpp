@@ -1,3 +1,25 @@
+# llama.cpp, as llmash runs it
+
+This branch is the runtime of [llmash](https://github.com/omgitsbase/llmash): llama.cpp from
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), merged forward from upstream, with changes mostly to
+the CUDA backend, speculative decoding and the server. What it adds:
+
+- **One CUDA graph per speculative round**: the verify batch, the accept decision and every draft step, with the
+  accept decided on the GPU.
+- **A 4-bit draft head**: an MTP head drafts through the 131,072 most frequent rows of the LM head, requantized to
+  Q4_K at load. Verification still reads the full head, so the output is the model's own.
+- **Fused recurrent layers** on delta-net models (Qwen3.5, 3.6, 3.8 and the Next models), and fused
+  mixture-of-experts tails.
+- **NVFP4 under speculation**: the second-level scales ride the matvecs of a verify batch as they do for one token.
+- **Flash attention that reads a q8_0 cache as it is** when decoding and verifying drafts.
+- **llama-ablate**: finds the direction a chat model's refusals run along and writes it out as a projection control
+  vector, leaving the model file untouched.
+
+Every fusion is matched on the graph rather than by model name, and each has a bit in `GGML_CUDA_FUSE_OFF` to turn
+it off. `build-cuda-fat.bat` builds the Windows runtime llmash ships. The rest of this file is upstream's README.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

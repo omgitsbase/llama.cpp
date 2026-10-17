@@ -16,11 +16,8 @@ void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int 
     }
 }
 
-// dst[:, t] = sum over e of x[:, e, t]; one block per (token, column chunk).
-// The columns of one token's experts are ne0 apart, tokens are s2 apart.
-// dst[:, t] = sum over e of x[:, e, t]. Each thread owns four consecutive
-// columns so a warp reads 512 bytes per expert row, and the expert loop is
-// unrolled; columns of one token's experts are s1 apart, tokens s2 apart.
+// dst[:, t] = sum over e of x[:, e, t]. Each thread owns four consecutive columns, so a warp reads 512 bytes per
+// expert row; columns of one token's experts are s1 apart, tokens s2 apart.
 template <int n_expert>
 static __global__ void sum_expert_rows_f32(const float * x_ptr, float * dst_ptr,
                                            const int ne0, const int64_t s1, const int64_t s2) {

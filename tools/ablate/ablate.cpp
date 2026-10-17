@@ -752,11 +752,8 @@ std::vector<float> direction_at(const std::vector<std::vector<float>> & dirs, do
 
 // The control-vector buffer for layers 1..n_layer-1: sqrt(w) r per layer, zero where the kernel is off.
 std::vector<float> cvec_data(const Trial & t, const std::vector<std::vector<float>> & dirs, int n_layer, int n_embd) {
-    // Each layer is ablated along ITS OWN refusal direction, not a single direction shared across layers. One
-    // shared direction is enough for models where the refusal concept keeps the same bearing through the stack
-    // (Qwen), but Gemma's rotates layer to layer, so a shared direction mis-ablates most layers and collapses the
-    // model (199-biotechnologies/gemma-4-abliterated uses per-layer directions for exactly this reason). The
-    // kernel still sets each layer's strength; t.d is unused in this mode.
+    // Each layer along its own direction: Gemma's refusal direction rotates through the stack, and one shared
+    // direction collapses it. The kernel still sets each layer's strength; t.d is unused here.
     std::vector<float> data(static_cast<size_t>(n_layer - 1) * n_embd, 0.0f);
     for (int il = 1; il < n_layer; il++) {
         const double w = kernel(t, il);
@@ -1154,14 +1151,10 @@ int main(int argc, char ** argv) {
     }
     say("direction layer=%d of=%d separation=%.2f capture_s=%.1f", best_il, n_layer, score[best_il], t_capture);
 
-    // Decide per-layer vs one pooled direction by how consistent the directions are across the WHOLE stack, not
-    // layer by layer. A finite-sample per-layer estimate is always a little noisier than one direction pooled from
-    // the best-separating layer, so on a model whose refusal keeps its bearing (Qwen) the pooled direction is
-    // strictly cleaner -- and there we want to use it outright, recovering the single-direction result with no
-    // per-layer penalty. On a model whose direction rotates through the stack (Gemma) one direction collapses the
-    // model and per-layer is required. The global agreement g (separation-weighted mean cosine with the best
-    // layer) tells which regime we are in; a ramp turns it into a blend so there is no cliff: g>=0.7 uses the
-    // pooled direction everywhere (no sacrifice on consistent models), g<=0.4 goes fully per-layer (Gemma).
+    // Per-layer directions or one pooled from the best layer, by how well the directions agree across the stack:
+    // g, the separation-weighted mean cosine with the best layer. The pooled one is cleaner where the direction
+    // holds (Qwen) and collapses a model where it rotates (Gemma), so g >= 0.7 pools, g <= 0.4 goes per-layer,
+    // and a ramp blends in between.
     double g_consistency = 0.0;
     {
         const std::vector<float> best_dir = dirs[best_il];
@@ -1198,11 +1191,8 @@ int main(int argc, char ** argv) {
     }
     say("direction consistency g=%.2f (1=one pooled direction, 0=fully per-layer)", g_consistency);
 
-    // Each layer is ablated along its OWN direction, but a layer whose refusal direction is poorly estimated (low
-    // separation) would otherwise be ablated along noise at full strength -- that is what made a per-layer vector
-    // worse than a single shared one on clean models. Scale each layer's direction by its separation relative to
-    // the best layer, so the ablation lands on the layers that actually carry refusal. A model where every layer
-    // separates well (Gemma) keeps all of them; one with a sharp peak (Qwen) keeps essentially just that band.
+    // A layer that separates poorly would be ablated along noise at full strength, so each direction is scaled by
+    // its separation against the best layer's and the ablation lands where the refusal is carried.
     {
         const double best_score = score[best_il] > 0 ? score[best_il] : 1.0;
         for (int il = 1; il < n_layer; il++) {
@@ -1343,10 +1333,8 @@ int main(int argc, char ** argv) {
     llama_batch_free(batch);
     const double t_trials = elapsed() - t_load - t_capture - t_base;
 
-    // ---- the KL guard: some models (Gemma's massive-activation family) cannot lose their refusal direction
-    // without collapsing -- the best vector still lands at a huge KL. Refuse to write a vector that would ship a
-    // broken model, so `llmash ablate` fails loudly instead of installing garbage. 1.0 is well clear of a healthy
-    // result (~0.1) and of a merely-aggressive one (Llama ~0.5), but far below a collapse (Gemma ~3.5+).
+    // Some models cannot lose the direction without collapsing, and no vector is written for them. A healthy result
+    // sits near 0.1 KL and a collapse above 3, so 1.0 separates the two.
     const double kl_max = o.max_kl > 0 ? o.max_kl : 1.0;
     if (best.kl > kl_max) {
         say("rejected kl=%.3f exceeds max_kl=%.3f: this model is not ablatable with this method (its refusal "
@@ -1358,16 +1346,10 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    // ---- the scan: is the refusal still in the stream once the vector is applied?
-    //
-    // The refusal count only sees whether an answer OPENS with one, and a model can learn to drop the opening
-    // and decline by answering something safer instead (Qwen3.5-4B leaves 22 of 100 requests unanswered that
-    // way, Qwen3.5-9B 52, where its own 27B leaves 2). Nothing about the search sees that. This does: with the
-    // chosen vector in place, take the residuals again over the same split and ask how far apart harmful and
-    // harmless prompts still sit along their best direction. If the model still tells them apart it still
-    // represents the refusal, whatever its answers open with. It reads only the residual stream, so it means
-    // the same on a dense model, a mixture of experts, or a recurrent one, and costs one capture. A scan that
-    // could not run reports -1, never 0, which would read as the refusal fully gone.
+    // Is the refusal still in the stream with the vector applied? The refusal count only sees how an answer opens,
+    // and a model can decline by answering something else. So capture the residuals again and measure how far
+    // apart harmful and harmless prompts still sit along their best direction. A scan that could not run reports
+    // -1, never 0, which would read as the refusal gone.
     const int  band_lo = std::max(1, n_layer / 4), band_hi = std::min(n_layer - 2, n_layer * 85 / 100);
     double     sep_before = 0, sep_after = -1;
     {

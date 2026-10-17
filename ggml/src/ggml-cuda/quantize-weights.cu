@@ -1,18 +1,9 @@
-// Quantizing weights on the GPU: the same search ggml-quants.c runs per block,
-// one CUDA thread to a block instead of one CPU core to a run of rows.
+// Quantizing weights on the GPU: the search ggml-quants.c runs per block, one thread to a block. The C code is
+// moved across in the same arithmetic order, so the output is byte-identical; that is also why this file opts out
+// of -use_fast_math (see CMakeLists), whose approximate reciprocal can move a scale by an ulp and flip a nibble.
 //
-// The searches are scalar and every block is independent, so the port is the
-// C code moved across rather than rewritten. Keeping the arithmetic in the
-// same order is what makes the output byte-identical, which is why this file
-// opts out of the backend's -use_fast_math (see CMakeLists): an approximate
-// reciprocal moves a scale by one ulp, which is enough to push a value across
-// a rounding boundary and change a nibble.
-//
-// Unsupported types return 0 so the caller keeps its CPU path. The k-quants
-// are carried only in their imatrix form, which is the one a custom build
-// uses; without one they fall back too. q8_0 is deliberately not here: its
-// search is so cheap that the cores beat the bus, measured 4.1 GB/s against
-// 3.0.
+// Unsupported types return 0 and the caller keeps its CPU path. The k-quants are carried only with an imatrix.
+// q8_0 is left to the CPU, which quantizes it faster than the bus can carry it here.
 
 #include "common.cuh"
 #include "convert.cuh"

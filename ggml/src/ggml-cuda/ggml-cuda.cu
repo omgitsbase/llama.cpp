@@ -2719,15 +2719,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    // The shape of the graph is its key, and nothing about where it was built.
-    // Two shapes in one context (a draft replay and a chained draft, say) must
-    // not share a slot, or neither is ever captured; but the same shape built
-    // again must land on the slot it had before. A caller that rebuilds its
-    // graph into fresh memory - llama does, whenever its inputs stop matching -
-    // would otherwise mint a new key every time, and a new key has to warm up
-    // by evaluating the graph node by node: 31 ms on a 35B MoE here, against 6
-    // to capture it again. A collision between two shapes costs a re-capture
-    // and nothing else, because the node properties are compared before replay.
+    // The key is the graph's shape, not its address: llama rebuilds a graph into fresh memory whenever its inputs
+    // change, and a new key has to warm up node by node again. A collision only costs a re-capture, since node
+    // properties are compared before replay.
     uint64_t h = 0xcbf29ce484222325ULL ^ (uint64_t) cgraph->n_nodes;
     auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001b3ULL; };
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4598,8 +4592,6 @@ static bool ggml_cuda_mm_epi_arg_of(const ggml_tensor * mm, const ggml_tensor * 
     return true;
 }
 
-// a matvec and the elementwise ops after it, applied in graph order by the matvec's epilogue before the store;
-// dry_run only reports how many nodes it would take
 // the elementwise ops after the matvec at node i as an epilogue over its output: fills epi and the tensors it reads,
 // and returns the last node taken (i when none)
 static int ggml_cuda_mm_epi_collect(const ggml_cgraph * cgraph, const int i, ggml_cuda_mm_epilogue & epi, const ggml_tensor ** args) {
@@ -7393,14 +7385,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                               (ggml_time_us() - cht_compat) / 1000.0);
             }
 
-            // Warming up by evaluating the graph node by node costs far more
-            // than capturing it does: 31 ms against 6 on a 35B MoE here. The
-            // old rule wanted two consecutive calls of a shape to agree before
-            // capturing it, which a shape that recurs only now and then never
-            // manages - its properties have always moved since it last ran, so
-            // it is evaluated eagerly every single time. One eager call is
-            // enough to know a shape is capturable; from its second call on,
-            // capture it and let the capture absorb whatever changed.
+            // Evaluating node by node costs several times a capture, and a shape that only recurs now and then never
+            // has two matching calls in a row. One eager call shows it is capturable; from the second on, capture.
             const bool seen_before = graph->n_seen > 1;  // n_seen counts this call
 
             if (!graph->warmup_complete) {
