@@ -30,7 +30,7 @@
 // would remove.
 struct llama_round_timing {
     bool    on = getenv("LLAMA_ROUND_TIMING") != nullptr;
-    struct acc { double prep = 0, graph = 0, inputs = 0, launch = 0, outputs = 0, total = 0, wait = 0; int n = 0; int built = 0; int splits = 0; int copies = 0; int done = 0;
+    struct acc { double prep = 0, apply = 0, graph = 0, inputs = 0, launch = 0, outputs = 0, total = 0, wait = 0; int n = 0; int built = 0; int splits = 0; int copies = 0; int done = 0;
                  double p_balloc = 0, p_mem = 0, p_slot = 0, p_res = 0, p_out = 0; };
     int64_t p_t[4] = {};
     std::map<std::pair<const void *, int>, acc> by_tokens;
@@ -38,8 +38,8 @@ struct llama_round_timing {
     void report(const void * ctx, int n_tokens) {
         acc & a = by_tokens[{ctx, n_tokens}];
         if (a.n % 100 != 0) return;
-        fprintf(stderr, "[round] decode ctx=%p T=%d calls %d-%d  prep %.3f  graph %.3f (built %d)  inputs %.3f  launch %.3f  outputs %.3f  total %.3f  wait-in-getters %.3f ms  splits %d copies %d\n",
-                ctx, n_tokens, a.done, a.done + a.n, a.prep / a.n, a.graph / a.n, a.built, a.inputs / a.n, a.launch / a.n, a.outputs / a.n, a.total / a.n, a.wait / a.n, a.splits, a.copies);
+        fprintf(stderr, "[round] decode ctx=%p T=%d calls %d-%d  prep %.3f  apply %.3f  graph %.3f (built %d)  inputs %.3f  launch %.3f  outputs %.3f  total %.3f  wait-in-getters %.3f ms  splits %d copies %d\n",
+                ctx, n_tokens, a.done, a.done + a.n, a.prep / a.n, a.apply / a.n, a.graph / a.n, a.built, a.inputs / a.n, a.launch / a.n, a.outputs / a.n, a.total / a.n, a.wait / a.n, a.splits, a.copies);
         fprintf(stderr, "[round]   prep: batch %.3f  reserve+memory update %.3f  memory slot %.3f  output_reserve %.3f  sampler+ubatch %.3f ms\n",
                 a.p_balloc / a.n, a.p_mem / a.n, a.p_slot / a.n, a.p_res / a.n, a.p_out / a.n);
         const int done = a.done + a.n;
@@ -1514,7 +1514,11 @@ void llama_context::set_adapter_cvec_mode(int32_t mode) {
 
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
+    auto & rt = llama_round_timer();
+    const int64_t rt_a = rt.on ? ggml_time_us() : 0;
+    const bool applied = !mctx || mctx->apply();
+    if (rt.on) { rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}].apply += (ggml_time_us() - rt_a) / 1000.0; }
+    if (!applied) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1523,7 +1527,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
-    auto & rt = llama_round_timer();
     const int64_t rt0 = rt.on ? ggml_time_us() : 0;
     bool rt_built = false;
 
