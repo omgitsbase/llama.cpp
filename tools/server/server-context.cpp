@@ -504,10 +504,12 @@ struct server_slot {
             return 0;
         }
 
-        // the drafter skips embedding batches, so an image leaves a hole in
-        // ctx_dft; set this if drafting across one ever faults again
-        static const bool no_spec_media = getenv("LLAMA_SPEC_NO_MEDIA") != nullptr;
-        if (no_spec_media && (task->tokens.has_media() || prompt.tokens.has_media())) {
+        // the drafter skips embedding batches, so an image leaves a hole in ctx_dft, and the draft rounds after one
+        // wreck the target: Qwen3.8-Flash-Next at 97k tokens with two pictures in the prompt kept 5% of its drafts
+        // and decayed into noise within a few hundred tokens on every build tried, and wrote 2,500 sound tokens with
+        // the drafts off. No drafts while the prompt holds media; LLAMA_SPEC_MEDIA=1 drafts anyway
+        static const bool spec_media = getenv("LLAMA_SPEC_MEDIA") != nullptr;
+        if (!spec_media && (task->tokens.has_media() || prompt.tokens.has_media())) {
             return 0;
         }
 
