@@ -366,6 +366,14 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // a drafter that fell out of step with the target (it never sees an image's positions, so its state lacks
+    // them) guesses nothing and still costs a draft a round: after a window of rounds that kept next to no
+    // drafted tokens it is rested, then probed, the rest doubling while the probes find it still out of step
+    uint32_t spec_recent   = 0; // drafted tokens kept over the rounds of the current window
+    uint32_t spec_recent_n = 0; // rounds in it
+    int32_t  spec_rest     = 0; // rounds left without a draft
+    int32_t  spec_rest_len = 0; // the last rest
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -401,6 +409,8 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_recent = spec_recent_n = 0;
+        spec_rest = spec_rest_len = 0;
 
         n_predict_max = -1;
 
@@ -513,6 +523,34 @@ struct server_slot {
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
+    }
+
+    // true when this round goes without a draft because the drafter is rested
+    bool spec_rested() {
+        if (spec_rest > 0) {
+            spec_rest--;
+            return true;
+        }
+        return false;
+    }
+
+    // a verified round kept n_accepted drafted tokens
+    void spec_note(size_t n_accepted) {
+        spec_recent   += (uint32_t) n_accepted;
+        spec_recent_n += 1;
+        if (spec_recent_n < 16) {
+            return;
+        }
+        // 16 rounds of drafting that kept fewer than 4 tokens cost more than they gave
+        if (spec_recent < 4) {
+            spec_rest_len = std::min(std::max(spec_rest_len * 2, 32), 1024);
+            spec_rest     = spec_rest_len;
+            SLT_INF(*this, "drafter rested for %d rounds: %u drafted tokens kept over the last %u rounds\n", spec_rest, spec_recent, spec_recent_n);
+        } else {
+            spec_rest_len = 0;
+        }
+        spec_recent   = 0;
+        spec_recent_n = 0;
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
@@ -3227,7 +3265,7 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
-                    } else {
+                    } else if (!slot.spec_rested()) {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(
@@ -4373,6 +4411,7 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            slot.spec_note(n_accepted);
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
