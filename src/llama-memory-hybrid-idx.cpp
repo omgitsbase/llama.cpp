@@ -415,16 +415,33 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
-                sq.pos_min == sp.begin()->first) {
+        bool kept = !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first;
+
+        // an edit at p leaves the cells before p and the pools that end before p as they were, so a speculative
+        // rollback cuts the tail instead of rebuilding the whole sequence; an edit at pos_min regroups everything
+        const llama_pos stale = mem_idx_stale[s];
+        if (kept && stale != POS_CLEAN) {
+            if (stale > sq.pos_min) {
+                const auto cut = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(stale, 0u));
+                sq.cells.erase(cut, sq.cells.end());
+                while (!sq.pools.empty() && sq.pools.back() + kpool > sq.cells.size()) {
+                    sq.pools.pop_back();
+                }
+                // the scan is left to right, so it resumes where the last kept pool ended
+                sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+            } else {
+                kept = false;
+            }
+        }
+
+        if (kept) {
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        // the appended tail accounts for every cell only if nothing before it was dropped
+        if (!kept || sq.cells.size() != sp.size()) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
