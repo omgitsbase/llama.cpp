@@ -46,6 +46,9 @@ bool llama_sampler_is_backend_greedy(const llama_sampler * sampler);
 // the backend part reads no token history from the host, so a decode can be queued before the last token is read
 bool llama_sampler_backend_chainable(const llama_sampler * sampler);
 
+// the backend part picks the token, so it is on the device after a decode; false when the CPU picks from candidates
+bool llama_sampler_backend_selects(const llama_sampler * sampler);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

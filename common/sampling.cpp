@@ -122,6 +122,9 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // the backend narrows the candidates and the CPU picks, so a grammar or a reasoning budget sees them first
+    bool pick_on_cpu = false;
+
     void reset() {
         prev.clear();
 
@@ -132,11 +135,6 @@ struct common_sampler {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
-
-        const llama_model * model = llama_get_model(ctx);
-        const llama_vocab * vocab = llama_model_get_vocab(model);
-
-        const int n_vocab = llama_vocab_n_tokens(vocab);
 
         if (sampled_probs) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
@@ -151,12 +149,23 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
-            const auto * logits = llama_get_logits_ith(ctx, idx);
-            GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-            }
+            set_logits_raw(ctx, idx);
+            return;
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // every token's logit, which the backend keeps beside its candidates when the CPU makes the pick
+    void set_logits_raw(struct llama_context * ctx, int idx) {
+        const auto * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+
+        cur.resize(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
@@ -184,6 +193,26 @@ std::string common_params_sampling::print() const {
 
     return std::string(result);
 }
+
+// A no-op with no backend part: in a chain it ends what the backend runs, and the samplers after it run on the CPU.
+static const char * cpu_pick_name(const struct llama_sampler *) { return "cpu-pick"; }
+static void cpu_pick_apply(struct llama_sampler *, llama_token_data_array *) {}
+static void cpu_pick_copy_state(const struct llama_sampler *, struct llama_sampler *) {}
+
+static struct llama_sampler_i cpu_pick_i = {
+    /* .name              = */ cpu_pick_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ cpu_pick_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ nullptr,
+    /* .free              = */ nullptr,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ cpu_pick_copy_state,
+};
 
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
@@ -338,6 +367,10 @@ struct common_sampler * common_sampler_init(
         }
     }
 
+    // a grammar or a reasoning budget has to see the candidates before the pick, which a backend sampler makes alone
+    const bool vetoed = (grmr || rbudget) && params.backend_sampling;
+    bool pick_on_cpu = false;
+
     if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
@@ -404,6 +437,13 @@ struct common_sampler * common_sampler_init(
                     GGML_ASSERT(false && "unknown sampler type");
             }
         }
+        // the backend still runs top-k and the samplers around it, and the CPU picks from the few candidates left
+        // (from the raw logits when the grammar allows none of them); without a top-k there is no short list
+        if (vetoed && !argmax_only && !use_adaptive_p && params.top_k > 0 &&
+                std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_TOP_K) != params.samplers.end()) {
+            samplers.push_back(llama_sampler_init(&cpu_pick_i, nullptr));
+            pick_on_cpu = true;
+        }
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
@@ -425,13 +465,13 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
+    if (grmr && params.backend_sampling && !pick_on_cpu) {
         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
 
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
+    if (rbudget && params.backend_sampling && !pick_on_cpu) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
 
         params.backend_sampling = false;
@@ -445,6 +485,7 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .pick_on_cpu = */ pick_on_cpu,
     };
 
     return result;
@@ -528,6 +569,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .pick_on_cpu = */ gsmpl->pick_on_cpu,
     };
 }
 
@@ -604,6 +646,35 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+static bool all_masked(const llama_token_data_array & cur_p) {
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        if (cur_p.data[i].logit != -INFINITY) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The backend's candidates hold nothing the grammar or the reasoning budget allows: pick from the raw logits, with
+// every sampler of the chain run on the CPU, as when the backend samples nothing.
+static llama_token sample_raw(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    auto & cur_p = gsmpl->cur_p;
+
+    gsmpl->set_logits_raw(ctx, idx);
+
+    llama_sampler_apply(gsmpl->rbudget, &cur_p);
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(gsmpl->grmr, &cur_p);
+    }
+    for (int32_t i = 0; i < llama_sampler_chain_n(gsmpl->chain); ++i) {
+        llama_sampler_apply(llama_sampler_chain_get(gsmpl->chain, i), &cur_p);
+    }
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_outputs_wait(ctx);
 
@@ -648,6 +719,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
+    if (gsmpl->pick_on_cpu && all_masked(cur_p)) {
+        return sample_raw(gsmpl, ctx, idx);
+    }
+
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
@@ -677,6 +752,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     if (grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr,  &cur_p);
+    }
+
+    if (gsmpl->pick_on_cpu && all_masked(cur_p)) {
+        return sample_raw(gsmpl, ctx, idx);
     }
 
     llama_sampler_apply(chain, &cur_p);

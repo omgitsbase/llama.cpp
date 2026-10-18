@@ -4589,6 +4589,18 @@ std::string llama_sampler_backend_signature(const llama_sampler * smpl) {
     return "";
 }
 
+bool llama_sampler_backend_selects(const llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return false;
+    }
+    if (smpl->iface != &llama_sampler_chain_i) {
+        return true;
+    }
+    // a chain ends in the sampler that picks, so it picks on the backend when its last sampler runs there
+    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+    return !chain->samplers.empty() && chain->samplers.back().is_backend;
+}
+
 bool llama_sampler_backend_chainable(const llama_sampler * smpl) {
     if (smpl == nullptr) {
         return false;

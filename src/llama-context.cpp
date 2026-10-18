@@ -1385,6 +1385,8 @@ void llama_context::set_warmup(bool value) {
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+    sampling.keep_logits.erase(seq_id);
+
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
@@ -1417,11 +1419,19 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
+        // a chain the CPU finishes may have to look past its candidates (a grammar that allows none of them)
+        if (!llama_sampler_backend_selects(sampler)) {
+            sampling.keep_logits.insert(seq_id);
+        }
+
         // the server sets a new sampler for every request, most often shaped like the one before, and the graphs
-        // measured for that one need no measuring again
+        // measured for that one need no measuring again. Nor do those of a chain whose backend part is the start of
+        // the measured one (a grammar's request stops before the pick): its graph is a part of that graph
         const std::string sig = llama_sampler_backend_signature(sampler);
         const auto it = sampler_sigs_reserved.find(seq_id);
-        if (sig.empty() || it == sampler_sigs_reserved.end() || it->second != sig) {
+        const bool covered = !sig.empty() && it != sampler_sigs_reserved.end() &&
+            it->second.compare(0, sig.size(), sig) == 0 && (it->second.size() == sig.size() || it->second[sig.size()] == '|');
+        if (!covered) {
             sched_need_reserve = true;
         }
 
@@ -1874,16 +1884,17 @@ static void copy_tensor_async_rows(
     }
 }
 
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers,
+                             const std::set<llama_seq_id> & keep_logits) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
             continue;
         }
 
-        // Check if the output token has at least one sequence without a backend sampler.
+        // Check if the output token has at least one sequence without a backend sampler, or one that keeps its logits.
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
+            if (samplers.find(seq_id) == samplers.end() || keep_logits.count(seq_id) > 0) {
                 return true;
             }
         }
@@ -2255,7 +2266,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.keep_logits)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -4811,7 +4822,9 @@ void llama_set_mtp_round_seqs(llama_context * ctx, const llama_mtp_round_seq * s
 }
 
 bool llama_context::has_backend_sampler(llama_seq_id seq_id) const {
-    return sampling.samplers.find(seq_id) != sampling.samplers.end();
+    // the readers of this take the sampled token on the device, which a chain whose CPU picks does not leave there
+    const auto it = sampling.samplers.find(seq_id);
+    return it != sampling.samplers.end() && llama_sampler_backend_selects(it->second);
 }
 
 bool llama_sampler_on_backend(llama_context * ctx, llama_seq_id seq_id) {
