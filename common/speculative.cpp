@@ -1404,7 +1404,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
     int32_t n_chain       = 0;       // > 0: the whole draft round runs as one graph, see draft_chained()
-    int32_t n_chain_host  = 0;       // > 0: a drafter over the target's cache (Gemma 4) runs its steps as one graph, the host accepting
     common_speculative_draft_notes notes;
 
     // a chained round replays the verify batch of every drafting sequence in one decode, launched in process() right
@@ -1426,8 +1425,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_tokens *           ids_result    = nullptr;
         int32_t                  ids_col       = -1;
         llama_pos                ids_n_past    = -1;
-        int64_t                  gen           = -1;     // the chained decode in flight, for the ids it drafted
-        int64_t                  ids_gen       = -1;
     };
     std::vector<chain_seq> chain;
     bool chain_launched = false; // a chained decode no draft has taken yet is in flight
@@ -1508,12 +1505,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 q.h_tgt = h;
             } else {
                 cs.base = cs.replay_pos[0];
-                // the replay's draft rows are the last chain's ids, still on the device: the batch carries placeholders
-                // for them until the server resolves the draft, after this launch
-                if (ids_pending(seq) != nullptr && V > 1 &&
-                        !llama_set_tokens_device_seq(ctx_dft, ctx_dft, seq, cs.replay_pos[0], V - 1, cs.ids_col)) {
-                    resolve_ids(seq);
-                }
                 for (int k = 0; k < V; ++k) {
                     common_batch_add(batch, cs.replay_tok[k], cs.replay_pos[k], { seq }, false);
                 }
@@ -1554,11 +1545,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         chain_launched = true;
-        const int64_t gen = llama_get_mtp_chain_gen(ctx_dft);
         for (int s = 0; s < S; ++s) {
             auto & cs = chain[seqs[s]];
             cs.col      = s;
-            cs.gen      = gen;
             cs.started  = true;
             cs.replay_n = 0;
         }
@@ -1577,10 +1566,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // The ids column col of the last chained decode drafted: written over result's placeholders (fill), or appended
     // when the round drafted for where the server is. False when the round drafted for a place the server has left.
-    bool take_ids(const chain_seq & cs, int32_t col, int64_t gen, llama_pos n_past, llama_tokens & result, bool fill) {
+    bool take_ids(const chain_seq & cs, int32_t col, llama_pos n_past, llama_tokens & result, bool fill) {
         const int K = n_chain;
         int32_t n_ids = 0;
-        const llama_token * ids = llama_get_mtp_chain_ids_gen(params.ctx_dft, gen, &n_ids);
+        const llama_token * ids = llama_get_mtp_chain_ids(params.ctx_dft, &n_ids);
         const int32_t S = llama_get_mtp_chain_n_seq(params.ctx_dft);
         GGML_ASSERT(n_ids == (K + 1)*S && col >= 0 && col < S);
         const int32_t n_acc = ids[K*S + col];
@@ -1611,11 +1600,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         cs.ids_result = nullptr;
         // drafted for a place the server has left, the verify took them on the device already and rejects them
         // like any other wrong guess
-        take_ids(cs, cs.ids_col, cs.ids_gen, cs.ids_n_past, *result, true);
-        // the verify rows process() saw were placeholders for these
-        for (size_t j = 0; j + 1 < cs.replay_tok.size() && j < result->size(); ++j) {
-            cs.replay_tok[j + 1] = (*result)[j];
-        }
+        take_ids(cs, cs.ids_col, cs.ids_n_past, *result, true);
         return true;
     }
 
@@ -1653,7 +1638,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (llama_seq_id seq : want) {
                     const auto & cs = chain[seq];
                     if (cs.col >= 0) {
-                        take_ids(cs, cs.col, cs.gen, dparams[seq].pos0, *dparams[seq].result, false);
+                        take_ids(cs, cs.col, dparams[seq].pos0, *dparams[seq].result, false);
                     }
                 }
             }
@@ -1675,7 +1660,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result->insert(dp.result->end(), K, dp.id_last);
                 cs.ids_result = dp.result;
                 cs.ids_col    = cs.col;
-                cs.ids_gen    = cs.gen;
                 cs.ids_n_past = dp.pos0;
                 cs.col        = -1;
             }
@@ -1694,7 +1678,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             // the round put the anchor after the rows it accepted; a server that
             // moved elsewhere (a restored checkpoint) gets no draft this time
-            take_ids(cs, cs.col, cs.gen, dparams[seq].pos0, *dparams[seq].result, false);
+            take_ids(cs, cs.col, dparams[seq].pos0, *dparams[seq].result, false);
             cs.col = -1;
         }
         if (spct.on) {
@@ -1788,12 +1772,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const uint32_t n_round_rows = n_seq * (2*this->params.n_max + 1);
         const bool seqs_ok = n_seq == 1 || (chain_seqs && llama_context_kv_unified(ctx_dft) && llama_context_kv_unified(ctx_tgt) &&
                 n_round_rows <= llama_n_ubatch(ctx_dft) && n_round_rows <= llama_n_batch(ctx_dft));
-        if (!no_chain && is_mem_shared && n_seq == 1 && this->params.n_max >= 2 && llama_context_flash_attn(ctx_dft) &&
-                llama_model_has_mtp_chain(llama_get_model(ctx_dft))) {
-            n_chain_host = this->params.n_max;
-            SPC_TRC("- chained drafting over the target's cache, n=%d\n", n_chain_host);
-        }
-        if (!no_chain && !chain_heads && !is_mem_shared && seqs_ok && this->params.n_max >= 2 &&
+        if (!no_chain && !chain_heads && seqs_ok && this->params.n_max >= 2 &&
                 llama_context_flash_attn(ctx_dft) &&
                 llama_model_has_mtp_chain(llama_get_model(ctx_dft))) {
             n_chain = this->params.n_max;
@@ -1880,10 +1859,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
-        // the last chain's ids come to the host now: after the verify before this one read its rows, before the
-        // next chain overwrites them on the device, and before this verify's rows are read
-        llama_mtp_chain_readback(ctx_dft);
-
         const int32_t n_tokens  = batch_in.n_tokens;
         const int     V         = n_chain + 1;
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
@@ -1924,9 +1899,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_batch_clear(batch);
 
             // each row pairs with the target's hidden row of its sequence's row before it
-            llama_round_mark("process.h_tgt.begin", 0);
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-            llama_round_mark("process.h_tgt.end", 0);
             std::vector<int32_t> prev(n_seq, -1);
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq = batch_in.seq_id[k][0];
@@ -1984,8 +1957,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (dev) {
             chain_launch(deferred, false, nullptr);
         }
-        // the ids the verify took, read now: the readback was queued before the chain just launched
-        resolve_all();
 
         // the target's hidden rows of each replay: the anchor's for accept(), and a host round's inputs
         for (llama_seq_id seq : deferred) {
@@ -2001,13 +1972,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
-        // the last chain's ids are read back after the next chain is launched (process_chained), so the readback
-        // waits for that chain alone; any other path resolves them here
-        if (n_chain == 0) {
-            resolve_all();
-        }
+        resolve_all();
         if (batch_in.n_tokens <= 0) {
-            resolve_all();
             return true;
         }
 
@@ -2137,52 +2103,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
-    // the round of a drafter over the target's cache: one decode of n_chain_host rows at the anchor's position, the
-    // anchor in row 0, every other row filled on the device from the step before it; the ids come back together
-    void draft_chain_host(common_speculative_draft_params_vec & dparams) {
-        auto * ctx_dft = params.ctx_dft;
-        const int K = n_chain_host;
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
-            common_batch_clear(batch);
-            for (int j = 0; j < K; ++j) {
-                common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.pos0, { seq_id }, false);
-                float * h = batch.embd + (size_t) (batch.n_tokens - 1) * n_embd;
-                if (j == 0) {
-                    std::memcpy(h, pending_h[seq_id].data(), row_bytes);
-                } else {
-                    std::memset(h, 0, row_bytes);
-                }
-            }
-            llama_set_mtp_chain(ctx_dft, K);
-            llama_round_mark("chain.launch.begin", 2);
-            const int ret = llama_decode(ctx_dft, batch);
-            llama_round_mark("chain.launch.end", ret);
-            llama_set_mtp_chain(ctx_dft, 0);
-            if (ret != 0) {
-                SPC_ERR("llama_decode(chained over the target's cache, n=%d) returned %d\n", K, ret);
-                continue;
-            }
-            int32_t n_ids = 0;
-            const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft, &n_ids);
-            GGML_ASSERT(n_ids == K);
-            dp.result->insert(dp.result->end(), ids, ids + K);
-        }
-    }
-
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
         if (n_chain > 0) {
             draft_chained(dparams);
-            return;
-        }
-        if (n_chain_host > 0) {
-            draft_chain_host(dparams);
             return;
         }
 

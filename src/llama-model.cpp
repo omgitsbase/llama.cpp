@@ -1610,8 +1610,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // unless a chained MTP draft runs on this model: its graph looks tokens up from ids produced
     // on the device, and a host-side table would split that graph at every step
     const char * input_env = getenv("LLAMA_INPUT_ON_DEVICE");
-    // Gemma 4's assistant drafter looks its chain's ids up in the target's table (the per-layer table stays lazy on the host)
-    const bool input_on_device = (input_env ? atoi(input_env) != 0 : llama_model_has_mtp_chain(this) || arch == LLM_ARCH_GEMMA4) && n_gpu_layers > n_layer_all;
+    const bool input_on_device = (input_env ? atoi(input_env) != 0 : llama_model_has_mtp_chain(this)) && n_gpu_layers > n_layer_all;
     if (input_on_device) {
         pimpl->dev_input = get_layer_buft_list(0);
     } else {

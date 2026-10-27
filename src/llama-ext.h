@@ -133,13 +133,6 @@ LLAMA_API void llama_set_mtp_round_seqs(struct llama_context * ctx, const struct
 // sequences of the last chained decode: llama_get_mtp_chain_ids returns n_chain + 1 rows of that many ids
 LLAMA_API int32_t llama_get_mtp_chain_n_seq(const struct llama_context * ctx);
 
-// chained decodes are counted per launch; the ids of the last two stay readable, so a chain can be launched
-// before the one before it is read
-LLAMA_API int64_t llama_get_mtp_chain_gen(const struct llama_context * ctx);
-// queues the readback of the last chained decode's ids; call it after the target's readbacks are queued
-LLAMA_API void llama_mtp_chain_readback(struct llama_context * ctx);
-LLAMA_API const llama_token * llama_get_mtp_chain_ids_gen(struct llama_context * ctx, int64_t gen, int32_t * n);
-
 // Whether the last ubatch of the last decode holds n rows of seq at positions pos0 .. pos0 + n - 1 in a row, all
 // of them outputs; row0 and out0 receive the first one's ubatch row and output row.
 LLAMA_API bool llama_get_last_rows(const struct llama_context * ctx, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t * row0, int32_t * out0);

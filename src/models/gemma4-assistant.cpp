@@ -81,16 +81,9 @@ std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_grap
     return std::make_unique<graph>(*this, params);
 }
 
-// the drafter writes no K/V of its own (it attends over the target's cache), so a whole draft round can run
-// as one graph: each step's argmax and hidden row feed the next on the device, see llama_set_mtp_chain
-bool llama_model_gemma4_assistant::has_mtp_round() const {
-    return true;
-}
-
 llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params) {
     const int64_t n_embd_backbone = hparams.n_embd_inp();
-    const int     K               = cparams.mtp_chain;
 
     ggml_tensor * inp_tokens;
     ggml_tensor * inp_h;
@@ -115,140 +108,91 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     GGML_ASSERT(cparams.ctx_other != nullptr);
     const auto * model_other = llama_get_model(cparams.ctx_other);
 
+    ggml_tensor * x = ggml_get_rows(ctx0, model_other->tok_embd, inp_tokens);
+    x = ggml_scale(ctx0, x, sqrtf((float) n_embd_backbone));
+    cb(x, "inp_embd_target", -1);
+
+    ggml_tensor * xh = ggml_concat(ctx0, x, inp_h, 0);
+    cb(xh, "inp_xh", -1);
+
+    ggml_tensor * cur = ggml_mul_mat(ctx0, model.nextn_proj_pre, xh);
+    cb(cur, "pre_proj", -1);
+
     auto *        inp_attn    = build_attn_inp_kv_iswa();
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = K > 0 ? nullptr : build_inp_out_ids();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // one pass over the rows of x_tok (the target's embeddings of the ids) and h_in (the target's hidden rows):
-    // the whole batch when row < 0, otherwise one row at `row` of the batch, attending with that row's mask
-    auto pass = [&](ggml_tensor * x_tok, ggml_tensor * h_in, ggml_tensor * pos, int row, ggml_tensor ** h_next) -> ggml_tensor * {
-        const int64_t n_rows = x_tok->ne[1];
+    ggml_tensor * inpL = cur;
 
-        ggml_tensor * x = ggml_scale(ctx0, x_tok, sqrtf((float) n_embd_backbone));
-        cb(x, "inp_embd_target", -1);
+    for (int il = 0; il < n_layer_nextn; ++il) {
+        const bool is_swa = hparams.is_swa(il);
 
-        ggml_tensor * xh = ggml_concat(ctx0, x, h_in, 0);
-        cb(xh, "inp_xh", -1);
+        const int64_t n_embd_head = hparams.n_embd_head_k(il);
+        const int64_t n_head      = hparams.n_head(il);
 
-        ggml_tensor * cur = ggml_mul_mat(ctx0, model.nextn_proj_pre, xh);
-        cb(cur, "pre_proj", -1);
+        const float freq_base_l  = model.get_rope_freq_base(cparams, il);
+        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+        const int   n_rot_l      = hparams.n_rot(il);
 
-        ggml_tensor * inpL = cur;
+        ggml_tensor * cur_norm = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur_norm, "attn_norm", il);
 
-        for (int il = 0; il < n_layer_nextn; ++il) {
-            const bool is_swa = hparams.is_swa(il);
+        ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur_norm);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+        Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "Qcur_normed", il);
 
-            const int64_t n_embd_head = hparams.n_embd_head_k(il);
-            const int64_t n_head      = hparams.n_head(il);
+        ggml_tensor * freq_factors = is_swa ? nullptr : model.layers[il].rope_freqs;
+        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig,
+                             freq_base_l, freq_scale_l, ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Qcur, "Qcur_pos", il);
 
-            const float freq_base_l  = model.get_rope_freq_base(cparams, il);
-            const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
-            const int   n_rot_l      = hparams.n_rot(il);
+        cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
+                Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
 
-            ggml_tensor * cur_norm = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
-            cb(cur_norm, "attn_norm", il);
-
-            ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur_norm);
-            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_rows);
-            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
-            cb(Qcur, "Qcur_normed", il);
-
-            ggml_tensor * freq_factors = is_swa ? nullptr : model.layers[il].rope_freqs;
-            Qcur = ggml_rope_ext(ctx0, Qcur, pos, freq_factors, n_rot_l, rope_type, n_ctx_orig,
-                                 freq_base_l, freq_scale_l, ext_factor, attn_factor, beta_fast, beta_slow);
-            cb(Qcur, "Qcur_pos", il);
-
-            if (row < 0) {
-                cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
-                        Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
-            } else {
-                cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn, is_swa), model.layers[il].wo, nullptr, nullptr,
-                        Qcur, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il, row, false, nullptr);
-            }
-
-            if (row < 0 && il == n_layer_nextn - 1 && inp_out_ids) {
-                cur  = ggml_get_rows(ctx0, cur,  inp_out_ids);
-                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
-            }
-
-            cur = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
-            cb(cur, "attn_post_norm", il);
-
-            ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
-            cb(attn_out, "attn_out", il);
-
-            cur = build_norm(attn_out, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
-            cb(cur, "ffn_norm", il);
-
-            cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   nullptr, nullptr,
-                    model.layers[il].ffn_gate, nullptr, nullptr,
-                    model.layers[il].ffn_down, nullptr, nullptr,
-                    nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
-            cb(cur, "ffn_out", il);
-
-            cur = build_norm(cur, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
-            cb(cur, "ffn_post_norm", il);
-
-            cur = ggml_add(ctx0, cur, attn_out);
-
-            cur = ggml_mul(ctx0, cur, model.layers[il].out_scale);
-            cb(cur, "out_scaled", il);
-
-            inpL = cur;
+        if (il == n_layer_nextn - 1 && inp_out_ids) {
+            cur  = ggml_get_rows(ctx0, cur,  inp_out_ids);
+            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
-        cur = inpL;
 
-        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-        cb(cur, "result_norm", -1);
+        cur = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_post_norm", il);
 
-        if (h_next) {
-            *h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, cur);
-            cb(*h_next, "h_nextn", -1);
-        }
-        return cur;
-    };
+        ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
+        cb(attn_out, "attn_out", il);
 
-    if (K > 0) {
-        // the round: row 0 of the batch is the anchor, its id and the target's hidden row; every step after it
-        // takes the argmax and the hidden row of the one before, at the same position (all of the batch's rows
-        // carry it) and over the cache as the host left it
-        GGML_ASSERT((int) ubatch.n_tokens == K && ubatch.token && "Gemma 4 assistant round: one row per draft, the anchor first");
-        GGML_ASSERT(!ggml_backend_buffer_is_host(model_other->tok_embd->buffer) && "Gemma 4 assistant round: the target's token embedding must be on the device");
+        cur = build_norm(attn_out, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "ffn_norm", il);
 
-        const size_t ps = ggml_element_size(inp_pos);
-        ggml_tensor * tok = ggml_get_rows(ctx0, model_other->tok_embd, ggml_view_1d(ctx0, inp_tokens, 1, 0));
-        ggml_tensor * h   = ggml_view_2d(ctx0, inp_h, n_embd_backbone, 1, inp_h->nb[1], 0);
-        for (int j = 0; j < K; ++j) {
-            ggml_tensor * pos_j  = ggml_view_1d(ctx0, inp_pos, 1, (size_t) j*ps);
-            ggml_tensor * h_next = nullptr;
-            ggml_tensor * cur    = pass(tok, h, pos_j, j, &h_next);
+        cur = build_ffn(cur,
+                model.layers[il].ffn_up,   nullptr, nullptr,
+                model.layers[il].ffn_gate, nullptr, nullptr,
+                model.layers[il].ffn_down, nullptr, nullptr,
+                nullptr,
+                LLM_FFN_GELU, LLM_FFN_PAR, il);
+        cb(cur, "ffn_out", il);
 
-            ggml_tensor * logits_j = build_lora_mm(model.output, cur);
-            cb(logits_j, "mtp_chain_logits", j);
+        cur = build_norm(cur, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "ffn_post_norm", il);
 
-            ggml_tensor * next = ggml_argmax(ctx0, logits_j);
-            cb(next, "mtp_chain_next", j);
-            ggml_set_output(next);
-            ggml_build_forward_expand(gf, next);
-            res->t_mtp_ids.push_back(next);
+        cur = ggml_add(ctx0, cur, attn_out);
 
-            if (j + 1 < K) {
-                tok = ggml_get_rows(ctx0, model_other->tok_embd, next);
-                h   = h_next;
-            }
-        }
-        return;
+        cur = ggml_mul(ctx0, cur, model.layers[il].out_scale);
+        cb(cur, "out_scaled", il);
+
+        inpL = cur;
     }
+    cur = inpL;
 
-    ggml_tensor * x_tok  = ggml_get_rows(ctx0, model_other->tok_embd, inp_tokens);
-    ggml_tensor * h_next = nullptr;
-    ggml_tensor * cur    = pass(x_tok, inp_h, inp_pos, -1, &h_next);
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
 
     ggml_tensor * logits = build_lora_mm(model.output, cur);
     cb(logits, "result_output", -1);
     res->t_logits = logits;
+
+    ggml_tensor * h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, cur);
+    cb(h_next, "h_nextn", -1);
     res->t_h_nextn = h_next;
 
     ggml_build_forward_expand(gf, logits);

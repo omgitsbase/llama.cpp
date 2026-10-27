@@ -886,7 +886,6 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     llama_model_gemma4_assistant(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
-    bool has_mtp_round() const override;
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);

@@ -61,23 +61,11 @@ struct llama_context {
 
     void synchronize();
 
-    // the ids of chain `gen` (-1: the last launched); older chains are dropped
-    const llama_token * get_mtp_chain_ids(int32_t & n, int64_t gen = -1);
-    // generation of the last chained decode, counted per launch
-    int64_t get_mtp_chain_gen() const { return mtp_ids_gen; }
+    const llama_token * get_mtp_chain_ids(int32_t & n);
     // the chained draft's id tensors, while its ids have not been read back
     const std::vector<ggml_tensor *> & get_mtp_ids_pending() const { return mtp_ids_pending; }
-    // the ids of chain `gen` on the device, the round graph's own copy (the last chain only): [n_steps][n_seq] ids from element `off`
-    struct mtp_ids_dev_view {
-        ggml_tensor *  t       = nullptr;
-        ggml_backend_t backend = nullptr;
-        size_t         off     = 0;
-        int32_t        n_seq   = 1;
-        int32_t        n_steps = 0;
-    };
-    mtp_ids_dev_view get_mtp_ids_dev(int64_t gen) const;
-    // sequences of the chained draft whose ids get_mtp_chain_ids returned last: each id tensor holds one id per sequence
-    int32_t get_mtp_chain_n_seq() const { return mtp_ids_read_n_seq; }
+    // sequences of the last chained draft: each id tensor holds one id per sequence
+    int32_t get_mtp_chain_n_seq() const { return mtp_ids_n_seq; }
 
     // the next decode takes the rows of seq at pos0 + 1 .. pos0 + n from element col of ctx_src's pending chained
     // ids, on the device; adds to any other sequence's rows armed for it
@@ -377,38 +365,6 @@ private:
     uint64_t synced_epoch = 0;
     // pinned, so the id copies queue and are waited on once; a copy into pageable memory waits on its own
     ggml_backend_buffer_ptr mtp_ids_buf;
-
-    // the ids of a chained decode come back behind its graph into a pinned slot, an event marking their arrival,
-    // so reading them never waits on a chain launched after it
-    struct mtp_ids_slot {
-        ggml_backend_event_t ev   = nullptr;
-        bool                 busy = false;
-    };
-    struct mtp_ids_read {
-        int32_t slot      = -1; // -1: in host
-        int32_t n         = 0;
-        int32_t n_seq     = 1;
-        int64_t gen       = 0;
-        bool    submitted = false; // the readback into the slot is queued
-        std::vector<llama_token> host;
-    };
-    mtp_ids_slot              mtp_ids_slots[2];
-    std::vector<mtp_ids_read> mtp_ids_queue;              // the last two chains launched, oldest first
-    size_t                    mtp_ids_cap        = 0;     // ids per pinned slot
-    bool                      mtp_ids_captured   = false; // the pending ids are in a slot or in mtp_ids
-    int32_t                   mtp_ids_read_n_seq = 1;
-    int64_t                   mtp_ids_gen        = 0;
-    int32_t                   mtp_ids_n_steps    = 0;       // id tensors of the last chain (n_chain + 1)
-    ggml_backend_t            mtp_ids_backend    = nullptr; // the backend the chain ran on
-    void mtp_ids_readback();
-    void mtp_ids_to_host(mtp_ids_read & r);
-    void mtp_ids_submit_entry(mtp_ids_read & r);
-public:
-    bool mtp_ids_peek(int64_t gen, std::vector<llama_token> & out, int32_t & n_seq);
-    // queues the readback of the last chain's ids into its pinned slot, with its event; the driver calls this
-    // after the target's own readbacks are queued, since copies to the host run in the order they were queued
-    void mtp_ids_submit();
-private:
 
     llama_mtp_round_state mtp_round;
     llama_tokens_dev_state tokens_dev;
