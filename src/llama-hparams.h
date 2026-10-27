@@ -66,6 +66,9 @@ struct llama_hparams {
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
 
+    // a drafter's centroid head: how many centroids' blocks of the vocabulary each row scores (0: the full head)
+    uint32_t masked_embd_top_k = 0;
+
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;

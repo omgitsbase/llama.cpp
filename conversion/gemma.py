@@ -835,20 +835,31 @@ class Gemma4UnifiedModel(Gemma4Model):
 class Gemma4AssistantModel(Gemma4Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
 
-    @classmethod
-    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
-        name, gen = item
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # the centroid scores pick which tokens get logits; keep them exact
+        if "masked_embedding.centroids" in name:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
-        if "masked_embedding" in name:
-            logger.debug(f"Skipping get tensor {name!r} in safetensors so that convert can end normally.")
-            return None
-
-        return super().filter_tensors(item)
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # the centroid index of the sparse head: the centroid rows, and the token ids of each centroid's block of the
+        # vocabulary, which go out as I32 (the generic path would store them as floats)
+        if name.endswith("masked_embedding.token_ordering"):
+            ordering = data_torch.to(torch.int32).numpy()
+            self.gguf_writer.add_tensor(self.format_tensor_name(gguf.MODEL_TENSOR.MASKED_EMBD_ORDERING, suffix=""), ordering)
+            return
+        if name.endswith("masked_embedding.centroids.weight"):
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MASKED_EMBD_CENTROIDS), data_torch)
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_embedding_length_out(self.hparams["backbone_hidden_size"])
         self.gguf_writer.add_nextn_predict_layers(self.block_count)
+        if self.hparams.get("use_ordered_embeddings"):
+            self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.masked_embedding.top_k",
+                                        int(self.hparams.get("centroid_intermediate_top_k", 32)))
 
 
 @ModelBase.register("Gemma4ForConditionalGeneration")

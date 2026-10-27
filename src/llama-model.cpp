@@ -1208,6 +1208,9 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
+    // the input layer's list when its gather tables stay in host memory the device reads in place
+    buft_list_t input_mapped_buft_list;
+
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
@@ -1610,9 +1613,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // unless a chained MTP draft runs on this model: its graph looks tokens up from ids produced
     // on the device, and a host-side table would split that graph at every step
     const char * input_env = getenv("LLAMA_INPUT_ON_DEVICE");
-    const bool input_on_device = (input_env ? atoi(input_env) != 0 : llama_model_has_mtp_chain(this)) && n_gpu_layers > n_layer_all;
+    // Gemma 4's assistant drafter looks its chain's ids up in the target's table (the per-layer table stays lazy on the host)
+    const bool input_on_device = (input_env ? atoi(input_env) != 0 : llama_model_has_mtp_chain(this) || arch == LLM_ARCH_GEMMA4) && n_gpu_layers > n_layer_all;
     if (input_on_device) {
         pimpl->dev_input = get_layer_buft_list(0);
+        // the tables a graph only gathers rows from stay in pinned host memory the device reads in place, so the
+        // lookups need no VRAM; LLAMA_INPUT_MAPPED=0 puts them in VRAM instead
+        const char * mapped_env = getenv("LLAMA_INPUT_MAPPED");
+        ggml_backend_dev_t input_dev = pimpl->dev_input.dev;
+        ggml_backend_reg_t input_reg = input_dev ? ggml_backend_dev_backend_reg(input_dev) : nullptr;
+        auto get_mapped = input_reg ? (ggml_backend_buffer_type_t (*)(ggml_backend_dev_t))
+                ggml_backend_reg_get_proc_address(input_reg, "ggml_backend_dev_get_mapped_buffer_type") : nullptr;
+        ggml_backend_buffer_type_t mapped = (!mapped_env || atoi(mapped_env) != 0) && get_mapped ? get_mapped(input_dev) : nullptr;
+        if (mapped) {
+            pimpl->input_mapped_buft_list = { { input_dev, mapped } };
+            pimpl->input_mapped_buft_list.insert(pimpl->input_mapped_buft_list.end(),
+                    pimpl->dev_input.buft_list->begin(), pimpl->dev_input.buft_list->end());
+            pimpl->dev_input.buft_list = &pimpl->input_mapped_buft_list;
+        }
     } else {
         pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
     }

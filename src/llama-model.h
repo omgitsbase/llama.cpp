@@ -654,6 +654,10 @@ struct llama_model {
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
 
+    // a drafter's centroid index: one row per centroid, and the token ids of each centroid's block of the vocabulary
+    struct ggml_tensor * masked_embd_centroids = nullptr;
+    struct ggml_tensor * masked_embd_ordering  = nullptr;
+
     // hrm-text initial low-cycle state
     struct ggml_tensor * hrm_z_l_init = nullptr;
 

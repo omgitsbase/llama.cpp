@@ -2742,7 +2742,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
             GGML_ASSERT(tokens_dev->ctx_dev);
             tokens_dev->tok_dev = ggml_new_tensor_1d(tokens_dev->ctx_dev, GGML_TYPE_I32, tokens_dev->n_max);
             ggml_set_name(tokens_dev->tok_dev, "inp_tokens_dev");
-            tokens_dev->buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(tokens_dev->ctx_dev, ggml_backend_buffer_get_type(tok_embd->buffer));
+            // the rows live in the memory of the device that gathers from the table: a table in mapped host memory
+            // still has its ids written and read on the device, never through the host
+            ggml_backend_buffer_type_t rows_buft = ggml_backend_buffer_get_type(tok_embd->buffer);
+            if (ggml_backend_dev_t rows_dev = ggml_backend_buft_get_device(rows_buft)) {
+                rows_buft = ggml_backend_dev_buffer_type(rows_dev);
+            }
+            tokens_dev->buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(tokens_dev->ctx_dev, rows_buft);
             GGML_ASSERT(tokens_dev->buf_dev && "failed to allocate the device token rows");
         }
         inp->tokens     = ggml_view_1d(ctx0, tokens_dev->tok_dev, ubatch.n_tokens, 0);
@@ -2900,13 +2906,18 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
 
     if (attn.k_rot) {
         q = llama_mul_mat_hadamard(ctx0, q, attn.k_rot);
-        k = llama_mul_mat_hadamard(ctx0, k, attn.k_rot);
+        if (k) {
+            k = llama_mul_mat_hadamard(ctx0, k, attn.k_rot);
+        }
     }
 
-    ggml_tensor * k_idx = ggml_view_1d(ctx0, attn.k_idxs, n_rows, row*ggml_element_size(attn.k_idxs));
-    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, k_idx, il));
+    // a drafter attending over another context's cache writes nothing
+    if (k) {
+        ggml_tensor * k_idx = ggml_view_1d(ctx0, attn.k_idxs, n_rows, row*ggml_element_size(attn.k_idxs));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, k_idx, il));
+    }
 
-    if (attn.v_idxs) {
+    if (attn.v_idxs && v) {
         ggml_tensor * v_idx = ggml_view_1d(ctx0, attn.v_idxs, n_rows, row*ggml_element_size(attn.v_idxs));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v, v_idx, il));
     }
@@ -3001,7 +3012,13 @@ const llm_graph_mtp_attn & attn,
     GGML_ASSERT(cparams.flash_attn && "MTP round: needs flash attention");
     GGML_ASSERT(mtp_round && "MTP round: needs the round state");
 
-    const auto & sg = mtp_round_ensure_dev(mtp_round, ggml_backend_buffer_get_type(mtp.mtp_embd_weights()->buffer), n_embd_h, V, n_seq);
+    // the round's inputs live in the memory of the device the embedding weights belong to (a table in mapped host
+    // memory still belongs to the device that reads it)
+    ggml_backend_buffer_type_t round_buft = ggml_backend_buffer_get_type(mtp.mtp_embd_weights()->buffer);
+    if (ggml_backend_dev_t round_dev = ggml_backend_buft_get_device(round_buft)) {
+        round_buft = ggml_backend_dev_buffer_type(round_dev);
+    }
+    const auto & sg = mtp_round_ensure_dev(mtp_round, round_buft, n_embd_h, V, n_seq);
 
     auto rinp = std::make_unique<llm_graph_input_mtp_round>(mtp_round, sched, n_embd_h, V, n_seq);
     rinp->c_ids  = sg.c_ids_dev;

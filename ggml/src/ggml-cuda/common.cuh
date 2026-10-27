@@ -1364,7 +1364,8 @@ struct ggml_cuda_concurrent_event {
     // Used to restore grouping for fusion within streams
     std::vector<const ggml_tensor *> original_order;
 
-    const ggml_tensor * join_node;
+    const ggml_tensor * join_node = nullptr;
+    const ggml_tensor * fork_node = nullptr; // the node whose readers the branches start from
 
     ggml_cuda_concurrent_event() = default;
 
@@ -1387,7 +1388,8 @@ struct ggml_cuda_concurrent_event {
     , n_streams(other.n_streams)
     , stream_mapping(std::move(other.stream_mapping))
     , original_order(std::move(other.original_order))
-    , join_node(other.join_node) {
+    , join_node(other.join_node)
+    , fork_node(other.fork_node) {
         other.fork_event = nullptr;
     }
 
@@ -1404,7 +1406,16 @@ struct ggml_cuda_concurrent_event {
         const int64_t       join_start = (int64_t) join_t->data;
         const int64_t       join_end   = join_start + ggml_nbytes(join_t);
 
+        // a view, reshape or permute writes nothing: only the ops that compute are writes
+        const auto writes = [](const ggml_tensor * t) {
+            return !ggml_is_empty(t) && t->op != GGML_OP_NONE && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW &&
+                   t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE;
+        };
+
         for (const auto & [tensor, stream] : stream_mapping) {
+            if (!writes(tensor)) {
+                continue;
+            }
             const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
             const int64_t       t_start = (int64_t) t->data;
             const int64_t       t_end   = t_start + ggml_nbytes(t);
@@ -1426,6 +1437,9 @@ struct ggml_cuda_concurrent_event {
         bool writes_overlap = false;
         bool dependent_srcs = false;
         for (const auto & [tensor, stream] : stream_mapping) {
+            if (!writes(tensor)) {
+                continue;
+            }
             const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
             const int64_t       t_start = (int64_t) t->data;
             const int64_t       t_end   = t_start + ggml_nbytes(t);
@@ -1618,6 +1632,12 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // the concurrent region whose branches are being launched, and the events its branches publish with;
+    // see ggml_cuda_region_publish
+    ggml_cuda_concurrent_event * active_region = nullptr;
+    std::vector<cudaEvent_t>     region_events;
+    size_t                       region_events_used = 0;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1729,16 +1749,29 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // the main stream's pool, for what outlives one op: a norm's quantized copy is taken by its first reader
+    // on whatever stream that runs and given back at the end of the walk, on the main stream
+    ggml_cuda_pool & pool_main() {
+        if (pools[device][0] == nullptr) {
+            pools[device][0] = new_pool_for_device(device, 0);
+        }
+        return *pools[device][0];
+    }
 };
 
-// the fold's buffer comes from the pool on first use; the graph walk frees it in reverse order
+// the fold's buffer comes from the main pool on first use; the graph walk frees it in reverse order
 static inline void ggml_cuda_norm_fold_reserve(ggml_backend_cuda_context & ctx, ggml_cuda_norm_fold & fold) {
     if (!fold.q8) {
-        fold.q8    = ctx.pool().alloc(fold.q8_bytes + fold.n_rows * sizeof(float), &fold.q8_size);
+        fold.q8    = ctx.pool_main().alloc(fold.q8_bytes + fold.n_rows * sizeof(float), &fold.q8_size);
         fold.scale = (float *) ((char *) fold.q8 + fold.q8_bytes);
         ctx.norm_fold_order.push_back(&fold);
     }
 }
+
+// inside a concurrent region, a launch on one branch's stream whose output other branches read before the join
+// (a norm's quantized copy and row factors, written once by the first reader): the other streams wait for it
+void ggml_cuda_region_publish(ggml_backend_cuda_context & ctx);
 
 struct ggml_cuda_mm_epilogue;
 

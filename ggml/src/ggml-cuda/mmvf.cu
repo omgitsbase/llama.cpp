@@ -930,6 +930,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
                     ne10, x->nb[1] / ts_src1, x->nb[2] / ts_src1, x->nb[3] / ts_src1, ne11, ne12, ne13, ctx.stream());
             }
             fold->scale_ready = true;
+            ggml_cuda_region_publish(ctx);
         }
         // GGML_CUDA_FOLD_FLOAT_MATERIALIZE=1: the product written out and read as before, to bisect the in-kernel path
         static const bool materialize_float = getenv("GGML_CUDA_FOLD_FLOAT_MATERIALIZE") != nullptr;

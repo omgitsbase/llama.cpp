@@ -1849,6 +1849,7 @@ void ggml_cuda_mul_mat_vec_q(
                 ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, l2_pf, stream);
             fold->q8_ready    = true;
             fold->scale_ready = true;
+            ggml_cuda_region_publish(ctx);
         }
         q8 = (char *) fold->q8;
     } else {
@@ -2087,6 +2088,7 @@ void ggml_cuda_mul_mat_vec_q_conv(ggml_backend_cuda_context & ctx, const ggml_te
                 ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, 1, 1, ggml_cuda_l2_pf{}, stream);
             fold->q8_ready    = true;
             fold->scale_ready = true;
+            ggml_cuda_region_publish(ctx);
         }
         q8 = (char *) fold->q8;
     } else {
@@ -2178,6 +2180,7 @@ void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_te
                 ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, 1, 1, ggml_cuda_l2_pf{}, stream);
             fold->q8_ready    = true;
             fold->scale_ready = true;
+            ggml_cuda_region_publish(ctx);
         }
         q8 = (char *) fold->q8;
     } else {

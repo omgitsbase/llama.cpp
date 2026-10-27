@@ -760,10 +760,25 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         }
     }
 
+    // a freed block stays off the free list for a few more nodes: a backend may compute several nodes as one
+    // launch that writes its outputs while it still reads inputs that die inside that span, and whether such an
+    // input had been reused for an output must not depend on what else the graph holds
+    enum { FREE_DELAY = 12, PENDING_MAX = FREE_DELAY * (GGML_MAX_SRC + 1) + 1 };
+    struct ggml_tensor * pending[PENDING_MAX];
+    int pending_at[PENDING_MAX];
+    int pending_head = 0;
+    int n_pending    = 0;
+
     // allocate tensors
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int buffer_id = get_node_buffer_id(node_buffer_ids, i);
+
+        while (n_pending > 0 && pending_at[pending_head] + FREE_DELAY <= i) {
+            ggml_gallocr_free_node(galloc, pending[pending_head]);
+            pending_head = (pending_head + 1) % PENDING_MAX;
+            n_pending--;
+        }
 
         // allocate parents (only leafs need to be allocated at this point)
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -802,6 +817,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("parent %s: %d children, %d views, allocated: %d\n",
                 parent->name, p_hn->n_children, p_hn->n_views, p_hn->allocated);
 
+            struct ggml_tensor * to_free = NULL;
             if (p_hn->n_children == 0 && p_hn->n_views == 0) {
                 if (ggml_impl_is_view(parent)) {
                     struct ggml_tensor * view_src = parent->view_src;
@@ -810,15 +826,31 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
                     AT_PRINTF("view_src %s: %d children, %d views\n",
                         view_src->name, view_src_hn->n_children, view_src_hn->n_views);
                     if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
-                        ggml_gallocr_free_node(galloc, view_src);
+                        to_free = view_src;
                     }
                 }
                 else if (p_hn->allocated) {
-                    ggml_gallocr_free_node(galloc, parent);
+                    to_free = parent;
                 }
+            }
+            if (to_free != NULL) {
+                if (n_pending == PENDING_MAX) {
+                    ggml_gallocr_free_node(galloc, pending[pending_head]);
+                    pending_head = (pending_head + 1) % PENDING_MAX;
+                    n_pending--;
+                }
+                const int slot = (pending_head + n_pending) % PENDING_MAX;
+                pending[slot]    = to_free;
+                pending_at[slot] = i;
+                n_pending++;
             }
             AT_PRINTF("\n");
         }
+    }
+    while (n_pending > 0) {
+        ggml_gallocr_free_node(galloc, pending[pending_head]);
+        pending_head = (pending_head + 1) % PENDING_MAX;
+        n_pending--;
     }
 }
 

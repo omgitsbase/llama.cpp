@@ -4582,6 +4582,10 @@ bool llama_context::set_tokens_device_seq(llama_context * ctx_src, llama_seq_id 
     if (tok_embd == nullptr || tok_embd->buffer == nullptr || ggml_backend_buffer_is_host(tok_embd->buffer)) {
         return false;
     }
+    // a per-layer embedding table on the host is looked up with the batch's ids there
+    if (model.per_layer_tok_embd && (model.per_layer_tok_embd->buffer == nullptr || ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer))) {
+        return false;
+    }
     tokens_dev.enabled   = true;
     tokens_dev.src       = ctx_src;
     tokens_dev.sched_dst = sched.get();

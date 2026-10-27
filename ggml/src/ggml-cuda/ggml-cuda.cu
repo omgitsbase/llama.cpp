@@ -1349,6 +1349,81 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
 
+// mapped buffer type: pinned host memory a kernel reads in place, for tables the device only gathers a few rows
+// from (token and per-layer embeddings). They stay out of VRAM, yet a graph can look ids up that it produced on the
+// device. The scheduler sees device memory, so the gathers run on the device; matrix products refuse it.
+
+static const char * ggml_backend_cuda_mapped_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_Mapped";
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_buft_is_cuda_mapped(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_mapped_buffer_type_name;
+}
+
+static bool ggml_backend_cuda_mapped_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return false;
+
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    void * ptr = nullptr;
+    cudaError_t err = cudaHostAlloc(&ptr, std::max<size_t>(size, 1), cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of mapped pinned memory: %s\n", __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    // with unified addressing (checked when the type is offered) the host pointer is the device's address as well
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    return buffer;
+}
+
+// nullptr when the devices cannot read host memory in place, or GGML_CUDA_NO_MAPPED is set
+ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type() {
+    static const bool usable = [] {
+        if (getenv("GGML_CUDA_NO_MAPPED") != nullptr) {
+            return false;
+        }
+        for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, id) != cudaSuccess || !prop.unifiedAddressing || !prop.canMapHostMemory) {
+                (void) cudaGetLastError();
+                return false;
+            }
+        }
+        return true;
+    }();
+    if (!usable) {
+        return nullptr;
+    }
+    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_mapped = {
+        /* .iface    = */ {
+            /* .get_name         = */ ggml_backend_cuda_mapped_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_mapped_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cuda_mapped_buffer_type_is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+
+    return &ggml_backend_cuda_buffer_type_mapped;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_dev_get_mapped_buffer_type(ggml_backend_dev_t dev) {
+    return ggml_backend_cuda_mapped_buffer_type();
+
+    GGML_UNUSED(dev);
+}
+
 /// kernels
 
 typedef void (*ggml_cuda_op_mul_mat_t)(
@@ -1937,6 +2012,7 @@ static void ggml_cuda_norm_fold_materialize(ggml_backend_cuda_context & ctx, con
         GGML_ASSERT(fold->norm->op == GGML_OP_RMS_NORM && "a gated fold's product is only ever quantized");
         ggml_cuda_op_rms_norm_fused(ctx, fold->norm, fold->mul);
         fold->materialized = true;
+        ggml_cuda_region_publish(ctx);
     }
 }
 
@@ -2576,18 +2652,18 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT((buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) || ggml_backend_buft_is_cuda_mapped(buf->buft)) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyDefault, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT((buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) || ggml_backend_buft_is_cuda_mapped(buf->buft)) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDefault, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -2595,10 +2671,10 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT((buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) || ggml_backend_buft_is_cuda_mapped(buf->buft)) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyDefault, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -2606,10 +2682,10 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT((buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) || ggml_backend_buft_is_cuda_mapped(buf->buft)) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDefault, cuda_ctx->stream()));
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -3716,6 +3792,11 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                         }
                     }
 
+                    static const bool trace_fuse = getenv("GGML_CUDA_TRACE_FUSE") != nullptr;
+                    if (!found && trace_fuse) {
+                        fprintf(stderr, "[fuse] %s (%s) at %p+%zu sits under its input %s (%s) at %p+%zu\n", dst->name, ggml_op_name(dst->op),
+                                dst->data, ggml_nbytes(dst), src->name, ggml_op_name(src->op), src->data, ggml_nbytes(src));
+                    }
                     if (!found) {
                         is_ok = false;
                         break;
@@ -3913,9 +3994,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ffn_up   = cgraph->nodes[node_idx + 1];
         const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
 
+        static const bool trace_fuse = getenv("GGML_CUDA_TRACE_FUSE") != nullptr;
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
             int out_nodes[] = { node_idx + 2 };
-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            const bool ok = ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            if (trace_fuse && !ok) {
+                fprintf(stderr, "[fuse] %s: gate/up/glu not taken, an output sits under an input\n", glu->name);
+            }
+            return ok;
+        } else if (trace_fuse) {
+            fprintf(stderr, "[fuse] %s: gate/up/glu not taken by should_fuse_mul_mat\n", glu->name);
         }
     }
 
@@ -6915,6 +7003,11 @@ static bool ggml_cuda_skip_op(const ggml_tensor * node) {
     return false;
 }
 
+// concurrent regions, see ggml_cuda_find_concurrent_regions below
+static const ggml_tensor * ggml_cuda_region_base(const ggml_tensor * t);
+static bool                ggml_cuda_region_reads(const ggml_tensor * node, const ggml_tensor * t);
+static cudaEvent_t         ggml_cuda_region_event(ggml_backend_cuda_context & ctx);
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -6952,9 +7045,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             [[maybe_unused]] int prev_i = 0;
 
             if (stream_ctx.concurrent_events.size() > 0) {
+                static const bool trace_regions = getenv("GGML_CUDA_TRACE_REGIONS") != nullptr;
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
-                    should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
+                    const bool valid = event.is_valid();
+                    if (!valid && trace_regions) {
+                        fprintf(stderr, "[region] %s -> %s dropped: its branches overlap or read each other\n", tensor->name, event.join_node->name);
+                    }
+                    should_launch_concurrent_events = should_launch_concurrent_events && valid;
                 }
             }
 
@@ -7015,6 +7113,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             const bool op_stats = ggml_cuda_op_stats() && !use_cuda_graph;
             if (op_stats) { ggml_cuda_op_timer_get().begin(cuda_ctx->stream()); }
+            cuda_ctx->active_region      = nullptr;
+            cuda_ctx->region_events_used = 0;
+            int region_join_idx          = cgraph->n_nodes;
             cuda_ctx->norm_folds.clear();
             cuda_ctx->norm_fold_order.clear();
             cuda_ctx->ids_ready = nullptr;
@@ -7033,33 +7134,45 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             node->src[0] ? node->src[0]->data : nullptr, node->src[1] ? node->src[1]->data : nullptr);
                     fflush(stderr);
                 }
+                if (!is_concurrent_event_active && i > 0 && !stream_ctx.concurrent_events.empty()) {
+                    // a region forks at the last computed node before this one, whatever launch covered it
+                    int p = i - 1;
+                    while (p > 0 && ggml_cuda_is_view_or_noop(cgraph->nodes[p])) {
+                        p--;
+                    }
+                    try_launch_concurrent_event(cgraph->nodes[p]);
+                    if (is_concurrent_event_active) {
+                        cuda_ctx->active_region = concurrent_event;
+                        region_join_idx         = cgraph->n_nodes;
+                        for (int k = i; k < cgraph->n_nodes; ++k) {
+                            if (cgraph->nodes[k] == concurrent_event->join_node) {
+                                region_join_idx = k;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // the join: the main stream waits for every branch, and the region is over
+                const auto join_region = [&]() {
+                    cuda_ctx->curr_stream_no = 0;
+                    for (int s = 1; s <= concurrent_event->n_streams; ++s) {
+                        CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[s - 1], cuda_ctx->stream(cuda_ctx->device, s)));
+                        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[s - 1]));
+                    }
+                    is_concurrent_event_active = false;
+                    concurrent_event           = nullptr;
+                    cuda_ctx->active_region    = nullptr;
+                    region_join_idx            = cgraph->n_nodes;
+                };
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
                     if (node == concurrent_event->join_node) {
-                        cuda_ctx->curr_stream_no = 0;
-                        for (int i = 1; i <= concurrent_event->n_streams; ++i) {
-                            // Wait on join events of forked streams in the main stream
-                            CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[i - 1],
-                                                       cuda_ctx->stream(cuda_ctx->device, i)));
-                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]));
-                        }
-
-                        is_concurrent_event_active = false;
-                        concurrent_event           = nullptr;
+                        join_region();
                     } else {
-                        GGML_ASSERT (concurrent_event->stream_mapping.find(node) != concurrent_event->stream_mapping.end());
-                        cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
-                        GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
-                    }
-                } else if (i - prev_i > 1) {
-                    //the previous node was fused
-                    const ggml_tensor * prev_node = cgraph->nodes[i - 1];
-                    try_launch_concurrent_event(prev_node);
-
-                    if (is_concurrent_event_active) {
-                        cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
-                        GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                        auto it = concurrent_event->stream_mapping.find(node);
+                        GGML_ASSERT(it != concurrent_event->stream_mapping.end());
+                        cuda_ctx->curr_stream_no = it->second;
                     }
                 }
 
@@ -7111,6 +7224,53 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // every fusion fires as it would on one stream, so the bits stay what they were. A launch here may
+                // cover the nodes after this one that each consume the one before (an elementwise tail, a norm
+                // with its rope), or matvecs over this node's input (members, a gate with its up); whatever those
+                // read from the other branches must be complete, so this stream waits for those branches first.
+                if (is_concurrent_event_active) {
+                    bool need[GGML_CUDA_MAX_STREAMS] = {};
+                    const auto mark = [&](const ggml_tensor * t) {
+                        auto it = concurrent_event->stream_mapping.find(t);
+                        if (it != concurrent_event->stream_mapping.end() && it->second != cuda_ctx->curr_stream_no) {
+                            need[it->second] = true;
+                        }
+                    };
+                    const ggml_tensor * cur = node;
+                    for (int j = i + 1, n_reach = 0; j < cgraph->n_nodes && n_reach < 16; ++j) {
+                        const ggml_tensor * t = cgraph->nodes[j];
+                        if (ggml_cuda_is_view_or_noop(t)) {
+                            continue;
+                        }
+                        const bool consumes = ggml_cuda_region_reads(t, cur);
+                        const bool sibling  = (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && t->op == node->op && t->src[1] == node->src[1];
+                        if (!consumes && !sibling) {
+                            break;
+                        }
+                        n_reach++;
+                        if (j >= region_join_idx) {
+                            for (int s = 1; s <= concurrent_event->n_streams; ++s) {
+                                need[s] = s != cuda_ctx->curr_stream_no;
+                            }
+                            break;
+                        }
+                        mark(t);
+                        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                            mark(t->src[s]);
+                            mark(ggml_cuda_region_base(t->src[s]));
+                        }
+                        if (consumes) {
+                            cur = t;
+                        }
+                    }
+                    for (int s = 1; s <= concurrent_event->n_streams; ++s) {
+                        if (need[s]) {
+                            cudaEvent_t e = ggml_cuda_region_event(*cuda_ctx);
+                            CUDA_CHECK(cudaEventRecord(e, cuda_ctx->stream(cuda_ctx->device, s)));
+                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), e));
+                        }
+                    }
+                }
                 int nodes_to_skip = i < g_cuda_no_fuse_until ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 // GGML_CUDA_TRACE_LAUNCH=1: what the graph actually launches,
@@ -7132,6 +7292,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
                     if (op_stats) { ggml_cuda_op_timer_get().mark(cuda_ctx->stream(), node, nodes_to_skip + 1); }
                     ggml_cuda_norm_fold_poison_scan(*cuda_ctx, cgraph->nodes[i + nodes_to_skip], i + nodes_to_skip);
+                    if (is_concurrent_event_active) {
+                        if (i + nodes_to_skip >= region_join_idx) {
+                            // the launch covered the join itself
+                            join_region();
+                        } else {
+                            // a launch that covered nodes of other branches: their streams wait for it
+                            for (int k = i + 1; k <= i + nodes_to_skip; ++k) {
+                                auto it = concurrent_event->stream_mapping.find(cgraph->nodes[k]);
+                                if (it != concurrent_event->stream_mapping.end() && it->second != cuda_ctx->curr_stream_no) {
+                                    ggml_cuda_region_publish(*cuda_ctx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -7159,10 +7334,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_ASSERT(ok);
                 ggml_cuda_norm_fold_poison_scan(*cuda_ctx, node, i);
                 if (op_stats) { ggml_cuda_op_timer_get().mark(cuda_ctx->stream(), node, 0); }
-
-                if (!is_concurrent_event_active) {
-                    try_launch_concurrent_event(node);
-               }
             }
             // GGML_CUDA_TRACE_FOLD=1: how many norms this walk left unlaunched
             static const bool trace_fold = getenv("GGML_CUDA_TRACE_FOLD") != nullptr;
@@ -7493,12 +7664,350 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+// Concurrent regions. Wherever one node feeds two or more chains of work that need nothing from each other until
+// they meet again (q, k and v of an attention layer; the routed and the shared experts of a MoE layer; the gating
+// projections beside the state projection of a delta-net layer), the chains run on their own streams between a
+// fork and a join, inside the captured CUDA graph. Every kernel reads and writes what it did before; only the order
+// between the chains is left to the GPU. Everything a region touches stays allocated until the join, so no chain can
+// take over another's buffer, and no launch fuses across the join.
+static constexpr int GGML_CUDA_REGION_MAX_BRANCHES = GGML_CUDA_MAX_STREAMS - 1;
+
+static const ggml_tensor * ggml_cuda_region_base(const ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+static bool ggml_cuda_region_reads(const ggml_tensor * node, const ggml_tensor * t) {
+    for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+        if (node->src[s] == t || ggml_cuda_region_base(node->src[s]) == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// a branch is worth a stream of its own when it carries a launch that streams real memory
+static bool ggml_cuda_region_heavy(const ggml_tensor * n) {
+    switch (n->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_CONV_2D:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static cudaEvent_t ggml_cuda_region_event(ggml_backend_cuda_context & ctx) {
+    if (ctx.region_events_used == ctx.region_events.size()) {
+        cudaEvent_t e = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        ctx.region_events.push_back(e);
+    }
+    return ctx.region_events[ctx.region_events_used++];
+}
+
+void ggml_cuda_region_publish(ggml_backend_cuda_context & ctx) {
+    const ggml_cuda_concurrent_event * ev = ctx.active_region;
+    if (ev == nullptr || ctx.curr_stream_no == 0) {
+        return;
+    }
+    cudaEvent_t e = ggml_cuda_region_event(ctx);
+    CUDA_CHECK(cudaEventRecord(e, ctx.stream()));
+    for (int s = 1; s <= ev->n_streams; ++s) {
+        if (s != ctx.curr_stream_no) {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(ctx.device, s), e));
+        }
+    }
+}
+
+static void ggml_cuda_find_concurrent_regions(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    static const bool trace = getenv("GGML_CUDA_TRACE_REGIONS") != nullptr;
+    const int n = cgraph->n_nodes;
+
+    std::unordered_map<const ggml_tensor *, int> group; // a region node -> its group
+    std::vector<int>  parent;                            // union-find over the groups
+    std::vector<bool> seeded;                            // the group starts at a reader of the root
+    auto find = [&](int g) {
+        while (parent[g] != g) {
+            parent[g] = parent[parent[g]];
+            g = parent[g];
+        }
+        return g;
+    };
+    auto unite = [&](int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) {
+            parent[b] = a;
+            seeded[a] = seeded[a] || seeded[b];
+        }
+        return a;
+    };
+
+    int n_regions = 0;
+    for (int r = 0; r + 2 < n; ++r) {
+        const ggml_tensor * root = cgraph->nodes[r];
+        if (ggml_cuda_is_view_or_noop(root)) {
+            continue;
+        }
+        int n_readers = 0;
+        for (int k = r + 1; k < n && n_readers < 2; ++k) {
+            if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k]) && ggml_cuda_region_reads(cgraph->nodes[k], root)) {
+                n_readers++;
+            }
+        }
+        if (n_readers < 2) {
+            continue;
+        }
+
+        // forward from the root: a node joins the group of whatever region node it reads or writes into, and
+        // merges the groups when it reads several; one that needs every group seeded by the root is the join; one
+        // that needs nothing of the region floats until a reader takes it in
+        group.clear();
+        parent.clear();
+        seeded.clear();
+        // tensors from before the region and the groups that read them or wrote into them (a KV cache, a
+        // recurrent state): a later write after a read, or any touch after a write, is a dependency the graph
+        // edges do not show
+        std::vector<std::pair<const ggml_tensor *, int>> touched_read;
+        std::vector<std::pair<const ggml_tensor *, int>> touched_write;
+        int join = -1;
+        int prev = -1; // the last node before this one
+        for (int k = r + 1; k < n; ++k) {
+            const ggml_tensor * node = cgraph->nodes[k];
+            if (ggml_cuda_is_view_or_noop(node)) {
+                continue;
+            }
+            int deps[4*GGML_MAX_SRC + 4];
+            int n_deps   = 0;
+            int n_seeded = 0;
+            auto need_group = [&](int g) {
+                g = find(g);
+                for (int d = 0; d < n_deps; ++d) {
+                    if (deps[d] == g) {
+                        return;
+                    }
+                }
+                if (n_deps == (int) (sizeof(deps)/sizeof(deps[0]))) {
+                    return;
+                }
+                deps[n_deps++] = g;
+                n_seeded += seeded[g] ? 1 : 0;
+            };
+            auto need = [&](const ggml_tensor * t) {
+                auto it = group.find(t);
+                if (it != group.end()) {
+                    need_group(it->second);
+                }
+            };
+            const ggml_tensor * wbase = node->view_src; // the node writes into this older tensor
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+                need(node->src[s]);
+                need(ggml_cuda_region_base(node->src[s]));
+                for (const auto & tw : touched_write) {
+                    if (tw.first == ggml_cuda_region_base(node->src[s])) {
+                        need_group(tw.second);
+                    }
+                }
+            }
+            if (wbase) {
+                need(wbase);
+                for (const auto & tw : touched_write) {
+                    if (tw.first == wbase) {
+                        need_group(tw.second);
+                    }
+                }
+                for (const auto & tr : touched_read) {
+                    if (tr.first == wbase) {
+                        need_group(tr.second);
+                    }
+                }
+            }
+            if (n_seeded >= 2) {
+                int n_live = 0;
+                for (size_t g = 0; g < parent.size(); ++g) {
+                    n_live += (seeded[g] && find((int) g) == (int) g) ? 1 : 0;
+                }
+                if (n_seeded == n_live) {
+                    join = k;
+                    break;
+                }
+            }
+            const bool reads_root = ggml_cuda_region_reads(node, root);
+            int g;
+            if (n_deps == 0 && reads_root && prev >= 0 && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+                    cgraph->nodes[prev]->op == node->op && cgraph->nodes[prev]->src[1] == node->src[1] &&
+                    cgraph->nodes[prev]->src[0]->type == node->src[0]->type && group.count(cgraph->nodes[prev]) &&
+                    ggml_cuda_region_reads(cgraph->nodes[prev], root)) {
+                // the matvec right after one over the same input: the two launch as one, so they are one branch
+                g = find(group[cgraph->nodes[prev]]);
+            } else if (n_deps == 0) {
+                g = (int) parent.size();
+                parent.push_back(g);
+                seeded.push_back(reads_root);
+            } else {
+                g = deps[0];
+                for (int d = 1; d < n_deps; ++d) {
+                    g = unite(g, deps[d]);
+                }
+                seeded[g] = seeded[g] || reads_root;
+            }
+            group[node] = g;
+            prev        = k;
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+                const ggml_tensor * base = ggml_cuda_region_base(node->src[s]);
+                if (base != root && !group.count(base)) {
+                    touched_read.emplace_back(base, g);
+                }
+            }
+            if (wbase && !group.count(wbase)) {
+                touched_write.emplace_back(wbase, g);
+            }
+        }
+        if (join < 0) {
+            continue;
+        }
+        ggml_tensor * join_node = cgraph->nodes[join];
+
+        // a norm inside the region folds into its readers; a reader at or after the join would find nothing written
+        bool ok = true;
+        for (int k = r + 1; k < join && ok; ++k) {
+            const ggml_tensor * node = cgraph->nodes[k];
+            if (node->op != GGML_OP_RMS_NORM) {
+                continue;
+            }
+            for (int m = join; m < n && ok; ++m) {
+                ok = !ggml_cuda_region_reads(cgraph->nodes[m], node);
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+
+        // the branches: the groups in order of first appearance; one not seeded by the root, without a heavy
+        // launch, or past the stream count runs on the branch before it
+        std::vector<int>  branch_of(parent.size(), 0);
+        std::vector<int>  order;
+        std::vector<bool> heavy;
+        for (int k = r + 1; k < join; ++k) {
+            const ggml_tensor * node = cgraph->nodes[k];
+            if (ggml_cuda_is_view_or_noop(node)) {
+                continue;
+            }
+            const int g = find(group[node]);
+            if (branch_of[g] == 0) {
+                order.push_back(g);
+                heavy.push_back(false);
+                branch_of[g] = (int) order.size();
+            }
+            heavy[branch_of[g] - 1] = heavy[branch_of[g] - 1] || ggml_cuda_region_heavy(node);
+        }
+        std::vector<int> merged(order.size(), 0);
+        int n_branches = 0;
+        for (size_t b = 0; b < order.size(); ++b) {
+            if (n_branches == 0 || (seeded[order[b]] && heavy[b] && n_branches < GGML_CUDA_REGION_MAX_BRANCHES)) {
+                n_branches++;
+            }
+            merged[b] = n_branches;
+        }
+        if (n_branches < 2) {
+            continue;
+        }
+        auto branch_of_node = [&](const ggml_tensor * node) {
+            auto it = group.find(node);
+            return it == group.end() ? 0 : merged[branch_of[find(it->second)] - 1];
+        };
+
+        ggml_cuda_concurrent_event ev(n_branches);
+        ev.fork_node = root;
+        ev.join_node = join_node;
+        std::vector<int> per_branch(n_branches + 1, 0);
+        int last_branch = 1;
+        for (int k = r + 1; k < join; ++k) {
+            ggml_tensor * node = cgraph->nodes[k];
+            int b = branch_of_node(node);
+            if (b == 0) {
+                // a view: of a region node, or of something older, read by one branch
+                b = branch_of_node(ggml_cuda_region_base(node));
+                for (int m = k + 1; m < join && b == 0; ++m) {
+                    if (ggml_cuda_region_reads(cgraph->nodes[m], node)) {
+                        b = branch_of_node(cgraph->nodes[m]);
+                    }
+                }
+                if (b == 0) {
+                    b = last_branch;
+                }
+            }
+            ev.stream_mapping[node] = b;
+            last_branch = b;
+            if (ggml_cuda_is_view_or_noop(node)) {
+                continue;
+            }
+            per_branch[b]++;
+            // every compute tensor the region writes or reads stays allocated until the join
+            params->add_alloc_dep(params->user_data, node, join_node);
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+                ggml_tensor * src = const_cast<ggml_tensor *>(ggml_cuda_region_base(node->src[s]));
+                if (src->buffer != nullptr && ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                    continue;
+                }
+                if (group.count(src) == 0) {
+                    params->add_alloc_dep(params->user_data, src, join_node);
+                }
+            }
+        }
+        params->add_alloc_dep(params->user_data, cgraph->nodes[r], join_node);
+
+        if (trace) {
+            fprintf(stderr, "[region] %s -> %s: %d branches of", root->name, join_node->name, n_branches);
+            for (int b = 1; b <= n_branches; ++b) {
+                fprintf(stderr, " %d", per_branch[b]);
+            }
+            fprintf(stderr, " nodes\n");
+        }
+        GGML_ASSERT(cuda_ctx->stream_context().concurrent_events.find(root) == cuda_ctx->stream_context().concurrent_events.end());
+        cuda_ctx->stream_context().concurrent_events.emplace(root, std::move(ev));
+        n_regions++;
+        r = join - 1;
+    }
+    if (trace) {
+        fprintf(stderr, "[region] %d regions in a graph of %d nodes\n", n_regions, n);
+    }
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            // the top-k gating fusion writes its weights and ids while it reads the logits and the elided
+            // nodes between; it is taken only when the allocator placed none of its outputs over them, which
+            // otherwise depends on the batch. Keeping the inputs until the weights makes it fire every time.
+            const ggml_op op = cgraph->nodes[i]->op;
+            if (op == GGML_OP_UNARY || op == GGML_OP_SOFT_MAX || op == GGML_OP_ARGSORT) {
+                ggml_cuda_topk_moe_args args;
+                if (ggml_cuda_topk_moe_fusion(cgraph, i, args)) {
+                    int n_ops = 0;
+                    if (!args.delayed_softmax) {
+                        n_ops = (args.sqrt_softplus ? 2 : 1) + (args.prob_bias ? 5 : 4) + (args.norm ? 5 : 0) + (args.scale ? 1 : 0);
+                    } else if (!args.norm && !args.prob_bias) {
+                        n_ops = 6;
+                    }
+                    if (n_ops > 0 && i + n_ops <= cgraph->n_nodes) {
+                        ggml_tensor * last = cgraph->nodes[i + n_ops - 1];
+                        params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], last);
+                        for (int k = i; k + 1 < i + n_ops; ++k) {
+                            params->add_alloc_dep(params->user_data, cgraph->nodes[k], last);
+                        }
+                    }
+                }
+            }
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;
             }
@@ -7527,12 +8036,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cgraph);
 #endif
 
-    static bool enable_graph_optimization = [] {
-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
+    // GGML_CUDA_GRAPH_OPT: unset or 0 keeps every graph on one stream, 1 is the attention-only pass below, 2 finds
+    // every concurrent region (see ggml_cuda_find_concurrent_regions). Measured 2026-10-27 on the 35B MoE: the
+    // regions take 0.2 ms off the GPU side of a 5 ms round and put 0.3 ms back on the host (branched graphs launch
+    // slower and re-instantiate more often), so they stay opt-in.
+    static const int graph_opt_mode = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+        return env == nullptr ? 0 : atoi(env);
     }();
 
-    if (!enable_graph_optimization) {
+    if (graph_opt_mode == 0) {
         return;
     }
 
@@ -7540,6 +8053,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     stream_context.reset();
 
     if (!use_cuda_graph) {
+        return;
+    }
+
+    if (graph_opt_mode != 1) {
+        ggml_cuda_find_concurrent_regions(cuda_ctx, cgraph, params);
         return;
     }
 
@@ -8064,6 +8582,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return false;
             }
         }
+        // a mapped source is read over the bus: fine for the rows a gather touches, never for a matrix product
+        if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_mapped(op->src[i]->buffer->buft) &&
+                (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_OUT_PROD)) {
+            return false;
+        }
     }
 
     switch (op->op) {
@@ -8514,7 +9037,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+           ggml_backend_buft_is_cuda_mapped(buft);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -8806,6 +9330,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_mapped_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_dev_get_mapped_buffer_type;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
