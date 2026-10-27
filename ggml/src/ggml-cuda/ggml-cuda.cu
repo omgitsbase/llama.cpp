@@ -2684,6 +2684,44 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// Under WDDM a launch the host does not wait on at once can reach the GPU late: a graph launched behind a
+// drafter's chain started only when the host next synchronized. None of the flushes below measured as
+// submitting it earlier (GGML_CUDA_FLUSH keeps them for experiments); off by default.
+static __global__ void ggml_cuda_flush_kernel() {}
+
+static void ggml_cuda_flush_stream(cudaStream_t stream, bool at_event = false) {
+#ifdef _WIN32
+    // GGML_CUDA_FLUSH: 0 off, 1 stream query after launches and event records, 2 event query after launches,
+    // 3 stream query after launches, 4 a synchronize on an idle stream after launches, 5 an empty kernel after launches
+    static const int mode = getenv("GGML_CUDA_FLUSH") ? atoi(getenv("GGML_CUDA_FLUSH")) : 0;
+    if (mode == 0 || (at_event && mode != 1)) {
+        return;
+    }
+    if (mode == 2) {
+        static cudaEvent_t ev = nullptr;
+        if (ev == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(ev, stream));
+        (void) cudaEventQuery(ev);
+    } else if (mode == 4) {
+        static cudaStream_t idle = nullptr;
+        if (idle == nullptr) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&idle, cudaStreamNonBlocking));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(idle));
+    } else if (mode == 5) {
+        ggml_cuda_flush_kernel<<<1, 1, 0, stream>>>();
+    } else {
+        (void) cudaStreamQuery(stream);
+    }
+    (void) cudaGetLastError();
+#else
+    GGML_UNUSED(stream);
+    GGML_UNUSED(at_event);
+#endif
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -7220,6 +7258,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        ggml_cuda_flush_stream(cuda_ctx->stream());
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -7472,6 +7511,7 @@ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+    ggml_cuda_flush_stream(cuda_ctx->stream(), true);
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {

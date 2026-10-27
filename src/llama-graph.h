@@ -172,6 +172,11 @@ public:
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+
+    // a drafter chaining its own rows reads them from tokens_dev->tok_dev (see llm_graph_input_embd)
+    llama_tokens_dev_state * tokens_dev = nullptr;
+    ggml_backend_sched_t     sched      = nullptr;
+    bool dev_tokens = false; // tokens is a view of tokens_dev->tok_dev
 };
 
 // The decode loop on the device. The host reserves a window of cache cells
@@ -206,6 +211,7 @@ struct llama_tokens_dev_state {
     ggml_backend_sched_t   sched_dst = nullptr;
     std::vector<llama_tokens_dev_span> spans;   // empty: the host uploads every row
     int32_t                n_batch   = 0;       // tokens of the decode in flight
+    int64_t                gen       = 0;       // the drafter's chain the rows come from
 
     // a decode of up to n_max tokens in one ubatch reads the drafted ids from tok_dev, so a copy from the drafter does
     // not synchronize; a decode of several ubatches uploads them from the host
@@ -237,6 +243,7 @@ struct llama_mtp_round_stage {
     ggml_tensor           * c_ids_dev  = nullptr; // I32 [n_verify*S]
     ggml_tensor           * h_tgt_dev  = nullptr; // F32 [n_embd, n_verify*S]
     ggml_tensor           * h_pend_dev = nullptr; // F32 [n_embd, S]
+    ggml_tensor           * ids_dev    = nullptr; // I32 [n_verify*S]: the chain's ids then the accepted counts, written by the round graph
 };
 
 // tok_io rows [0, n_cm): the ids the last small decode sampled, by output row; rows [n_cm, 2*n_cm): the host's ids.
@@ -1450,6 +1457,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    void build_inp_embd_h_tokens(llm_graph_input_embd_h & inp) const;
 
     // the token ids of this graph come through the decode chain's tok_io
     bool is_chain_form() const;

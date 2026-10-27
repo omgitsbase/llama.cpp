@@ -49,6 +49,44 @@ struct llama_round_timing {
 };
 static llama_round_timing & llama_round_timer() { static llama_round_timing t; return t; }
 
+// LLAMA_ROUND_TIMING=2: a timeline of marks over one server round, from the library, the
+// speculative driver and the server; the server flushes it
+struct llama_round_marks {
+    bool on = getenv("LLAMA_ROUND_TIMING") != nullptr && atoi(getenv("LLAMA_ROUND_TIMING")) >= 2;
+    std::vector<std::pair<const char *, int64_t>> v;
+    std::vector<int32_t> tags;
+};
+static llama_round_marks & llama_round_marks_get() { static llama_round_marks m; return m; }
+
+void llama_round_mark(const char * what, int32_t tag) {
+    auto & m = llama_round_marks_get();
+    if (!m.on) {
+        return;
+    }
+    m.v.emplace_back(what, ggml_time_us());
+    m.tags.push_back(tag);
+}
+
+void llama_round_marks_flush(bool print) {
+    auto & m = llama_round_marks_get();
+    if (!m.on) {
+        return;
+    }
+    if (print && !m.v.empty()) {
+        const int64_t t0 = m.v[0].second;
+        int64_t prev = t0;
+        fprintf(stderr, "[round] timeline (us from the first mark, +step):\n");
+        for (size_t i = 0; i < m.v.size(); ++i) {
+            fprintf(stderr, "[round]   %7lld  +%6lld  %s %d\n", (long long) (m.v[i].second - t0), (long long) (m.v[i].second - prev), m.v[i].first, m.tags[i]);
+            prev = m.v[i].second;
+        }
+    }
+    m.v.clear();
+    m.tags.clear();
+}
+
+static int32_t llama_round_ctx_tag(const void * ctx) { return (int32_t) ((((uintptr_t) ctx) >> 4) & 0xfff); }
+
 //
 // llama_context
 //
@@ -517,6 +555,11 @@ llama_context::~llama_context() {
     if (chain_info.ev) {
         ggml_backend_event_free(chain_info.ev);
     }
+    for (auto & s : mtp_ids_slots) {
+        if (s.ev) {
+            ggml_backend_event_free(s.ev);
+        }
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -818,7 +861,9 @@ void llama_context::synchronize() {
         return;
     }
 
+    llama_round_mark("sync.begin", llama_round_ctx_tag(this));
     ggml_backend_sched_synchronize(sched.get());
+    llama_round_mark("sync.end", llama_round_ctx_tag(this));
     synced_epoch = epoch;
     for (const auto & f : outputs_fill) {
         memcpy(f.dst, f.src, f.size);
@@ -1904,6 +1949,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     llama_work_queued();
+    llama_round_mark("decode.begin", batch_inp.n_tokens);
+    struct mark_end { int32_t n; ~mark_end() { llama_round_mark("decode.end", n); } } mark_end_{batch_inp.n_tokens};
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1920,8 +1967,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     } tokens_dev_guard{tokens_dev};
     tokens_dev.n_batch = batch_inp.n_tokens;
 
-    // the pending ids live in the compute buffer this decode overwrites
-    if (!mtp_ids_pending.empty()) {
+    // the pending ids live in the compute buffer this decode overwrites, unless a readback queued behind their
+    // graph holds them already
+    if (!mtp_ids_pending.empty() && !mtp_ids_captured) {
         int32_t n_ids = 0;
         get_mtp_chain_ids(n_ids);
     }
@@ -2364,7 +2412,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (!res->t_mtp_ids.empty()) {
             mtp_ids_pending = res->t_mtp_ids;
             mtp_ids_n_seq   = (int32_t) ggml_nelements(res->t_mtp_ids[0]);
-            mtp_ids.clear();
+            mtp_ids_readback();
         }
 
         if (res->t_mtp_hpend) {
@@ -2447,17 +2495,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
             (int32_t) last_rows_seq.size() == batch_inp.n_tokens && batch_inp.n_tokens <= tokens_dev.n_max) {
         synchronize();
         int32_t n_ids = 0;
-        const llama_token * ids = tokens_dev.src->get_mtp_chain_ids(n_ids);
-        const int32_t n_seq = tokens_dev.src->get_mtp_chain_n_seq();
+        // a drafter replaying its own last chain reads the chain before the one just queued; nothing is consumed
+        std::vector<llama_token> peek;
+        int32_t n_seq = 1;
+        tokens_dev.src->mtp_ids_peek(tokens_dev.src == this ? mtp_ids_gen - 1 : tokens_dev.src->mtp_ids_gen, peek, n_seq);
+        n_ids = (int32_t) peek.size();
+        const llama_token * ids = peek.data();
         std::vector<llama_token> rows(batch_inp.n_tokens);
         ggml_backend_tensor_get(tokens_dev.tok_dev, rows.data(), 0, rows.size()*sizeof(llama_token));
         for (int32_t r = 0; r < batch_inp.n_tokens; ++r) {
             for (const auto & sp : tokens_dev.spans) {
                 const int32_t j = last_rows_seq[r] == sp.seq ? last_rows_pos[r] - sp.pos0 - 1 : -1;
                 if (j >= 0 && j < sp.n) {
-                    if (rows[r] != ids[j*n_seq + sp.col]) {
-                        LLAMA_LOG_ERROR("%s: device row %d (seq %d, step %d) holds %d, the drafter drafted %d\n", __func__, r, sp.seq, j, rows[r], ids[j*n_seq + sp.col]);
-                        GGML_ABORT("device token rows");
+                    if (n_ids <= j*n_seq + sp.col || rows[r] != ids[j*n_seq + sp.col]) {
+                        LLAMA_LOG_ERROR("%s: device row %d (seq %d, step %d, pos %d) holds %d, the drafter drafted %d (n_ids %d, self %d)\n", __func__,
+                                r, sp.seq, j, (int) last_rows_pos[r], rows[r], n_ids > j*n_seq + sp.col ? ids[j*n_seq + sp.col] : -1, n_ids, (int) (tokens_dev.src == this));
+                        if (tokens_dev.src != this) {
+                            GGML_ABORT("device token rows");
+                        }
                     }
                 }
             }
@@ -4491,34 +4546,189 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
     return ctx->set_sampler(seq_id, smpl);
 }
 
-const llama_token * llama_context::get_mtp_chain_ids(int32_t & n) {
-    if (!mtp_ids_pending.empty()) {
+// the ids of the chained decode just queued: read back behind its graph into a pinned slot, with an event
+// marking their arrival; with both slots taken the oldest goes to host memory first
+void llama_context::mtp_ids_readback() {
+    mtp_ids_captured = false;
+    mtp_ids_gen++;
+    const size_t n_seq = (size_t) mtp_ids_n_seq;
+    const size_t k     = mtp_ids_pending.size()*n_seq;
+    ggml_backend_t backend0 = ggml_backend_sched_get_tensor_backend(sched.get(), mtp_ids_pending[0]);
+    if (backend0 == nullptr || k == 0) {
+        return;
+    }
+    auto * buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend0));
+    if (buft == nullptr) {
+        return;
+    }
+    if (mtp_round.stages.size() < n_seq || !mtp_round.stages[n_seq - 1].ids_dev) {
+        // no stage tensor (a drafter's own round): the ids are read from the graph's tensors on demand, with a wait
+        mtp_ids_backend = backend0;
+        mtp_ids_n_steps = (int32_t) mtp_ids_pending.size();
+        return;
+    }
+    // the last two chains stay readable; anything older was never asked for
+    while (mtp_ids_queue.size() >= 2) {
+        auto & r = mtp_ids_queue.front();
+        if (r.slot >= 0) {
+            mtp_ids_slots[r.slot].busy = false;
+        }
+        mtp_ids_queue.erase(mtp_ids_queue.begin());
+    }
+    if (!mtp_ids_buf || mtp_ids_cap < k) {
+        for (auto & r : mtp_ids_queue) {
+            mtp_ids_to_host(r);
+        }
+        mtp_ids_cap = std::max<size_t>(64, k);
+        mtp_ids_buf.reset(ggml_backend_buft_alloc_buffer(buft, 2*mtp_ids_cap*sizeof(llama_token)));
+        if (!mtp_ids_buf) {
+            mtp_ids_cap = 0;
+            return;
+        }
+    }
+    int slot = mtp_ids_slots[0].busy ? 1 : 0;
+    GGML_ASSERT(!mtp_ids_slots[slot].busy);
+    auto & s = mtp_ids_slots[slot];
+    if (s.ev == nullptr) {
+        s.ev = ggml_backend_event_new(ggml_backend_get_device(backend0));
+    }
+    // the round graph wrote its ids into the stage tensor; the readback into the slot is queued by mtp_ids_submit()
+    GGML_ASSERT(mtp_round.stages.size() >= n_seq && mtp_round.stages[n_seq - 1].ids_dev && (size_t) ggml_nelements(mtp_round.stages[n_seq - 1].ids_dev) == k);
+    s.busy = true;
+    mtp_ids_backend = backend0;
+    mtp_ids_n_steps = (int32_t) mtp_ids_pending.size();
+    mtp_ids_queue.push_back({ slot, (int32_t) k, (int32_t) n_seq, mtp_ids_gen, false, {} });
+    mtp_ids_captured = true;
+}
+
+void llama_context::mtp_ids_submit_entry(mtp_ids_read & r) {
+    if (r.slot < 0 || r.submitted) {
+        return;
+    }
+    if (r.gen != mtp_ids_gen) {
+        // the stage tensor holds the last chain only: an older chain's ids never reached the host
+        LLAMA_LOG_WARN("%s: the ids of chain %lld were not read before chain %lld\n", __func__, (long long) r.gen, (long long) mtp_ids_gen);
+        mtp_ids_slots[r.slot].busy = false;
+        r.slot = -1;
+        r.n    = 0;
+        return;
+    }
+    const size_t n_seq = (size_t) r.n_seq;
+    auto & s = mtp_ids_slots[r.slot];
+    llama_token * pinned = (llama_token *) ggml_backend_buffer_get_base(mtp_ids_buf.get()) + r.slot*mtp_ids_cap;
+    llama_work_queued();
+    ggml_backend_tensor_get_async(mtp_ids_backend, mtp_round.stages[n_seq - 1].ids_dev, pinned, 0, (size_t) r.n*sizeof(llama_token));
+    ggml_backend_event_record(s.ev, mtp_ids_backend);
+    r.submitted = true;
+}
+
+void llama_context::mtp_ids_submit() {
+    for (auto & r : mtp_ids_queue) {
+        mtp_ids_submit_entry(r);
+    }
+}
+
+void llama_mtp_chain_readback(llama_context * ctx) {
+    ctx->mtp_ids_submit();
+}
+
+llama_context::mtp_ids_dev_view llama_context::get_mtp_ids_dev(int64_t gen) const {
+    mtp_ids_dev_view v;
+    const size_t n_seq = (size_t) mtp_ids_n_seq;
+    if (gen == mtp_ids_gen && mtp_ids_backend && mtp_round.stages.size() >= n_seq && mtp_round.stages[n_seq - 1].ids_dev) {
+        v.t       = mtp_round.stages[n_seq - 1].ids_dev;
+        v.backend = mtp_ids_backend;
+        v.off     = 0;
+        v.n_seq   = (int32_t) n_seq;
+        v.n_steps = mtp_ids_n_steps;
+    }
+    return v;
+}
+
+// the ids of chain `gen` without consuming them: a queued readback is waited for and copied
+bool llama_context::mtp_ids_peek(int64_t gen, std::vector<llama_token> & out, int32_t & n_seq) {
+    for (auto & r : mtp_ids_queue) {
+        if (r.gen != gen) {
+            continue;
+        }
+        mtp_ids_submit_entry(r);
+        if (r.slot >= 0) {
+            ggml_backend_event_synchronize(mtp_ids_slots[r.slot].ev);
+            const llama_token * pinned = (const llama_token *) ggml_backend_buffer_get_base(mtp_ids_buf.get()) + r.slot*mtp_ids_cap;
+            out.assign(pinned, pinned + r.n);
+        } else {
+            out = r.host;
+        }
+        n_seq = r.n_seq;
+        return true;
+    }
+    if (gen == mtp_ids_gen || !mtp_ids.empty()) {
+        int32_t n = 0;
+        const llama_token * ids = get_mtp_chain_ids(n, gen);
+        out.assign(ids, ids + n);
+        n_seq = mtp_ids_read_n_seq;
+        return n > 0;
+    }
+    return false;
+}
+
+void llama_context::mtp_ids_to_host(mtp_ids_read & r) {
+    if (r.slot < 0) {
+        return;
+    }
+    mtp_ids_submit_entry(r);
+    if (r.slot < 0) {
+        return;
+    }
+    auto & s = mtp_ids_slots[r.slot];
+    ggml_backend_event_synchronize(s.ev);
+    const llama_token * pinned = (const llama_token *) ggml_backend_buffer_get_base(mtp_ids_buf.get()) + r.slot*mtp_ids_cap;
+    r.host.assign(pinned, pinned + r.n);
+    s.busy = false;
+    r.slot = -1;
+}
+
+const llama_token * llama_context::get_mtp_chain_ids(int32_t & n, int64_t gen) {
+    if (gen < 0) {
+        gen = mtp_ids_gen;
+    }
+    size_t at = mtp_ids_queue.size();
+    for (size_t i = 0; i < mtp_ids_queue.size(); ++i) {
+        if (mtp_ids_queue[i].gen == gen) {
+            at = i;
+        }
+    }
+    if (at < mtp_ids_queue.size()) {
+        // its readback was queued behind its graph; chains before it were not asked for
+        for (size_t i = 0; i < at; ++i) {
+            if (mtp_ids_queue[i].slot >= 0) {
+                mtp_ids_slots[mtp_ids_queue[i].slot].busy = false;
+            }
+        }
+        mtp_ids_read r = std::move(mtp_ids_queue[at]);
+        mtp_ids_queue.erase(mtp_ids_queue.begin(), mtp_ids_queue.begin() + at + 1);
+        llama_round_mark("ids.wait.begin", r.slot);
+        mtp_ids_to_host(r);
+        llama_round_mark("ids.wait.end", r.slot);
+        mtp_ids            = std::move(r.host);
+        mtp_ids_read_n_seq = r.n_seq;
+    } else if (gen != mtp_ids_gen && !mtp_ids.empty()) {
+        // read already, or dropped: what the host holds
+    } else if (!mtp_ids_pending.empty() && !mtp_ids_captured) {
+        // no pinned slot for this backend: the ids come over now, and the whole queue is waited for
         const size_t n_seq = (size_t) mtp_ids_n_seq;
         const size_t k     = mtp_ids_pending.size()*n_seq;
         mtp_ids.assign(k, LLAMA_TOKEN_NULL);
-        llama_token * dst = mtp_ids.data();
-        ggml_backend_t backend0 = ggml_backend_sched_get_tensor_backend(sched.get(), mtp_ids_pending[0]);
-        if (backend0 != nullptr && (!mtp_ids_buf || ggml_backend_buffer_get_size(mtp_ids_buf.get()) < k * sizeof(llama_token))) {
-            mtp_ids_buf.reset();
-            if (auto * buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend0))) {
-                mtp_ids_buf.reset(ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(64, k) * sizeof(llama_token)));
-            }
-        }
-        llama_token * pinned = mtp_ids_buf ? (llama_token *) ggml_backend_buffer_get_base(mtp_ids_buf.get()) : dst;
         llama_work_queued();
         for (size_t j = 0; j < mtp_ids_pending.size(); ++j) {
             ggml_tensor * t = mtp_ids_pending[j];
             ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
             GGML_ASSERT(backend_t != nullptr && (size_t) ggml_nelements(t) == n_seq);
-            ggml_backend_tensor_get_async(backend_t, t, &pinned[j*n_seq], 0, n_seq*sizeof(llama_token));
+            ggml_backend_tensor_get_async(backend_t, t, &mtp_ids[j*n_seq], 0, n_seq*sizeof(llama_token));
         }
-        mtp_ids_pending.clear();
         synchronize();
-        if (pinned != dst) {
-            std::copy(pinned, pinned + k, dst);
-        }
-    } else {
-        synchronize();
+        mtp_ids_read_n_seq = mtp_ids_n_seq;
+        mtp_ids_captured   = true;
     }
     n = (int32_t) mtp_ids.size();
     return mtp_ids.data();
@@ -4530,7 +4740,8 @@ void llama_context::set_mtp_round_target(llama_context * ctx_tgt) {
 
 bool llama_context::set_tokens_device_seq(llama_context * ctx_src, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t col) {
     if (ctx_src == nullptr || n <= 0 || seq < 0 || col < 0 || col >= ctx_src->mtp_ids_n_seq ||
-            (int32_t) ctx_src->mtp_ids_pending.size() <= n || (tokens_dev.src != nullptr && tokens_dev.src != ctx_src)) {
+            ctx_src->mtp_ids_n_steps <= n || !ctx_src->get_mtp_ids_dev(ctx_src->mtp_ids_gen).t ||
+            (tokens_dev.src != nullptr && tokens_dev.src != ctx_src)) {
         return false;
     }
     for (const auto & sp : tokens_dev.spans) {
@@ -4542,9 +4753,14 @@ bool llama_context::set_tokens_device_seq(llama_context * ctx_src, llama_seq_id 
     if (tok_embd == nullptr || tok_embd->buffer == nullptr || ggml_backend_buffer_is_host(tok_embd->buffer)) {
         return false;
     }
+    // a per-layer embedding table on the host is looked up with the batch's ids there
+    if (model.per_layer_tok_embd && (model.per_layer_tok_embd->buffer == nullptr || ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer))) {
+        return false;
+    }
     tokens_dev.enabled   = true;
     tokens_dev.src       = ctx_src;
     tokens_dev.sched_dst = sched.get();
+    tokens_dev.gen       = ctx_src->mtp_ids_gen;
     tokens_dev.spans.push_back({ seq, pos0, n, col });
     return true;
 }
@@ -5084,6 +5300,14 @@ bool llama_decode_loop_on_device(const llama_context * ctx) {
 
 const llama_token * llama_get_mtp_chain_ids(llama_context * ctx, int32_t * n) {
     return ctx->get_mtp_chain_ids(*n);
+}
+
+int64_t llama_get_mtp_chain_gen(const llama_context * ctx) {
+    return ctx->get_mtp_chain_gen();
+}
+
+const llama_token * llama_get_mtp_chain_ids_gen(llama_context * ctx, int64_t gen, int32_t * n) {
+    return ctx->get_mtp_chain_ids(*n, gen);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

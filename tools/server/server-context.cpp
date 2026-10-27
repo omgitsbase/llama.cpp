@@ -2993,6 +2993,13 @@ private:
 #endif
 
     void update_slots() {
+        {
+            // LLAMA_ROUND_TIMING=2: three whole rounds of marks, every 400 calls
+            static int n_calls = 0;
+            const int k = ++n_calls % 400;
+            llama_round_marks_flush(k >= 398 || k == 0);
+            llama_round_mark("slots.begin", n_calls);
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3304,7 +3311,9 @@ private:
                 {
                     auto & srt = srv_round_timer();
                     const int64_t t0 = srt.on ? ggml_time_us() : 0;
+                    llama_round_mark("draft.begin", 0);
                     common_speculative_draft(spec.get());
+                    llama_round_mark("draft.end", 0);
                     if (srt.on) { srt.draft += (ggml_time_us() - t0) / 1000.0; }
                 }
             });
@@ -3981,11 +3990,6 @@ private:
                 ret = llama_decode(ctx_tgt, batch_view);
                 if (srt.on) { srt.decode += (ggml_time_us() - t0) / 1000.0; }
             }
-            // the verify is queued: the drafted ids it took on the device come back to the host now, before
-            // anything reads the batch, the draft or the prompt (and before a retry would upload the batch)
-            for (server_slot * s : handoff) {
-                resolve_draft(*s);
-            }
             if (ret == 0 && has_output && !spec && !chain_start) {
                 auto & srt = srv_round_timer();
                 const int64_t t0 = srt.on ? ggml_time_us() : 0;
@@ -3996,7 +4000,19 @@ private:
         });
         if (spt.on && spt.t_sync) { spt.t_yield = ggml_time_us(); }
 
+        // the verify is queued: the drafted ids it took on the device come back to the host before anything reads
+        // the batch, the draft or the prompt; the drafter's process() goes first, so that it launches the next
+        // chain before this readback waits on the last one
+        const auto resolve_handoff = [&]() {
+            for (server_slot * s : handoff) {
+                resolve_draft(*s);
+            }
+            llama_round_mark("verify.resolved", (int32_t) handoff.size());
+            handoff.clear();
+        };
+
         if (ret != 0) {
+            resolve_handoff(); // before a retry would upload the batch
             {
                 std::string err;
 
@@ -4057,7 +4073,10 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 auto & srt = srv_round_timer();
                 const int64_t t0 = srt.on ? ggml_time_us() : 0;
+                llama_round_mark("process.begin", 0);
                 ok = common_speculative_process(spec.get(), batch_view);
+                llama_round_mark("process.end", 0);
+                resolve_handoff();
                 if (srt.on) { srt.process += (ggml_time_us() - t0) / 1000.0; }
             });
 
@@ -4351,6 +4370,7 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 if (srt.on) { srt.accept += (ggml_time_us() - t_acc0) / 1000.0; srt.end_round(); }
+                llama_round_mark("accept.end", (int32_t) accepted.size());
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4456,6 +4476,7 @@ private:
             {
                 auto & srt = srv_round_timer();
                 if (srt.on) { srt.tokens += (ggml_time_us() - t_tok0) / 1000.0; }
+                llama_round_mark("tokens.end", (int32_t) ids.size());
             }
 
             slot.print_timings_tg();
