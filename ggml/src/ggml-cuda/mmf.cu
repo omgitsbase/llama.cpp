@@ -132,7 +132,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
         const size_t * src0_nb, const int src1_ncols, bool mul_mat_id) {
-    if (ggml_is_quantized(type)) {
+    if (ggml_is_quantized(type) || type == GGML_TYPE_F8_E4M3) {
         return false;
     }
 

@@ -72,6 +72,7 @@ public:
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
+    bool seq_cp_prefix(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n, ggml_backend_t backend) override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
@@ -92,8 +93,17 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+    // see llama_kv_cache::set_split_gaps
+    void set_split_gaps(bool v) {
+        split_gaps = v;
+        kv_base->set_split_gaps(v);
+        kv_swa ->set_split_gaps(v);
+    }
+
 private:
     const bool unified;
+
+    bool split_gaps = false;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;
@@ -116,12 +126,20 @@ public:
             llama_context * lctx,
             bool optimize);
 
-    // used to create a batch processing context from a batch
+    // used to create a batch processing context from a batch; grouped: the ubatches are the groups of one forward
+    // (split_groups), applied together, the graph's ubatch their concatenation
     llama_kv_cache_iswa_context(
             llama_kv_cache_iswa * kv,
             slot_info_vec_t sinfos_base,
             slot_info_vec_t sinfos_swa,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            bool grouped = false);
+
+    // a view of one group of a grouped context: its ubatch and its slots in both caches
+    llama_kv_cache_iswa_context(
+            llama_memory_context_ptr base,
+            llama_memory_context_ptr swa,
+            llama_ubatch ubatch);
 
     virtual ~llama_kv_cache_iswa_context();
 
@@ -142,7 +160,14 @@ public:
     const llama_kv_cache_context * get_base() const;
     const llama_kv_cache_context * get_swa()  const;
 
+    // the groups of a grouped context (0 otherwise) and the view of each, valid after apply()
+    uint32_t n_groups() const { return grouped ? (uint32_t) ubatches.size() : 0; }
+    const llama_kv_cache_iswa_context * get_group(uint32_t g) const { return g < views.size() ? views[g].get() : nullptr; }
+
 private:
+    bool grouped = false;
+    llama_ubatch composite = {};
+    std::vector<std::unique_ptr<llama_kv_cache_iswa_context>> views;
     //llama_kv_cache_iswa * kv;
 
     // the index of the next ubatch to process

@@ -11,6 +11,7 @@
 #include <list>
 #include <set>
 #include <sstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -586,8 +587,9 @@ struct common_params {
 
     bool single_turn       = false; // single turn chat conversation
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    // KV cache data types; GGML_TYPE_COUNT is auto: FP8 for a model that carries its cache's scales, f16 otherwise
+    ggml_type cache_type_k = GGML_TYPE_COUNT; // KV cache data type for the K
+    ggml_type cache_type_v = GGML_TYPE_COUNT; // KV cache data type for the V
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -1172,31 +1174,55 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // Host memory for a sequence state. Pinned when a GPU backend can pin it, so
 // the copies to and from the device run at DMA speed rather than the pageable
 // rate; pinning is itself slow, so released buffers are pooled for reuse.
-// resize() leaves the contents past the old size undefined.
+// A copy shares the bytes until one side writes them (the prompt cache keeps a
+// slot's checkpoints without copying them). resize() leaves the contents past
+// the old size undefined.
 struct common_state_buf {
     common_state_buf() = default;
-    ~common_state_buf();
-    common_state_buf(const common_state_buf & o);
-    common_state_buf & operator=(const common_state_buf & o);
-    common_state_buf(common_state_buf && o) noexcept;
-    common_state_buf & operator=(common_state_buf && o) noexcept;
+    ~common_state_buf() = default;
+    common_state_buf(const common_state_buf & o) = default;
+    common_state_buf & operator=(const common_state_buf & o) = default;
+    common_state_buf(common_state_buf && o) noexcept = default;
+    common_state_buf & operator=(common_state_buf && o) noexcept = default;
 
     void            resize(size_t n);
-    void            clear() { n_ = 0; }
-    void            shrink_to_fit() { if (n_ == 0) { release(); } }
-    uint8_t *       data()       { return ptr_; }
-    const uint8_t * data() const { return ptr_; }
-    size_t          size()  const { return n_; }
-    bool            empty() const { return n_ == 0; }
+    void            clear();
+    void            shrink_to_fit();
+    uint8_t *       data();         // to write: the bytes are this buffer's alone from here on
+    const uint8_t * data() const;   // to read: waits for a device copy still filling them
+    size_t          size()  const { return p_ ? p_->n : 0; }
+    bool            empty() const { return size() == 0; }
+
+    // the context whose device is still filling the buffer (LLAMA_STATE_SEQ_FLAGS_ASYNC): wait() before the bytes
+    // are read; the buffer waits itself before it is copied, reused or freed. Only pinned memory takes a device
+    // copy beside the decodes: pinned() says whether the flag may be used for this buffer
+    void            set_async(llama_context * ctx);
+    void            wait() const;
+    bool            pinned() const { return p_ && p_->pinned; }
 
 private:
-    uint8_t * ptr_ = nullptr;
-    size_t    n_   = 0;
-    size_t    cap_ = 0;
-    void *    buf_ = nullptr;  // the ggml buffer behind ptr_ when pinned
+    struct impl {
+        uint8_t *       ptr       = nullptr;
+        size_t          n         = 0;
+        size_t          cap       = 0;
+        void *          buf       = nullptr;  // the ggml buffer behind ptr when it is a pinned buffer of its own
+        bool            carved    = false;    // ptr is a range of a pinned slab instead
+        bool            pinned    = false;    // page-locked: the device copies into it without a staging pass
+        llama_context * async_ctx = nullptr;
 
-    void release();
+        ~impl();
+        void wait();
+        void alloc(size_t n);
+        void release();
+    };
+    std::shared_ptr<impl> p_;
+
+    void own(); // this buffer's bytes alone: a copy when they are shared
 };
+
+// pins slabs for about this many bytes of states now (a slab pins in ~100 ms per GB) rather than at requests' ends;
+// returns the bytes pinned in slabs (pinning stops at the first failure)
+size_t common_state_buf_warm(size_t bytes);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;

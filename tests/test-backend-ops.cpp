@@ -130,6 +130,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+    } else if (tensor->type == GGML_TYPE_F8_E4M3) {
+        std::vector<uint8_t> dataq(nels);
+        ggml_get_type_traits(GGML_TYPE_F8_E4M3)->from_float_ref(data.data(), dataq.data(), nels);
+        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
     } else if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16) {
         // This is going to create some weird integers though.
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * ggml_type_size(tensor->type));
@@ -9769,6 +9773,52 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// three quantized matmuls over one input, next to each other in the graph: the CUDA backend launches them as one
+// for several sequences' rows (GGML_CUDA_MMQ_BATCHED=1 counts every matmul as such)
+struct test_mul_mat_group : public test_case {
+    const ggml_type type;
+    const int64_t m0, m1, m2, n, k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m0, m1, m2, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        // the FP4 route quantizes the activations to FP4 too, as test_mul_mat allows
+        if ((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    test_mul_mat_group(ggml_type type, int64_t m0, int64_t m1, int64_t m2, int64_t n, int64_t k)
+        : type(type), m0(m0), m1(m1), m2(m2), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * w0 = ggml_new_tensor_2d(ctx, type, k, m0);
+        ggml_set_name(w0, "w0");
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type, k, m1);
+        ggml_set_name(w1, "w1");
+        ggml_tensor * w2 = ggml_new_tensor_2d(ctx, type, k, m2);
+        ggml_set_name(w2, "w2");
+
+        ggml_tensor * a = ggml_mul_mat(ctx, w0, x);
+        ggml_tensor * b = ggml_mul_mat(ctx, w1, x);
+        ggml_tensor * c = ggml_mul_mat(ctx, w2, x);
+        // a, b and c end up next to each other in the graph in this nesting
+        ggml_tensor * out = ggml_concat(ctx, a, ggml_concat(ctx, b, c, 0), 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -10782,6 +10832,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // shapes the CUDA backend's block-scaled FP4 path takes (GGML_CUDA_FP4_GEMM=2 runs it for one sequence too): several
+    // sequences against an attention and a feed-forward matrix
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4}) {
+        for (int n : {9, 16, 33, 128, 200}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, n, 2560, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2560, n, 10240, {1, 1}, {1, 1}));
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4}) {
+        for (int n : {16, 33, 128}) {
+            test_cases.emplace_back(new test_mul_mat_group(type, 2048, 512, 512, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_group(type, 10240, 10240, 200, n, 2560));
+        }
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
@@ -11579,6 +11645,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int nb : { 32, 64, }) {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+
+    // an FP8 (E4M3) cache in Gemma 4's head shapes, which the MMA kernel reads directly through its stages
+    for (int hs : { 256, 512 }) {
+        for (int nr2 : { 2, 4 }) {
+            for (int kv : { 256, 1024 }) {
+                for (int nb : { 1, 2, 4, 8, 16, 32, 64 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
                 }
             }
         }

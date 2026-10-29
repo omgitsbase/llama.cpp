@@ -105,10 +105,20 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    // gaps = with sequential, the ids only have to increase: idle sequences between them leave gaps
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool gaps = false);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
+
+    // The batch as groups for one forward (vLLM's decodes and prefills in one batch): each sequence's tokens one run of
+    // the batch, consecutive runs of one length with increasing sequence ids one equal-length ubatch, so the groups'
+    // rows are the batch's rows in order (a verify's rows, then each prompt chunk). Empty when that gives a single
+    // group, a sequence's tokens are not one run, a token is in several sequences, or the batch exceeds n_ubatch.
+    std::vector<llama_ubatch> split_groups(uint32_t n_ubatch);
+
+    // the next init of a memory module may split the batch into groups (split_groups) for one forward
+    bool groups_allowed = false;
 
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future

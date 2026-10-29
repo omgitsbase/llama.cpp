@@ -640,6 +640,9 @@ static __global__ void elt_chain_f32(const ggml_cuda_chain_args a, const int64_t
         v = ggml_cuda_chain_apply(st, v, st.arg >= 0 ? at(a.arg[st.arg]) : 0.0f);
     }
     a.dst[idx] = v;
+    if (a.dst_bf16 != nullptr) {
+        a.dst_bf16[idx] = __float2bfloat16(v);
+    }
 }
 
 void ggml_cuda_op_elt_chain(ggml_backend_cuda_context & ctx, const ggml_cuda_chain_args & a) {

@@ -54,3 +54,5 @@ bool ggml_cuda_mmvq_router_weights_taken();
 // two quantized matvecs over one activation, each within one wave, in one launch
 bool ggml_cuda_mmvq_pair_ok(const ggml_tensor * a, const ggml_tensor * b, int device);
 void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b, ggml_cuda_norm_fold * fold);
+// two to four matvecs over one activation, each member's rows computed as alone
+void ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, const ggml_tensor * const * nodes, int n, ggml_cuda_norm_fold * fold);

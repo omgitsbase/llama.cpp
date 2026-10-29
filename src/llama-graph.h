@@ -6,9 +6,14 @@
 #include "llama-adapter.h"
 #include "llama-ext.h"
 
+#include "ggml-backend.h"
+
 #include <cstdint>
 #include <cstdlib>
+#include <array>
 #include <vector>
+#include <cstdio>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <functional>
@@ -96,6 +101,7 @@ struct llama_cross {
 
 struct llm_graph_params;
 struct llama_tokens_dev_state;
+struct llama_embd_dev_state;
 struct llama_decode_chain_state;
 
 //
@@ -149,6 +155,9 @@ public:
     llama_tokens_dev_state * tokens_dev = nullptr;
     bool dev_tokens = false; // tokens is a view of tokens_dev->tok_dev
     ggml_backend_sched_t sched = nullptr;
+    llama_embd_dev_state * embd_dev = nullptr; // rows of embd copied on the device from another context, see set_input
+    ggml_tensor * idx     = nullptr; // I32 [S]: a chained draft's anchors as rows of embd_dev->stage; embd is then not read
+    int32_t       chain_k = 0;       // rows per sequence of such a draft
 
     // chain form: I32 [2*n_tokens], the host ids and then the row map into chain->tok_io
     const llama_decode_chain_state * chain = nullptr;
@@ -201,6 +210,15 @@ struct llama_tokens_dev_span {
 
 // Batch rows of the next decode that another context's chained MTP draft fills on the device: the verify is
 // queued behind the draft graph instead of waiting for its ids to reach the host. Armed for one decode.
+struct llama_embd_dev_state {
+    llama_context *                        src = nullptr;
+    std::vector<std::array<int32_t, 2>>    rows;  // {sequence whose first row takes it, row of src's last hidden rows}
+    // a chained draft gathers its anchors from here: the source's hidden rows come over as one block, the host's
+    // rows go behind it (llm_graph_input_embd::idx); the drafter allocates it on first use
+    ggml_tensor *                          stage     = nullptr; // F32 [n_embd, n_src_max + n_seq_max]
+    int32_t                                n_src_max = 0;
+};
+
 struct llama_tokens_dev_state {
     llama_context        * src       = nullptr; // the drafter whose last chained ids fill the rows
     ggml_backend_sched_t   sched_dst = nullptr;
@@ -259,6 +277,9 @@ struct llama_decode_chain_state {
     }
 };
 
+// the candidates a drafter that samples its drafts keeps of each (speculative sampling, see build_sampling)
+#define LLAMA_MTP_DRAFT_TOP_K 20
+
 struct llama_mtp_round_state {
     llama_context * ctx_tgt   = nullptr;
     ggml_tensor   * hpend_dev = nullptr;  // F32 [n_embd, n_seq_max], by sequence id, written after every chained decode
@@ -275,6 +296,10 @@ struct llama_mtp_round_state {
 
     // the next round's sequences; after a round each one takes the device route
     std::vector<llama_mtp_round_seq> seqs = { llama_mtp_round_seq() };
+
+    // a drafter over the target's cache takes only the verify's samples and hidden rows (see
+    // llama_set_mtp_dev_anchors): no pending row of its own
+    bool anchors_only = false;
 
     void free_stages() {
         for (auto & st : stages) {
@@ -336,6 +361,26 @@ public:
     const int64_t n_embd;
     const int64_t n_verify;
     const int64_t n_seq;
+};
+
+// a round that samples its drafts: every sequence's temperature and top-p from the target's sampler, a uniform a step
+class llm_graph_input_mtp_sample : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_sample(llama_mtp_round_state * state, int K, int V) : state(state), K(K), V(V) {}
+    virtual ~llm_graph_input_mtp_sample() = default;
+
+    bool reads_token_ids() const override { return false; }
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override { GGML_UNUSED(params); return true; }
+
+    ggml_tensor * par = nullptr; // F32 [2, S]: 1/temperature (large for a greedy one), top-p
+    ggml_tensor * u   = nullptr; // F32 [S, K]: step j's uniforms in row j
+
+    llama_mtp_round_state * state;
+    const int K;
+    const int V;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -426,6 +471,31 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+};
+
+// a ubatch whose sequences skip idle streams: which sequence's queries each stream of the span takes (a stream
+// between them takes the first sequence's, masked out), and which stream each sequence's output comes back from
+class llm_graph_input_strm : public llm_graph_input_i {
+public:
+    llm_graph_input_strm(int64_t n_seqs, int64_t n_span, int64_t n_stream) : n_seqs(n_seqs), n_span(n_span), n_stream(n_stream) {}
+    virtual ~llm_graph_input_strm() = default;
+
+    bool reads_token_ids() const override { return false; }
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * strm_q = nullptr; // I32 [n_span]
+    ggml_tensor * strm_o = nullptr; // I32 [n_seqs]
+
+    const int64_t n_seqs;
+    const int64_t n_span;
+    const int64_t n_stream; // the cache's streams: a span of them all starts at stream 0
+
+    // in a grouped forward, the remap of one group's rows: its ubatch is the group view's, not the graph's
+    int group = -1;
+    const llama_memory_context_i * gmctx = nullptr;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -739,6 +809,24 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+
+    // A grouped forward (a verify's rows and prompt chunks in one graph, llama_kv_cache_iswa_context::n_groups): the
+    // parent holds no tensors and a child per group; a child's mctx is its group's view and its ubatch that view's.
+    int group = -1;
+    std::vector<llm_graph_input_attn_kv_iswa *> groups;
+
+    // a group's streams, one per sequence, which the attention reads instead of the view's (I32 [n_seqs]); its masks
+    // are then one per sequence too
+    ggml_tensor * kv_strm = nullptr;
+
+    // A grouped forward in vLLM's variable-length layout: one attention over every group's rows instead of one per
+    // group. The indices and masks above are the groups' rows one after another, the masks as wide as the widest
+    // group's view; the table is each sequence's first row, rows and stream (flash_attn_varlen_tile).
+    ggml_tensor * varlen_tab = nullptr; // I32 [1 + 3*n_seq_max]
+    int64_t n_kv_varlen     = 0;
+    int64_t n_kv_varlen_swa = 0;
+
+    void set_input_varlen(const llama_ubatch * ubatch);
 };
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {
@@ -792,6 +880,7 @@ struct llm_graph_mtp_attn {
     ggml_tensor * v_idxs  = nullptr; // null where the cache holds no separate V
     ggml_tensor * kq_mask = nullptr;
     ggml_tensor * k_rot   = nullptr; // the rotation a Hadamard-rotated cache applies
+    ggml_tensor * kv_strm = nullptr; // each sequence's stream (llm_graph_input_attn_kv_iswa::kv_strm)
 };
 
 llm_graph_mtp_attn llm_graph_mtp_attn_of(llm_graph_input_attn_kv      * inp);
@@ -998,7 +1087,49 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // built as one argmax over every output row: reusable by any ubatch whose sampling is the same
+    bool greedy = false;
+
+    // built in the batched form (llm_graph_params::samplers_batch): its inputs, filled from the step's samplers
+    uint64_t      batch_key = 0;
+    int32_t       batch_lw  = 0; // penalty window entries a row holds
+    int32_t       batch_kp  = 0; // ids a row takes in before it within the batch
+    int32_t       batch_nb  = 0; // logit bias entries a row holds
+    ggml_tensor * inp_par   = nullptr; // [12, rows]: top-p, log min-p, temperature, uniform, 1/repeat - 1, repeat - 1, freq, presence, temperature 0, drafted, second uniform, draft distribution
+    ggml_tensor * inp_hist  = nullptr; // [lw, rows]: the penalty window's ids (-1: none)
+    ggml_tensor * inp_ppos  = nullptr; // [kp*rows]: the batch positions of the ids a row takes in before it
+    ggml_tensor * inp_pmask = nullptr; // [kp, rows]: 1 where inp_ppos holds one
+    ggml_tensor * inp_btok  = nullptr; // [nb, rows]: logit bias ids (-1: none)
+    ggml_tensor * inp_bval  = nullptr; // [nb, rows]: their biases
+    ggml_tensor * inp_dpos  = nullptr; // [rows]: the batch position of the draft a row checks (its own without one)
+    ggml_tensor * inp_qstage = nullptr; // [2*LLAMA_MTP_DRAFT_TOP_K, rows]: the drafter's last round's distributions
+    ggml_tensor * inp_qidx   = nullptr; // [rows]: the stage row of the draft a row checks
+
+    llama_tokens_dev_state * tokens_dev = nullptr; // the drafter's round whose distributions fill inp_qstage
+    ggml_backend_sched_t     sched      = nullptr;
 };
+
+// the batched form's shape key when every output row's sampler takes it, else 0
+uint64_t llm_graph_samplers_batch_key(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers,
+        int32_t * lw = nullptr, int32_t * kp = nullptr, int32_t * nb = nullptr, int32_t * k = nullptr, bool * rep = nullptr,
+        bool * minp = nullptr, bool * t0 = nullptr, bool * sd = nullptr);
+
+// the streams and sampling signature of the ubatch, see llm_graph_params
+void llm_graph_params_fill(llm_graph_params & params);
+
+// see llm_graph_input_attn_kv_iswa::kv_strm
+bool llm_graph_attn_streams_in(const llama_cparams & cparams);
+
+// see llm_graph_input_attn_kv_iswa::varlen_tab; the widest group's cache view sizes in n_kv and n_kv_swa
+bool llm_graph_attn_varlen(const llama_cparams & cparams, const llama_hparams & hparams,
+        const llama_kv_cache_iswa_context * mctx, int64_t * n_kv = nullptr, int64_t * n_kv_swa = nullptr);
+
+// every output row has a sampler whose backend result is the argmax of its logits
+bool llm_graph_samplers_greedy(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers);
+
+// greedy rows whose chains all pick on the backend: the host reads none of their logits (llama_context::needs_raw_logits)
+bool llm_graph_logits_internal(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers);
 
 //
 // llm_graph_result
@@ -1035,6 +1166,7 @@ struct llm_graph_params {
 
     llama_mtp_round_state  * mtp_round;
     llama_tokens_dev_state * tokens_dev;
+    llama_embd_dev_state   * embd_dev;
     const llama_loop_state       * loop;
     const llama_decode_chain_state * chain;
 
@@ -1063,9 +1195,39 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // The cache streams the ubatch's views cover (first stream, count) and whether its sampling is one argmax over
+    // every output row: two ubatches of one shape with these equal build the same graph, whatever their sequence
+    // ids and sampler objects, so a step over other slots replays the graph instead of building it again.
+    // Filled by llm_graph_params_fill; strm_n is 0 for memory without streams, which keeps the sequence id check, and
+    // -1 where the attention reads its streams from an input (any sequences of the same count replay the graph).
+    int32_t strm_s0 = -1;
+    int32_t strm_n  = 0;
+    bool    samplers_greedy = false;
+    // greedy, and no row's logits go to the host (llm_graph_logits_internal): the logits are no graph output
+    bool    logits_internal = false;
+    // every row's sampler runs in the batched form (llm_graph_samplers_batch_key): the form's shape, which with
+    // its parameters in inputs makes the graph the same whatever the sampler objects; 0 otherwise
+    uint64_t samplers_batch = 0;
+
+    // a grouped forward: each group's tokens, sequences and stream span (empty otherwise)
+    std::vector<std::array<int32_t, 4>> groups_sig;
+
+    // the sizes of the cache views the attention reads (each group's, for a grouped forward): a multi-sequence
+    // graph's arena key (llama_context::get_gf_res_prev), so a round keeps one graph per size it has seen
+    uint64_t n_kv_sig = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
+    // why the last allow_reuse said no (LLAMA_ROUND_TIMING)
+    static const char *& reuse_reason() { static const char * r = ""; return r; }
+
     bool allow_reuse(const llm_graph_params & other) const {
+        reuse_reason() = "";
+
+        if (groups_sig != other.groups_sig) {
+            reuse_reason() = "groups";
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -1082,7 +1244,11 @@ struct llm_graph_params {
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
         if (can_reuse_ubatch && ubatch.equal_seqs()) {
-            if (!ubatch.data) {
+            if (strm_n < 0 && other.strm_n < 0) {
+                // the streams are inputs
+            } else if (strm_n > 0 && other.strm_n > 0) {
+                can_reuse_ubatch = strm_s0 == other.strm_s0 && strm_n == other.strm_n;
+            } else if (!ubatch.data) {
                 // if the old ubatch does not own it's data, then we cannot guarantee that it is still alive, and
                 //   therefore we cannot perform the sequence id check. normally should never happen
                 can_reuse_ubatch = false;
@@ -1094,26 +1260,49 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            static char buf[256];
+            snprintf(buf, sizeof(buf), "ubatch: old T %u st %u seqs %u unq %u eq %d tok %d embd %d span %d+%d | new T %u st %u seqs %u unq %u eq %d tok %d embd %d span %d+%d",
+                    ubatch.n_tokens, ubatch.n_seq_tokens, ubatch.n_seqs, ubatch.n_seqs_unq, (int) ubatch.equal_seqs(), ubatch.token != nullptr, ubatch.embd != nullptr, strm_s0, strm_n,
+                    other.ubatch.n_tokens, other.ubatch.n_seq_tokens, other.ubatch.n_seqs, other.ubatch.n_seqs_unq, (int) other.ubatch.equal_seqs(), other.ubatch.token != nullptr, other.ubatch.embd != nullptr, other.strm_s0, other.strm_n);
+            reuse_reason() = buf;
             return false;
         }
 
         if (n_outputs != other.n_outputs) {
+            reuse_reason() = "n_outputs";
             return false;
         }
 
-        if (!samplers_equal(samplers, other.samplers)) {
+        // one argmax over the rows reads no sampler, so the samplers need not be the same objects; a graph
+        // without output rows samples nothing at all
+        const bool greedy = (samplers_greedy && other.samplers_greedy) || (n_outputs == 0 && other.n_outputs == 0) ||
+                            (samplers_batch != 0 && samplers_batch == other.samplers_batch);
+
+        if (!greedy && !samplers_equal(samplers, other.samplers)) {
+            reuse_reason() = samplers_greedy == other.samplers_greedy ? "samplers differ (not greedy)" : "greedy flag differs";
             return false;
         }
 
-        if (samplers.size() > 0) {
+        if (logits_internal != other.logits_internal) {
+            reuse_reason() = "logits output flag differs";
+            return false;
+        }
+
+        if (samplers.size() > 0 || other.samplers.size() > 0) {
             if (!ubatch.data || !other.ubatch.data) {
+                reuse_reason() = "ubatch data not owned";
                 return false;
             }
 
-            // check that the outputs are the same for all samplers
+            // check that the outputs are the same for all samplers. The output rows' places are input data
+            // (out_ids); one argmax over the gathered rows reads no sampler, so for it only their count matters
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                if (ubatch.output[i]    != other.ubatch.output[i] ||
-                    ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
+                if (!greedy && ubatch.output[i] != other.ubatch.output[i]) {
+                    reuse_reason() = "output rows differ";
+                    return false;
+                }
+                if (!greedy && ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
+                    reuse_reason() = "row sequences differ (not greedy)";
                     return false;
                 }
             }
@@ -1125,19 +1314,21 @@ struct llm_graph_params {
         }
 
         if (cparams.mtp_chain != other.cparams.mtp_chain || draft_head != other.draft_head) {
+            reuse_reason() = "mtp chain or draft head";
             return false;
         }
 
-        return
-            cparams.embeddings              == other.cparams.embeddings              &&
-            cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
-            cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
-            cparams.causal_attn             == other.cparams.causal_attn             &&
-            arch  == other.arch  &&
-            gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+        if (cparams.embeddings              != other.cparams.embeddings)              { reuse_reason() = "embeddings";              return false; }
+        if (cparams.embeddings_nextn        != other.cparams.embeddings_nextn)        { reuse_reason() = "embeddings_nextn";        return false; }
+        if (cparams.embeddings_nextn_masked != other.cparams.embeddings_nextn_masked) { reuse_reason() = "embeddings_nextn_masked"; return false; }
+        if (cparams.causal_attn             != other.cparams.causal_attn)             { reuse_reason() = "causal_attn";             return false; }
+        if (arch  != other.arch)  { reuse_reason() = "arch";  return false; }
+        if (gtype != other.gtype) { reuse_reason() = "gtype"; return false; }
+        if (cvec  != other.cvec)  { reuse_reason() = "cvec";  return false; }
+        if (loras != other.loras) { reuse_reason() = "loras"; return false; }
+        if (cross != other.cross) { reuse_reason() = "cross"; return false; }
+
+        return true;
     }
 };
 
@@ -1207,7 +1398,12 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
     std::vector<ggml_tensor *> t_mtp_ids; // I32 [S], one per chained draft step, then the accepted counts
+    ggml_tensor * t_mtp_ids_all = nullptr; // I32 [K, S], the same ids with a sequence's together
+    ggml_tensor * t_mtp_q = nullptr;       // F32 [2*LLAMA_MTP_DRAFT_TOP_K, K, S]: each draft's candidates (ids) and probabilities
     ggml_tensor * t_mtp_hpend = nullptr;  // F32 [n_embd, S], the anchors' hidden rows for the next round
+
+    // the sequence count the graph's matrix multiplications carry (ggml_mul_mat_set_n_seqs): 2 for several, else 0
+    int32_t mm_seqs_tag = 0;
 
     // the token ids come in the chain form, every sampled id goes to tok_io, and no other input reads token ids
     bool chain_ok  = false;
@@ -1216,6 +1412,7 @@ public:
     // the recurrent states gathered into their step rows
     int32_t n_step_states = 0;
     bool draft_head_unused = false;       // the MTP head did not multiply by the rows the draft head holds
+    bool logits_internal   = false;       // t_logits is no graph output (llm_graph_logits_internal)
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1228,6 +1425,22 @@ public:
     ggml_cgraph * gf;
 
     int64_t max_nodes;
+
+    void set_samplers_greedy(bool v) { params.samplers_greedy = v; }
+    void set_samplers_batch(uint64_t v) { params.samplers_batch = v; }
+
+    // the tensors the scheduler placed in its compute buffers, noted after the graph's allocation; the buffers may
+    // be allocated again for other graphs, so the next allocation of this one starts from unplaced tensors
+    std::vector<ggml_tensor *> sched_tensors;
+    std::vector<ggml_tensor *> src_snapshot; // see snapshot_srcs
+
+    void note_sched_tensors();
+
+    // The scheduler's split rewrites a node's src to the copy it makes in its own context, which the next split
+    // frees: a graph split again (one that gets its allocation back) first takes its original srcs back
+    void snapshot_srcs();
+    void restore_srcs();
+    void clear_sched_tensors();
 
 private:
     // keep a copy of the previous graph parameters
@@ -1247,6 +1460,20 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
+
+// A tied token embedding is loaded twice: the table rows are gathered from (in mapped host memory when the input
+// layer keeps it there) and the output head's copy in device memory. Gathers read the head's copy: the same bytes,
+// without crossing PCIe. The table itself when there is no such copy.
+static inline ggml_tensor * llm_gather_table(ggml_tensor * tok_embd, ggml_tensor * output) {
+    if (!tok_embd || !output || output == tok_embd || !tok_embd->buffer || !output->buffer ||
+            output->type != tok_embd->type || !ggml_are_same_shape(output, tok_embd) ||
+            strcmp(ggml_get_name(output), ggml_get_name(tok_embd)) != 0 ||
+            ggml_backend_buffer_is_host(output->buffer) || ggml_backend_buffer_is_host(tok_embd->buffer) ||
+            ggml_backend_buffer_get_type(output->buffer) == ggml_backend_buffer_get_type(tok_embd->buffer)) {
+        return tok_embd;
+    }
+    return output;
+}
 
 struct llm_graph_qkv {
     ggml_tensor * q; // [n_embd_head, n_head,    n_tokens]
@@ -1302,6 +1529,7 @@ struct llm_graph_context {
 
     llama_mtp_round_state  * mtp_round;
     llama_tokens_dev_state * tokens_dev;
+    llama_embd_dev_state   * embd_dev;
     const llama_loop_state       * loop;
     const llama_decode_chain_state * chain;
 
@@ -1309,6 +1537,17 @@ struct llm_graph_context {
 
     // while set, build_lora_mm multiplies by draft_head->w where it would multiply by this
     mutable const ggml_tensor * mm_subst = nullptr;
+
+    // the stream maps of a ubatch that skips idle sequences, made by the first attention that needs them
+    mutable llm_graph_input_strm * inp_strm = nullptr;
+
+    // while a grouped forward's attention is built for one group: its ubatch and index (build_attn, build_attn_mha)
+    mutable const llama_ubatch * ubatch_attn = nullptr;
+    mutable int strm_group = -1;
+    mutable const llama_memory_context_i * strm_gmctx = nullptr;
+    mutable llm_graph_input_strm * inp_strm_g[16] = {};
+    mutable ggml_tensor * fa_kv_strm = nullptr; // the next flash attention's K/V stream input (src[5])
+    llm_graph_input_strm * build_inp_strm(int64_t n_seqs, int64_t n_span) const;
 
     // a draft model's reduced head: logits for every token, -inf for those it leaves out
     void build_draft_logits();
@@ -1471,6 +1710,19 @@ struct llm_graph_context {
                  ggml_tensor * inp_pos,
                          int   n_chain,
                      int64_t   n_embd_h = 0);
+
+    // The anchors of a draft round over the target's cache, taken on the device (llama_set_mtp_dev_anchors): the
+    // ubatch holds n_chain + 1 rows per sequence, row j the anchor had the target accepted j drafts. The verify's
+    // samples and hidden rows come over from the target's last graph; the accepted count is the run of drafts equal to
+    // the target's samples, as vLLM's rejection sampler counts them on the device.
+    struct dev_anchors {
+        ggml_tensor * sel_flat  = nullptr; // I32 [S]: the anchor's row of the ubatch, s*(n_chain + 1) + n_acc[s]
+        ggml_tensor * sel_local = nullptr; // I32 [1, S]: n_acc[s], its row within the sequence
+        ggml_tensor * id        = nullptr; // I32 [S]: the anchor token, the target's sample after the accepted drafts
+        ggml_tensor * h         = nullptr; // F32 [n_embd_h, S]: the target's hidden row of the last accepted token
+        ggml_tensor * n_acc     = nullptr; // I32 [S]
+    };
+    dev_anchors build_mtp_dev_anchors(ggml_tensor * inp_tokens, int n_chain, int64_t n_embd_h, ggml_tensor * table) const;
 
     // the round over n_seq > 1 sequences
     void build_mtp_round_seqs(

@@ -145,6 +145,19 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // the variable-length layout (flash_attn_varlen_tile) runs on the several-sequence variant: tiles of 4 rows, a
+    // block for each (a verify's rows are one tile per sequence)
+    {
+        const ggml_tensor * Qv = dst->src[0];
+        if (dst->src[5] && Qv->ne[3] == 1 && dst->src[5]->ne[0] > 1) {
+            if constexpr ((DKQ == 256 || DKQ == 512) && DKQ == DV && ncols2 == 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 4, 1>(ctx, dst);
+                return;
+            } else {
+                GGML_ABORT("flash attention: the variable-length layout needs head size 256 or 512 and 4 query heads a K/V head");
+            }
+        }
+    }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
@@ -159,6 +172,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+            // several sequences of a row or two each (a decode, a drafter's round): the variant for several sequences
+            // below, the same tile as here (8 columns: 2 rows by 4 query heads or 4 by 2)
+            if constexpr ((DKQ == 256 || DKQ == 512) && DKQ == DV && (ncols2 == 2 || ncols2 == 4)) {
+                static const bool wide_off = getenv("GGML_CUDA_FA_WIDE") && atoi(getenv("GGML_CUDA_FA_WIDE")) == 0;
+                if (!wide_off && Q->ne[3] > 1 && ampere_mma_available(cc)) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, 1>(ctx, dst);
+                    return;
+                }
+            }
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
             return;
         }
@@ -166,6 +188,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
+            // a verify over several sequences (a tile per sequence and K/V head): vLLM's layout, see the variant's
+            // configuration; one sequence keeps stream-k. GGML_CUDA_FA_WIDE=0 keeps stream-k for all
+            if constexpr ((DKQ == 256 || DKQ == 512) && DKQ == DV && ncols2 == 4) {
+                static const bool wide_off = getenv("GGML_CUDA_FA_WIDE") && atoi(getenv("GGML_CUDA_FA_WIDE")) == 0;
+                if (!wide_off && Q->ne[3] > 1 && ampere_mma_available(cc)) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 4, 1>(ctx, dst);
+                    return;
+                }
+            }
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
         }
@@ -523,6 +554,8 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
             return true;
+        case GGML_TYPE_F8_E4M3: // the MMA kernel only (ggml_cuda_get_best_fattn_kernel), read directly or converted to f16
+            return true;
         default:
             return false;
     }
@@ -627,6 +660,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // GGML_CUDA_FA_FORCE=mma|vec: the choice below overridden, for measuring the two at decode
     static const char * force = getenv("GGML_CUDA_FA_FORCE");
 
+    // the variable-length layout (flash_attn_varlen_tile) is in the MMA kernel only
+    if (dst->src[5] && Q->ne[3] == 1 && dst->src[5]->ne[0] > 1) {
+        if (!turing_mma_available(cc)) {
+            GGML_ABORT("flash attention: the variable-length layout needs Turing tensor cores (LLAMA_ATTN_VARLEN=0 turns it off)");
+        }
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // an FP8 cache has no vector kernel: the MMA kernel reads it (or its f16 copy)
+    if (K->type == GGML_TYPE_F8_E4M3 || V->type == GGML_TYPE_F8_E4M3) {
+        return turing_mma_available(cc) ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (force && strcmp(force, "mma") == 0) {
@@ -643,8 +689,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1);
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192) && !sparse_decode) {
                     return BEST_FATTN_KERNEL_VEC;
-                }
-            } else {
+                }            } else {
                 // the MMA kernel reads a q8_0 cache once for a group of heads, the vector kernel once a head: from 5
                 // heads a group and 1k cells it is the faster of the two (sm_120, Qwen3.8-27B: 27% at 128k)
                 const bool q8_mma = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && gqa_opt_applies &&
@@ -754,6 +799,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+thread_local float ggml_cuda_fattn_out_scale = 1.0f;
+
+void ggml_cuda_flash_attn_ext_scaled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float scale) {
+    ggml_cuda_fattn_out_scale = scale;
+    ggml_cuda_flash_attn_ext(ctx, dst);
+    ggml_cuda_fattn_out_scale = 1.0f;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
@@ -773,4 +826,78 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+}
+
+void ggml_cuda_graphs_invalidate(ggml_backend_cuda_context & ctx);
+
+// one scan of a mask per graph (see fattn-common.cuh): a few entries per context, valid for the current graph
+struct ggml_cuda_kv_max_entry {
+    const void * mask; int ne; int iter_k; int ncols1; int64_t s31; int64_t s33; bool gaps;
+    int *   buf = nullptr;
+    size_t  cap = 0;
+    uint64_t gen = 0;
+};
+struct ggml_cuda_kv_max_state {
+    uint64_t gen = 1;
+    std::vector<ggml_cuda_kv_max_entry> entries;
+};
+static std::mutex ggml_cuda_kv_max_mtx;
+static std::unordered_map<const ggml_backend_cuda_context *, ggml_cuda_kv_max_state> ggml_cuda_kv_max_states;
+
+void ggml_cuda_kv_max_graph_begin(ggml_backend_cuda_context & ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_kv_max_mtx);
+    ggml_cuda_kv_max_states[&ctx].gen++;
+}
+
+int * ggml_cuda_kv_max_lookup(ggml_backend_cuda_context & ctx, const void * mask, int ne, int iter_k, int ncols1, int64_t s31, int64_t s33, bool gaps, bool & fresh) {
+    static const bool off = getenv("GGML_CUDA_NO_KVMAX_SHARE") != nullptr;
+    fresh = true;
+    if (off) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_kv_max_mtx);
+    auto & st = ggml_cuda_kv_max_states[&ctx];
+    for (auto & e : st.entries) {
+        if (e.mask == mask && e.ne == ne && e.iter_k == iter_k && e.ncols1 == ncols1 && e.s31 == s31 && e.s33 == s33 && e.gaps == gaps) {
+            fresh = e.gen != st.gen;
+            e.gen = st.gen;
+            return e.buf;
+        }
+    }
+    // a new mask of this graph: the entry least recently used, or a new one while there are few
+    ggml_cuda_kv_max_entry * e = nullptr;
+    if (st.entries.size() < 8) {
+        st.entries.emplace_back();
+        e = &st.entries.back();
+    } else {
+        e = &st.entries[0];
+        for (auto & c : st.entries) {
+            if (c.gen < e->gen) {
+                e = &c;
+            }
+        }
+    }
+    if (e->cap < (size_t) ne) {
+        // no allocation while a graph is captured: this launch takes a pool buffer
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            e->gen = 0;
+            return nullptr;
+        }
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        if (e->buf) {
+            CUDA_CHECK(cudaFree(e->buf));
+        }
+        // a growth drops every captured graph: start at 256 KB, more than any batch's tiles need
+        e->cap = std::max<size_t>(ne, 65536);
+        CUDA_CHECK(cudaMalloc(&e->buf, e->cap*sizeof(int)));
+        // graphs captured before read the freed buffer
+        ggml_cuda_graphs_invalidate(ctx);
+    }
+    e->mask = mask; e->ne = ne; e->iter_k = iter_k; e->ncols1 = ncols1; e->s31 = s31; e->s33 = s33; e->gaps = gaps;
+    e->gen = st.gen;
+    fresh = true;
+    return e->buf;
 }

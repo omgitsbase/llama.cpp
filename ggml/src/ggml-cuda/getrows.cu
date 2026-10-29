@@ -1,4 +1,8 @@
 #include "getrows.cuh"
+
+#include <climits>
+#include <mutex>
+#include <unordered_map>
 #include "dequantize.cuh"
 #include "convert.cuh"
 
@@ -439,6 +443,163 @@ void get_rows_cuda(
     }
 }
 
+bool ggml_cuda_buffer_is_mapped(ggml_backend_buffer_t buffer); // ggml-cuda.cu
+
+// The rows a gather picks from a table in mapped host memory, copied over PCIe into a stage in VRAM as wide coalesced
+// reads, many in flight, with the stage's row index beside them. Dequantizing in place reads each block's scales and
+// quants as small dependent loads across the bus: Gemma 4's per-layer embedding table (Q6_K, 8.8 KB a token) came
+// over at ~2.7 GB/s that way, 1.1 MB in 425 us for a 128-token verify.
+// A row is read as whole aligned 128-byte lines (a warp's load is one line, not two halves of neighbours) and in chunks
+// of STAGE_CHUNK words, a block each, so many lines are in flight across the bus at once.
+static constexpr int STAGE_THREADS = 128;
+static constexpr int STAGE_U       = 8;
+static constexpr int STAGE_CHUNK   = STAGE_THREADS*STAGE_U;
+
+// A VRAM cache of the rows such a gather picks: a generated token is one of a few thousand over a long run (1.1k
+// distinct ids made 99% of 49k tokens of the bench replies), so a row that came over PCIe once is read from VRAM after.
+// A row that misses claims a slot for its token (slot_of -2 while it is written: another row of the same token in the
+// batch reads host memory), the stage copy writes the slot as well, and the slot is published once the copy is done.
+// When the slots run out, rows keep coming from host memory. The rows are the table's bytes, so the gather's values are
+// the same. GGML_CUDA_MAPPED_CACHE_MB sizes it (default 192, 0 off).
+struct mapped_row_cache {
+    uint32_t * rows    = nullptr;
+    int32_t  * slot_of = nullptr; // per table row: its slot, -1 none, -2 being written
+    int32_t  * n_used  = nullptr;
+    int32_t    cap     = 0;
+    int64_t    words   = 0;       // a slot's words, rows 128-byte aligned
+};
+static std::mutex mapped_cache_mtx;
+static std::unordered_map<const void *, mapped_row_cache> mapped_caches;
+
+// each gathered row's source: a slot to read (>= 0), a slot to write as it reads host memory (~slot), or host only
+static __global__ void k_cache_plan(const int32_t * __restrict__ ids, const int64_t s10, const int64_t n, int32_t * __restrict__ slot_of,
+        int32_t * __restrict__ n_used, const int32_t cap, int32_t * __restrict__ plan) {
+    const int64_t r = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (r >= n) {
+        return;
+    }
+    const int32_t tok = ids[r*s10];
+    const int32_t s   = slot_of[tok];
+    int32_t p = INT_MIN;
+    if (s >= 0) {
+        p = s;
+    } else if (s == -1 && *(volatile int32_t *) n_used < cap && atomicCAS(&slot_of[tok], -1, -2) == -1) {
+        const int32_t k = atomicAdd(n_used, 1);
+        if (k < cap) {
+            p = ~k;
+        } else {
+            slot_of[tok] = -1;
+        }
+    }
+    plan[r] = p;
+}
+
+static __global__ void k_cache_publish(const int32_t * __restrict__ ids, const int64_t s10, const int64_t n, const int32_t * __restrict__ plan,
+        int32_t * __restrict__ slot_of) {
+    const int64_t r = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (r < n && plan[r] < 0 && plan[r] != INT_MIN) {
+        slot_of[ids[r*s10]] = ~plan[r];
+    }
+}
+
+static __global__ void k_stage_rows(const char * __restrict__ src0, const int32_t * __restrict__ ids, const int64_t s10,
+        const size_t nb01, const int64_t n_words, uint32_t * __restrict__ stage, int32_t * __restrict__ iota,
+        const int32_t * __restrict__ plan, uint32_t * __restrict__ cache, const int64_t cache_words) {
+    const int64_t r   = blockIdx.x;
+    const int32_t p   = plan != nullptr ? plan[r] : INT_MIN;
+    if (blockIdx.y == 0 && threadIdx.x == 0) {
+        iota[r] = (int32_t) r;
+    }
+    if (p >= 0) {
+        // a cached row, in VRAM and aligned
+        const uint32_t * src = cache + (int64_t) p*cache_words;
+        uint32_t       * dst = stage + r*n_words;
+        const int64_t i0 = (int64_t) blockIdx.y*STAGE_CHUNK + threadIdx.x;
+#pragma unroll
+        for (int u = 0; u < STAGE_U; ++u) {
+            const int64_t i = i0 + (int64_t) u*STAGE_THREADS;
+            if (i < n_words) {
+                dst[i] = src[i];
+            }
+        }
+        return;
+    }
+    const int32_t i01 = ids[r*s10];
+    const char * row = src0 + (int64_t) i01*nb01;
+    // the row's first byte within its 128-byte line, in words
+    const int64_t shift = (int64_t) (((uintptr_t) row & 127) / sizeof(uint32_t));
+    const uint32_t * src = (const uint32_t *) (row - shift*sizeof(uint32_t));
+    uint32_t       * dst = stage + r*n_words - shift;
+    const int64_t i_end = n_words + shift;
+    const int64_t i0 = (int64_t) blockIdx.y*STAGE_CHUNK + threadIdx.x;
+    uint32_t v[STAGE_U];
+#pragma unroll
+    for (int u = 0; u < STAGE_U; ++u) {
+        const int64_t i = i0 + (int64_t) u*STAGE_THREADS;
+        v[u] = i < i_end ? src[i] : 0u;
+    }
+    uint32_t * cdst = p != INT_MIN ? cache + (int64_t) (~p)*cache_words - shift : nullptr;
+#pragma unroll
+    for (int u = 0; u < STAGE_U; ++u) {
+        const int64_t i = i0 + (int64_t) u*STAGE_THREADS;
+        if (i >= shift && i < i_end) {
+            dst[i] = v[u];
+            if (cdst != nullptr) {
+                cdst[i] = v[u];
+            }
+        }
+    }
+}
+
+// the cache of a mapped table's rows (data, n_rows of row_bytes), made on first use outside a capture, or nullptr
+static const mapped_row_cache * mapped_cache_get(cudaStream_t stream, const void * data, const int64_t n_rows, const size_t row_bytes) {
+    static const int64_t mb = getenv("GGML_CUDA_MAPPED_CACHE_MB") ? atoll(getenv("GGML_CUDA_MAPPED_CACHE_MB")) : 192;
+    if (mb <= 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mapped_cache_mtx);
+    auto it = mapped_caches.find(data);
+    if (it != mapped_caches.end()) {
+        return it->second.rows ? &it->second : nullptr;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return nullptr;
+    }
+    mapped_row_cache & c = mapped_caches[data];
+    c.words = (int64_t) (((row_bytes + 127) / 128) * 128 / sizeof(uint32_t));
+    c.cap   = (int32_t) std::min<int64_t>(n_rows, (mb << 20) / (c.words*(int64_t) sizeof(uint32_t)));
+    if (c.cap <= 0 || n_rows > INT32_MAX) {
+        c.cap = 0;
+        return nullptr;
+    }
+    CUDA_CHECK(cudaMalloc(&c.rows, (size_t) c.cap*c.words*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&c.slot_of, (size_t) n_rows*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c.n_used, sizeof(int32_t)));
+    CUDA_CHECK(cudaMemsetAsync(c.slot_of, 0xFF, (size_t) n_rows*sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(c.n_used, 0, sizeof(int32_t), stream));
+    GGML_LOG_INFO("%s: %d rows of a mapped table cached in VRAM (%.0f MB)\n", __func__, c.cap, c.cap*c.words*sizeof(uint32_t)/1e6);
+    return &c;
+}
+
+void ggml_cuda_mapped_cache_forget(const void * base, const size_t size) {
+    std::lock_guard<std::mutex> lock(mapped_cache_mtx);
+    for (auto it = mapped_caches.begin(); it != mapped_caches.end();) {
+        const char * p = (const char *) it->first;
+        if (p >= (const char *) base && p < (const char *) base + size) {
+            if (it->second.rows) {
+                CUDA_CHECK(cudaFree(it->second.rows));
+                CUDA_CHECK(cudaFree(it->second.slot_of));
+                CUDA_CHECK(cudaFree(it->second.n_used));
+            }
+            it = mapped_caches.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -453,6 +614,38 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    // a quantized table in mapped host memory: its picked rows come into VRAM first, then the same kernel dequantizes
+    // them there (the same bytes, so the same values). GGML_CUDA_MAPPED_NO_STAGE=1 reads the table in place.
+    static const bool no_stage = getenv("GGML_CUDA_MAPPED_NO_STAGE") != nullptr;
+    const size_t row_bytes = ggml_row_size(src0->type, ne00);
+    if (!no_stage && ggml_is_quantized(src0->type) && ggml_cuda_buffer_is_mapped(src0->buffer) &&
+            ne02 == 1 && ne03 == 1 && ne11 == 1 && ne12 == 1 && ne10 > 0 &&
+            row_bytes % sizeof(uint32_t) == 0 && nb01 % sizeof(uint32_t) == 0 && ((uintptr_t) src0->data) % sizeof(uint32_t) == 0) {
+        const int64_t n_words = (int64_t) (row_bytes / sizeof(uint32_t));
+        const int64_t s10     = (int64_t) (nb10 / sizeof(int32_t));
+        ggml_cuda_pool_alloc<uint32_t> stage(ctx.pool(), (size_t) ne10*n_words);
+        ggml_cuda_pool_alloc<int32_t>  iota (ctx.pool(), (size_t) ne10);
+        ggml_cuda_pool_alloc<int32_t>  plan (ctx.pool());
+        const mapped_row_cache * cache = mapped_cache_get(stream, src0->data, ne01, row_bytes);
+        if (cache != nullptr) {
+            plan.alloc((size_t) ne10);
+            k_cache_plan<<<(unsigned int) ((ne10 + 127) / 128), 128, 0, stream>>>((const int32_t *) src1->data, s10, ne10, cache->slot_of,
+                    cache->n_used, cache->cap, plan.get());
+        }
+        // the words of a row plus up to a line's worth before it
+        const unsigned int n_chunks = (unsigned int) ((n_words + 32 + STAGE_CHUNK - 1) / STAGE_CHUNK);
+        k_stage_rows<<<dim3((unsigned int) ne10, n_chunks, 1), STAGE_THREADS, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data,
+                s10, nb01, n_words, stage.get(), iota.get(), cache ? plan.get() : nullptr, cache ? cache->rows : nullptr, cache ? cache->words : 0);
+        CUDA_CHECK(cudaGetLastError());
+        if (cache != nullptr) {
+            k_cache_publish<<<(unsigned int) ((ne10 + 127) / 128), 128, 0, stream>>>((const int32_t *) src1->data, s10, ne10, plan.get(), cache->slot_of);
+        }
+        get_rows_cuda(stage.get(), src0->type, iota.get(), dst->data, dst->type,
+            ne00, row_bytes, row_bytes*ne10, row_bytes*ne10, ne10, 1, 1,
+            sizeof(int32_t), sizeof(int32_t)*ne10, sizeof(int32_t)*ne10, nb1, nb2, nb3, stream);
+        return;
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

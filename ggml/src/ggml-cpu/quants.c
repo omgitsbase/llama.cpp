@@ -62,6 +62,34 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_f8_e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8_e4m3_ref(x, (uint8_t *) y, k);
+}
+
+// FP8 E4M3 weights against F32 activations, through a table of the 256 values
+void ggml_vec_dot_f8_e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    static float table[256];
+    static bool  table_ready = false;
+    if (!table_ready) {
+        for (int i = 0; i < 256; ++i) {
+            table[i] = ggml_e4m3_to_fp32((uint8_t) i);
+        }
+        table_ready = true;
+    }
+    const uint8_t * GGML_RESTRICT x = (const uint8_t *) vx;
+    const float   * GGML_RESTRICT y = (const float *) vy;
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += (double) (table[x[i]]*y[i]);
+    }
+    *s = (float) sum;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

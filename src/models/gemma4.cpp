@@ -159,7 +159,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // the head's device copy of the tied table, unless an adapter patches the table itself
+    inpL = build_inp_embd(loras && !loras->empty() ? model.tok_embd : llm_gather_table(model.tok_embd, model.output));
 
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
     inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
@@ -209,6 +210,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         // this is to mirror Gemma4Attention in pytorch code
         ggml_tensor * qkv_fused = nullptr;
         ggml_tensor * Qcur;
+        ggml_tensor * Kcur = nullptr;
+        ggml_tensor * Vcur = nullptr;
         if (model.layers[il].wqkv) {
             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
             cb(qkv_fused, "wqkv", il);
@@ -216,6 +219,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+            // the k and v projections go into the graph right after q's (the graph takes nodes in dependency
+            // order otherwise, with q's norm and rope between), so that a backend can launch the three as one
+            if (hparams.has_kv(il)) {
+                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+                Vcur = model.layers[il].wv
+                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
+                       : Kcur; // if v_proj is not present, use Kcur as Vcur
+                ggml_build_forward_expand(gf, Qcur);
+                ggml_build_forward_expand(gf, Kcur);
+                ggml_build_forward_expand(gf, Vcur);
+            }
         }
         {
             cb(Qcur, "Qcur", il);
@@ -232,8 +246,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // self-attention
         if (hparams.has_kv(il)) {
-            ggml_tensor * Kcur;
-            ggml_tensor * Vcur;
             if (qkv_fused) {
                 const int64_t q_dim = n_embd_head * n_head;
                 const int64_t k_dim = n_embd_head * n_head_kv;
@@ -241,11 +253,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 const size_t  esize = ggml_element_size(qkv_fused);
                 Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
                 Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
-            } else {
-                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-                Vcur = model.layers[il].wv
-                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
-                       : Kcur; // if v_proj is not present, use Kcur as Vcur
             }
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
@@ -449,7 +456,10 @@ public:
             if (prefetch) {
                 llama_prefetch_rows(ple, ubatch->token, ubatch->n_tokens);
             }
-            ggml_backend_tensor_set(tokens, ubatch->token, 0, ubatch->n_tokens * ggml_element_size(tokens));
+            // rows a drafter fills on the device come through the token embedding's input, see build_inp_per_layer
+            if (!dev_tokens) {
+                ggml_backend_tensor_set(tokens, ubatch->token, 0, ubatch->n_tokens * ggml_element_size(tokens));
+            }
         } else if (prefetch) {
             // [TAG_GEMMA4_IMG_PADDING]
             const int32_t padding = 0;
@@ -462,6 +472,7 @@ public:
     }
 
     ggml_tensor * tokens = nullptr;
+    bool dev_tokens = false;
 
     const llama_model & model;
 };
@@ -474,9 +485,16 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
     ggml_tensor * inp_per_layer;
     float tok_embd_scale = sqrtf((float) n_embd_per_layer);
     if (ubatch.token) {
-        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-        ggml_set_input(inp->tokens);
-        res->t_inp_tokens = inp->tokens;
+        if (tokens_dev && tokens_dev->use_dev(ubatch) && res->t_inp_tokens) {
+            // a batch whose drafted rows a drafter fills on the device: the ids are the token embedding's, which
+            // reads the device rows; a tensor of the host's placeholders here would look the wrong rows up
+            inp->tokens     = res->t_inp_tokens;
+            inp->dev_tokens = true;
+        } else {
+            inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+            ggml_set_input(inp->tokens);
+            res->t_inp_tokens = inp->tokens;
+        }
 
         inp_per_layer = ggml_get_rows  (ctx0, model.per_layer_tok_embd, inp->tokens);
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);

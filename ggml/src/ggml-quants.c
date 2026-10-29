@@ -2311,6 +2311,25 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
 }
 
+// FP8 E4M3 values, one byte each; a checkpoint's scales (per row, per tensor) are tensors of their own
+void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_fp32_to_e4m3(x[i]);
+    }
+}
+
+void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_e4m3_to_fp32(x[i]);
+    }
+}
+
+size_t quantize_f8_e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_f8_e4m3_ref(src, (uint8_t *) dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_F8_E4M3, n_per_row);
+}
+
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
 
 void quantize_row_tq1_0_ref(const float * GGML_RESTRICT x, block_tq1_0 * GGML_RESTRICT y, int64_t k) {
@@ -5617,6 +5636,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 // UE4M3 scales are uint8_t — all byte values are valid
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_F8_E4M3:
+            {
+                const uint8_t * q = (const uint8_t *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if ((q[i] & 0x7F) == 0x7F) {
+                        fprintf(stderr, "%s: found nan value at value %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q2_K:
             {

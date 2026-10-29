@@ -1146,3 +1146,177 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+// The epilogue of a fused q/k/v projection in one launch, as vLLM's compiled Gemma 4 attention input does it: the
+// product's token and row scales (an FP8 GEMM's, or none), each head's RMS norm, the q and k norms' weights and rope,
+// q into its tensor and k and v straight into their cache rows. A block per (head, token); the arithmetic of
+// rms_norm_mul_rope_f32 for q and k, of the RMS norm for v.
+template <int block_size, bool has_ff, typename cache_t>
+static __global__ void qkv_norm_rope_store_f32(
+        const float * __restrict__ d, const int64_t ld_d,
+        const float * __restrict__ s_tok, const float * __restrict__ s_row, const float * __restrict__ s_t,
+        const int hd, const int n_q, const int n_k,
+        const float eps_q, const float eps_k, const float eps_v,
+        const float * __restrict__ wq, const float * __restrict__ wk,
+        float * __restrict__ q_out,
+        cache_t * __restrict__ k_cache, const int64_t * __restrict__ k_idx, const int64_t k_stride,
+        cache_t * __restrict__ v_cache, const int64_t * __restrict__ v_idx, const int64_t v_stride,
+        const float k_mul, const float k_add, const float v_mul, const float v_add,
+        const int n_dims, const int32_t * __restrict__ pos, const float freq_scale, const float ext_factor,
+        const float attn_factor, const rope_corr_dims corr_dims, const float theta_scale,
+        const float * __restrict__ freq_factors, const bool is_neox) {
+    const int     slot = blockIdx.x;
+    const int64_t t    = blockIdx.y;
+    const int     tid  = threadIdx.x;
+
+    int     kind;
+    int     h;
+    int64_t col0;
+    if (slot < n_q) {
+        kind = 0; h = slot;             col0 = (int64_t) h*hd;
+    } else if (slot < n_q + n_k) {
+        kind = 1; h = slot - n_q;       col0 = (int64_t) (n_q + h)*hd;
+    } else {
+        kind = 2; h = slot - n_q - n_k; col0 = (int64_t) (n_q + n_k + h)*hd;
+    }
+
+    extern __shared__ float s_sum[];
+    float * xs = s_sum + 32;
+
+    const float * x  = d + t*ld_d + col0;
+    const float   st = (s_tok ? s_tok[t] : 1.0f) * (s_t ? s_t[0] : 1.0f);
+    float tmp = 0.0f;
+    for (int i = tid; i < hd; i += block_size) {
+        float v = x[i];
+        // fp8_scale_out's order: the row's scale times the token's, then the product
+        if (s_tok || s_row || s_t) {
+            v *= s_row ? s_row[col0 + i]*st : st;
+        }
+        xs[i] = v;
+        tmp += v*v;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = ggml_cuda_rms_scale(tmp, hd, kind == 0 ? eps_q : kind == 1 ? eps_k : eps_v);
+    __syncthreads();
+
+    // an FP8 cache's rows take the SCALE before its SET_ROWS (scale_f32's arithmetic), then E4M3
+    auto store = [](const float y, const float mul, const float add) -> cache_t {
+        if constexpr (std::is_same_v<cache_t, half>) {
+            return __float2half(y);
+        } else {
+            return __nv_fp8_e4m3(mul * y + add);
+        }
+    };
+
+    if (kind == 2) {
+        cache_t * dst = v_cache + v_idx[t]*v_stride + (int64_t) h*hd;
+        for (int i = tid; i < hd; i += block_size) {
+            dst[i] = store(scale * xs[i], v_mul, v_add);
+        }
+        return;
+    }
+
+    const float * w = kind == 0 ? wq : wk;
+    for (int i0 = 2*tid; i0 < hd; i0 += 2*block_size) {
+        int ix0;
+        int ix1;
+        if (is_neox && i0 < n_dims) {
+            ix0 = i0/2;
+            ix1 = i0/2 + n_dims/2;
+        } else {
+            ix0 = i0 + 0;
+            ix1 = i0 + 1;
+        }
+        const float x0 = scale * xs[ix0] * w[ix0];
+        const float x1 = scale * xs[ix1] * w[ix1];
+        float y0 = x0;
+        float y1 = x1;
+        if (i0 < n_dims) {
+            const float theta_base  = pos[t]*powf(theta_scale, i0/2.0f);
+            const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+            float cos_theta;
+            float sin_theta;
+            rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+            y0 = x0*cos_theta - x1*sin_theta;
+            y1 = x0*sin_theta + x1*cos_theta;
+        }
+        if (kind == 0) {
+            float * dst = q_out + (t*n_q + h)*hd;
+            dst[ix0] = y0;
+            dst[ix1] = y1;
+        } else {
+            cache_t * dst = k_cache + k_idx[t]*k_stride + (int64_t) h*hd;
+            dst[ix0] = store(y0, k_mul, k_add);
+            dst[ix1] = store(y1, k_mul, k_add);
+        }
+    }
+}
+
+void ggml_cuda_qkv_norm_rope_store(ggml_backend_cuda_context & ctx, const float * d, const int64_t ld_d,
+        const float * s_tok, const float * s_row, const float * s_t, const int hd, const int n_q, const int n_k, const int64_t n_tok,
+        const ggml_tensor * norm_q, const ggml_tensor * norm_k, const ggml_tensor * norm_v,
+        const float * wq, const float * wk, float * q_out,
+        void * k_cache, const int64_t * k_idx, const int64_t k_stride, void * v_cache, const int64_t * v_idx, const int64_t v_stride,
+        const ggml_tensor * rope, const bool f8, const float k_mul, const float k_add, const float v_mul, const float v_add) {
+    float eps_q;
+    float eps_k;
+    float eps_v;
+    memcpy(&eps_q, norm_q->op_params, sizeof(float));
+    memcpy(&eps_k, norm_k->op_params, sizeof(float));
+    memcpy(&eps_v, norm_v->op_params, sizeof(float));
+
+    const int n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int mode       = ((const int32_t *) rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    GGML_ASSERT(mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE);
+    const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
+
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+
+    const int32_t * pos          = (const int32_t *) rope->src[1]->data;
+    const float   * freq_factors = rope->src[2] ? (const float *) rope->src[2]->data : nullptr;
+
+    constexpr int block_size = 256; // the unfused norms' block below 1024 columns, so the sums reduce in the same order
+    const dim3 grid((unsigned) (n_q + 2*n_k), (unsigned) n_tok, 1);
+    const size_t smem = (32 + hd)*sizeof(float);
+    cudaStream_t stream = ctx.stream();
+    auto launch = [&](auto has_ff, auto * cache) {
+        using cache_t = std::remove_pointer_t<decltype(cache)>;
+        qkv_norm_rope_store_f32<block_size, decltype(has_ff)::value, cache_t><<<grid, block_size, smem, stream>>>(d, ld_d, s_tok, s_row, s_t,
+            hd, n_q, n_k, eps_q, eps_k, eps_v, wq, wk, q_out,
+            (cache_t *) k_cache, k_idx, k_stride, (cache_t *) v_cache, v_idx, v_stride, k_mul, k_add, v_mul, v_add,
+            n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, is_neox);
+    };
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (f8) {
+        if (freq_factors) {
+            launch(std::true_type{}, (__nv_fp8_e4m3 *) nullptr);
+        } else {
+            launch(std::false_type{}, (__nv_fp8_e4m3 *) nullptr);
+        }
+    } else
+#endif
+    {
+        GGML_ASSERT(!f8);
+        if (freq_factors) {
+            launch(std::true_type{}, (half *) nullptr);
+        } else {
+            launch(std::false_type{}, (half *) nullptr);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

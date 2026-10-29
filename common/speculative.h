@@ -79,6 +79,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// whether the batch common_speculative_process is about to see is the step's last decode: a drafter may then leave
+// the target's hidden rows on the device for its next draft instead of reading them back; returns whether one will
+// (the target then need not read them back, see llama_set_embd_nextn_readback)
+bool common_speculative_set_last_decode(common_speculative * spec, bool last);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

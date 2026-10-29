@@ -1376,3 +1376,32 @@ class IQ4_XS(__Quant, qtype=GGMLQuantizationType.IQ4_XS):
         qs = np.take_along_axis(kvalues, qs, axis=-1).astype(np.float32).reshape((n_blocks, -1, 32))
 
         return (dl * qs).reshape((n_blocks, -1))
+
+
+class F8_E4M3(__Quant, qtype=GGMLQuantizationType.F8_E4M3):
+    # FP8 E4M3 (E4M3FN: bias 7, no infinities, S.1111.111 is NaN), one byte a value; scales are separate tensors
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        x = blocks.astype(np.float32)
+        sign = np.where(np.signbit(x), np.uint8(0x80), np.uint8(0))
+        a = np.minimum(np.abs(x), np.float32(448.0))
+        m, e = np.frexp(a)  # a = m * 2^e, m in [0.5, 1)
+        exp = (e - 1 + 7).astype(np.int32)
+        man = np.rint((2.0 * m - 1.0) * 8.0).astype(np.int32)
+        carry = man == 8
+        man = np.where(carry, 0, man)
+        exp = np.where(carry, exp + 1, exp)
+        normal = ((exp << 3) | man).astype(np.uint8)
+        sub = np.rint(a * 512.0).astype(np.uint8)
+        q = np.where(a < 2.0 ** -6, sub, normal)
+        return (q | sign).astype(np.uint8).reshape(blocks.shape[0], -1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        x = blocks.astype(np.uint8)
+        exp = ((x >> 3) & 0xF).astype(np.int32)
+        man = (x & 0x7).astype(np.float32)
+        v = np.where(exp == 0, man * 2.0 ** -9, (1.0 + man / 8.0) * np.exp2(exp.astype(np.float32) - 7))
+        v = np.where((x & 0x7F) == 0x7F, np.nan, v)
+        return np.where(x & 0x80, -v, v).astype(np.float32)

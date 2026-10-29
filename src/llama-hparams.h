@@ -372,6 +372,11 @@ struct llama_hparams {
     enum llm_ffn_op_type llm_ffn_op;
 
     // Step35: optional per-layer clamps for (Swi)GLU
+    // an FP8 KV cache's static scale per layer (llm-compressor's kv_cache_scheme): cached k = k/scale_k,
+    // v = v/scale_v; 0 when the model has none
+    std::array<float, LLAMA_MAX_LAYERS> kv_cache_scale_k;
+    std::array<float, LLAMA_MAX_LAYERS> kv_cache_scale_v;
+
     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp; // clamping for expert FFN
     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert
 

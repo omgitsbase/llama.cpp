@@ -1940,7 +1940,7 @@ void ggml_cuda_op_mul_mat_vec_q(
 // launches a pair, or with wave_rows set returns the rows one wave covers. Four member slots: with two, nvcc picks the
 // member through the parameters' address and the loads lose their global address space
 template <ggml_type type, int ncols_dst, bool small_k>
-static void mul_mat_vec_q_pair_launch(const void * vy, const uint32_t ncols_x, const uint32_t stride_col_y, const mmvq_member * mb,
+static void mul_mat_vec_q_pair_launch(const void * vy, const uint32_t ncols_x, const uint32_t stride_col_y, const mmvq_member * mb, const int n,
         const int nwarps, const int rows_per_block, const int device, const int warp_size, cudaStream_t stream, int64_t * wave_rows) {
     const auto kernel = mul_mat_vec_q_members<type, ncols_dst, small_k, 4>;
     if (wave_rows) {
@@ -1949,13 +1949,14 @@ static void mul_mat_vec_q_pair_launch(const void * vy, const uint32_t ncols_x, c
         *wave_rows = (int64_t) blocks_per_sm * ggml_cuda_info().devices[device].nsm * rows_per_block;
         return;
     }
-    const mmvq_members<4> g = {{ mb[0], mb[1], mb[1], mb[1] }};
-    const ggml_cuda_kernel_launch_params launch_params(dim3(mb[1].block_end, 1, 1), dim3(warp_size, nwarps, 1), 0, stream);
+    // the slots past the last member repeat it: their blocks start where the grid ends
+    const mmvq_members<4> g = {{ mb[0], mb[n > 1 ? 1 : 0], mb[n > 2 ? 2 : n - 1], mb[n > 3 ? 3 : n - 1] }};
+    const ggml_cuda_kernel_launch_params launch_params(dim3(mb[n - 1].block_end, 1, 1), dim3(warp_size, nwarps, 1), 0, stream);
     ggml_cuda_kernel_launch(kernel, launch_params, vy, ncols_x, stride_col_y, g);
 }
 
 template <ggml_type type>
-static void mul_mat_vec_q_pair_switch_ncols_dst(const void * vy, const uint32_t ncols_x, const uint32_t stride_col_y, mmvq_member * mb,
+static void mul_mat_vec_q_pair_switch_ncols_dst(const void * vy, const uint32_t ncols_x, const uint32_t stride_col_y, mmvq_member * mb, const int n,
         const int ncols_dst, const int device, cudaStream_t stream, int64_t * wave_rows) {
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
@@ -1964,30 +1965,32 @@ static void mul_mat_vec_q_pair_switch_ncols_dst(const void * vy, const uint32_t 
     const int  nwarps  = calc_nwarps(type, ncols_dst, table_id);
     const int  rpb     = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     mb[0].block_end = (mb[0].nrows + rpb - 1) / rpb;
-    mb[1].block_end = mb[0].block_end + (mb[1].nrows + rpb - 1) / rpb;
+    for (int k = 1; k < n; ++k) {
+        mb[k].block_end = mb[k - 1].block_end + (mb[k].nrows + rpb - 1) / rpb;
+    }
     switch (ncols_dst) {
         case 1:
             if (small_k) {
-                mul_mat_vec_q_pair_launch<type, 1, true>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows);
+                mul_mat_vec_q_pair_launch<type, 1, true>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows);
             } else {
-                mul_mat_vec_q_pair_launch<type, 1, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows);
+                mul_mat_vec_q_pair_launch<type, 1, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows);
             }
             break;
-        case 2: mul_mat_vec_q_pair_launch<type, 2, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows); break;
-        case 3: mul_mat_vec_q_pair_launch<type, 3, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows); break;
-        case 4: mul_mat_vec_q_pair_launch<type, 4, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows); break;
-        case 5: mul_mat_vec_q_pair_launch<type, 5, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows); break;
-        case 6: mul_mat_vec_q_pair_launch<type, 6, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows); break;
-        case 7: mul_mat_vec_q_pair_launch<type, 7, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows); break;
-        case 8: mul_mat_vec_q_pair_launch<type, 8, false>(vy, ncols_x, stride_col_y, mb, nwarps, rpb, device, warp_size, stream, wave_rows); break;
+        case 2: mul_mat_vec_q_pair_launch<type, 2, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows); break;
+        case 3: mul_mat_vec_q_pair_launch<type, 3, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows); break;
+        case 4: mul_mat_vec_q_pair_launch<type, 4, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows); break;
+        case 5: mul_mat_vec_q_pair_launch<type, 5, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows); break;
+        case 6: mul_mat_vec_q_pair_launch<type, 6, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows); break;
+        case 7: mul_mat_vec_q_pair_launch<type, 7, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows); break;
+        case 8: mul_mat_vec_q_pair_launch<type, 8, false>(vy, ncols_x, stride_col_y, mb, n, nwarps, rpb, device, warp_size, stream, wave_rows); break;
         default: GGML_ABORT("fatal error");
     }
 }
 
 static void mul_mat_vec_q_pair_switch_type(const ggml_type type, const void * vy, const uint32_t ncols_x, const uint32_t stride_col_y,
-        mmvq_member * mb, const int ncols_dst, const int device, cudaStream_t stream, int64_t * wave_rows) {
+        mmvq_member * mb, const int n, const int ncols_dst, const int device, cudaStream_t stream, int64_t * wave_rows) {
     switch (type) {
-#define MMVQ_PAIR_CASE(t) case t: mul_mat_vec_q_pair_switch_ncols_dst<t>(vy, ncols_x, stride_col_y, mb, ncols_dst, device, stream, wave_rows); break;
+#define MMVQ_PAIR_CASE(t) case t: mul_mat_vec_q_pair_switch_ncols_dst<t>(vy, ncols_x, stride_col_y, mb, n, ncols_dst, device, stream, wave_rows); break;
         MMVQ_PAIR_CASE(GGML_TYPE_Q1_0)
         MMVQ_PAIR_CASE(GGML_TYPE_Q2_0)
         MMVQ_PAIR_CASE(GGML_TYPE_Q4_0)
@@ -2148,17 +2151,22 @@ bool ggml_cuda_mmvq_pair_ok(const ggml_tensor * a, const ggml_tensor * b, int de
             wave_rows = it->second;
         } else {
             mmvq_member mb[2] = { mmvq_member_of(a), mmvq_member_of(b) };
-            mul_mat_vec_q_pair_switch_type(type, nullptr, a->src[1]->ne[0], 0, mb, ncols, device, nullptr, &wave_rows);
+            mul_mat_vec_q_pair_switch_type(type, nullptr, a->src[1]->ne[0], 0, mb, 2, ncols, device, nullptr, &wave_rows);
             wave_rows_cache[key] = wave_rows;
         }
     }
     return a->src[0]->ne[1] <= wave_rows && b->src[0]->ne[1] <= wave_rows;
 }
 
-void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b, ggml_cuda_norm_fold * fold) {
+void ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, const ggml_tensor * const * nodes, const int n, ggml_cuda_norm_fold * fold) {
+    GGML_ASSERT(n >= 2 && n <= 4);
+    const ggml_tensor * a    = nodes[0];
     const ggml_tensor * src1 = a->src[1];
     const ggml_type     type = a->src[0]->type;
-    GGML_ASSERT(b->src[1] == src1 && b->src[0]->type == type && a->src[0]->ne[0] == src1->ne[0] && b->src[0]->ne[0] == src1->ne[0]);
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * b = nodes[k];
+        GGML_ASSERT(b->src[1] == src1 && b->src[0]->type == type && b->src[0]->ne[0] == src1->ne[0]);
+    }
     cudaStream_t stream = ctx.stream();
 
     const int64_t ne10 = src1->ne[0];
@@ -2188,6 +2196,14 @@ void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_te
         quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q8, type, ne10, s11_src, s12_src, s13_src, ne10_padded, ne11, 1, 1, stream);
     }
 
-    mmvq_member mb[2] = { mmvq_member_of(a), mmvq_member_of(b) };
-    mul_mat_vec_q_pair_switch_type(type, q8, ne10, ne10_padded / QK8_1, mb, ne11, ctx.device, stream, nullptr);
+    mmvq_member mb[4] = {};
+    for (int k = 0; k < n; ++k) {
+        mb[k] = mmvq_member_of(nodes[k]);
+    }
+    mul_mat_vec_q_pair_switch_type(type, q8, ne10, ne10_padded / QK8_1, mb, n, ne11, ctx.device, stream, nullptr);
+}
+
+void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b, ggml_cuda_norm_fold * fold) {
+    const ggml_tensor * nodes[2] = { a, b };
+    ggml_cuda_mul_mat_vec_q_group(ctx, nodes, 2, fold);
 }

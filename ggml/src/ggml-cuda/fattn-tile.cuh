@@ -797,6 +797,7 @@ static __global__ void flash_attn_tile(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_strm_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -825,7 +826,7 @@ static __global__ void flash_attn_tile(
     // Skip unused kernel variants for faster compilation:
 
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_strm_ptr, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -854,8 +855,8 @@ static __global__ void flash_attn_tile(
     const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
-    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+    const half2 * K_h2 = (const half2 *) (K + nb13*(KV_strm_ptr ? KV_strm_ptr[sequence] : sequence) + nb12*(head0 / gqa_ratio));
+    const half2 * V_h2 = (const half2 *) (V + nb23*(KV_strm_ptr ? KV_strm_ptr[sequence] : sequence) + nb22*(head0 / gqa_ratio)); // K and V have same shape
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
@@ -1091,7 +1092,8 @@ static __global__ void flash_attn_tile(
             return;
         }
 
-        const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
+        // every cell masked: nothing to attend to
+        const float scale = gridDim.y == 1 ? (KQ_sum[jc0] > 0.0f ? 1.0f/KQ_sum[jc0] : 0.0f) : 1.0f;
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + j)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
 
@@ -1132,7 +1134,7 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_strm_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

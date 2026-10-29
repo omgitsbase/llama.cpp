@@ -21,6 +21,8 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
     int32_t  mtp_chain = 0;          // DECODER_MTP: draft steps per graph, see llama_set_mtp_chain
+    bool     mtp_dev_anchors = false; // a round over the target's cache takes its anchors on the device, see llama_set_mtp_dev_anchors
+    bool     kq_mask_strict  = false; // a row sees only the cells before its position (the round's candidate anchors)
 
     float rope_freq_base;
     float rope_freq_scale;

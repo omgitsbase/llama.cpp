@@ -1,5 +1,7 @@
 #include "llama-batch.h"
 
+#include <map>
+
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-memory.h"
@@ -507,7 +509,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool gaps) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -536,7 +538,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
         // accept only increasing sequence ids
         if (sequential) {
-            add = add && (cur_seq_set.empty() || batch.seq_id[i][0] == last_seq_id + 1);
+            add = add && (cur_seq_set.empty() ||
+                    (gaps ? batch.seq_id[i][0] > last_seq_id : batch.seq_id[i][0] == last_seq_id + 1));
         }
 
         if (add) {
@@ -744,6 +747,63 @@ void llama_batch_allocr::clear() {
     seq_set_map.clear();
 
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
+}
+
+std::vector<llama_ubatch> llama_batch_allocr::split_groups(uint32_t n_ubatch) {
+    std::vector<llama_ubatch> res;
+
+    if (has_cpl || (uint32_t) batch.n_tokens > n_ubatch || batch.n_tokens == 0) {
+        return res;
+    }
+
+    // each sequence's tokens must be one run of the batch: the groups' rows, one after the other, are then the
+    // batch's own rows in its own order (outputs and hidden rows are read by batch index)
+    struct run { llama_seq_id seq; int32_t i0; int32_t n; };
+    std::vector<run> runs;
+    std::vector<bool> seen(LLAMA_MAX_SEQ, false);
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (used[i] || batch.n_seq_id[i] != 1) {
+            return res;
+        }
+        const llama_seq_id seq = batch.seq_id[i][0];
+        if (!runs.empty() && runs.back().seq == seq) {
+            runs.back().n++;
+            continue;
+        }
+        if (seen[seq]) {
+            return res;
+        }
+        seen[seq] = true;
+        runs.push_back({ seq, i, 1 });
+    }
+
+    // consecutive runs of one length and increasing sequence ids form a group (an equal-length ubatch)
+    std::vector<std::pair<size_t, size_t>> groups; // [first run, end run)
+    for (size_t r = 0; r < runs.size(); ++r) {
+        if (groups.empty() || runs[r].n != runs[r - 1].n || runs[r].seq <= runs[r - 1].seq) {
+            groups.push_back({ r, r + 1 });
+        } else {
+            groups.back().second = r + 1;
+        }
+    }
+    // a graph holds at most 16 groups (llm_graph_context::build_inp_strm)
+    if (groups.size() < 2 || groups.size() > 16) {
+        return res;
+    }
+
+    for (const auto & [r0, r1] : groups) {
+        std::vector<int32_t> idxs;
+        for (size_t r = r0; r < r1; ++r) {
+            for (int32_t k = 0; k < runs[r].n; ++k) {
+                idxs.push_back(runs[r].i0 + k);
+                used[runs[r].i0 + k] = true;
+                ++n_used;
+            }
+        }
+        res.push_back(ubatch_add(idxs, (uint32_t) (r1 - r0), true));
+    }
+
+    return res;
 }
 
 llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {

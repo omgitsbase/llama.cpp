@@ -108,6 +108,11 @@ struct server_context {
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
 
+    // Run requests through the serving path before the server reports ready, as vLLM captures a graph for every batch
+    // size at load: every slot count from n_parallel down to 1, prompt chunks beside a verify, each shape twice so its
+    // CUDA graph is captured. Blocks until done; the loop must be running (call from another thread).
+    void warmup_traffic();
+
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
 };

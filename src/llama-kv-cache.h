@@ -141,6 +141,7 @@ public:
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
+    bool seq_cp_prefix(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n, ggml_backend_t backend) override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
@@ -161,6 +162,10 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+
+    // with several streams, let a ubatch skip idle sequences; the model's attention must read the cache through
+    // build_attn_mha and build_attn_inp_kq_mask, which cover the streams from its first sequence to its last
+    void set_split_gaps(bool v) { split_gaps = v; }
 
     bool get_has_shift() const;
 
@@ -197,6 +202,9 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // the scales of the FP8 cache layer il reads ({0, 0}: none, or not a layer of this cache)
+    std::pair<float, float> get_kv_scales(int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -236,7 +244,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool strict = false) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -267,12 +275,18 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // an FP8 cache's static scales (llama_hparams::kv_cache_scale_k/_v of the layer that writes it, 0: none)
+        float scale_k = 0.0f;
+        float scale_v = 0.0f;
     };
 
     bool v_trans = true;  // the value tensor is transposed
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+
+    bool split_gaps = false;
 
     // required padding
     const uint32_t n_pad = 1;
@@ -401,13 +415,35 @@ public:
     // llama_kv_cache_context specific API
     //
 
+    // a grouped batch (llama_kv_cache_iswa_context): every ubatch is applied before the one forward over them, and
+    // each group's attention reads the cache through a view of its own ubatch
+    bool apply_at(size_t i);
+    std::unique_ptr<llama_kv_cache_context> make_view(size_t i) const;
+
+    // a ubatch's K/V as a view from stream 0, a stream per sequence: the attention reads each sequence's stream from an
+    // input (get_streams), as vLLM's attention reads a sequence's blocks from its block table. The graph is the same
+    // whichever streams the sequences have, and no stream between them is computed.
+    ggml_tensor * get_k_stream0(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_stream0(ggml_context * ctx, int32_t il) const;
+    const std::vector<llama_seq_id> & get_streams() const;
+
+    // n_kv cells of stream 0 as one stream: the variable-length attention reads each tile's stream from its table
+    ggml_tensor * get_k_varlen(ggml_context * ctx, int32_t il, uint32_t n_kv) const;
+    ggml_tensor * get_v_varlen(ggml_context * ctx, int32_t il, uint32_t n_kv) const;
+
     uint32_t get_n_kv() const;
+
+    // the streams the current ubatch's attention covers: from its first sequence's to its last's
+    uint32_t get_n_stream_span() const;
+    uint32_t get_stream_s0() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+
+    std::pair<float, float> get_kv_scales(int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -432,7 +468,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool strict = false) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

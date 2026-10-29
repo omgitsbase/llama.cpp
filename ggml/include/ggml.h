@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_F8_E4M3 = 43, // FP8 E4M3 values as FP8 checkpoints store them; their scales are separate tensors
+        GGML_TYPE_COUNT   = 44,
     };
 
     // [TAG_GGML_PREC]
@@ -1495,6 +1496,11 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
+
+    // how many sequences the rows of a matrix multiplication's src1 come from (0: not said); a backend may pick another
+    // kernel for a batch of several, whose rounding then differs from one sequence's
+    GGML_API void    ggml_mul_mat_set_n_seqs(struct ggml_tensor * a, int32_t n_seqs);
+    GGML_API int32_t ggml_mul_mat_get_n_seqs(const struct ggml_tensor * a);
 
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(

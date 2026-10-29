@@ -181,6 +181,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // struct that contains llama context and inference
     server_context ctx_server;
 
+    // the start-up requests (server_context::warmup_traffic), joined when the loop ends
+    std::thread warmup_thread;
+
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");
@@ -484,7 +487,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         routes.update_meta(ctx_server);
-        ctx_http.is_ready.store(true);
+
+        // requests through the serving path build and capture the graphs first (LLAMA_NO_WARMUP_TRAFFIC=1 skips it);
+        // the server reports ready after them
+        if (params.n_parallel > 1 && !getenv("LLAMA_NO_WARMUP_TRAFFIC")) {
+            warmup_thread = std::thread([&]() {
+                ctx_server.warmup_traffic();
+                ctx_http.is_ready.store(true);
+            });
+        } else {
+            ctx_http.is_ready.store(true);
+        }
 
         SRV_INF("%s", "model loaded\n");
 
@@ -543,6 +556,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
+
+        if (warmup_thread.joinable()) {
+            warmup_thread.join();
+        }
 
         clean_up();
         if (ctx_http.thread.joinable()) {

@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <numeric>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -115,6 +116,34 @@ enum slot_state {
 
 struct server_slot; // forward declaration
 
+// the lengths a prompt chunk is padded to: vLLM's CUDA graph sizes (1, 2, 4, then every 8 to 256 and every 16 to
+// 512); a longer chunk's compute hides its launches, so it runs as it is
+// A prompt chunk's padded length: a few lengths only, so that the prompts of a run share one graph (a new
+// length is a graph build and capture, 10-15 ms with nothing on the device). Below 128 rows the forward costs
+// about the same as at 128, the weights being read either way. LLAMA_PROMPT_PAD_MIN overrides the floor.
+// A chunk no longer than a verify's rows (n_verify, a draft's length plus one) takes that length: beside the generating
+// slots' verifies it is one more run of their length in their group, where a cached prompt's last few tokens padded to
+// 128 rows doubled the step's rows.
+static int32_t prompt_pad_len(int32_t n, int32_t n_verify = 1) {
+    static const int32_t n_min = getenv("LLAMA_PROMPT_PAD_MIN") ? atoi(getenv("LLAMA_PROMPT_PAD_MIN")) : 128;
+    if (n <= n_verify) {
+        return n_verify;
+    }
+    if (n <= 2) {
+        return n;
+    }
+    if (n <= n_min) {
+        return n_min;
+    }
+    if (n <= 256) {
+        return 256;
+    }
+    if (n <= 512) {
+        return 512;
+    }
+    return (n + 63) & ~63;
+}
+
 struct server_batch {
     llama_batch batch;
     bool batch_rendered = false;
@@ -125,6 +154,7 @@ struct server_batch {
         llama_pos pos;
         bool output;
         bool is_prompt; // for stats tracking
+        bool is_pad = false; // a row after a prompt chunk that pads it to a graph's length, dropped after the decode
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -167,6 +197,23 @@ struct server_batch {
             return false;
         }
         tokens.push_back({ id_slot, token, pos, output, is_prompt });
+        return true;
+    }
+
+    bool add_pad(int32_t id_slot, llama_token token, llama_pos pos) {
+        if (!add(id_slot, token, pos, false, true)) {
+            return false;
+        }
+        tokens.back().is_pad = true;
+        return true;
+    }
+
+    // a pad row sampled like a verify row (a ghost slot's), dropped after the decode too
+    bool add_pad_out(int32_t id_slot, llama_token token, llama_pos pos) {
+        if (!add(id_slot, token, pos, true, false)) {
+            return false;
+        }
+        tokens.back().is_pad = true;
         return true;
     }
 
@@ -261,6 +308,10 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    llama_pos            ghost_pos0 = 0; // a ghost's rows start here, right after its cache
+    bool                 ghost_busy = false; // in a round as a ghost: the queue must not launch a task on it
+    common_sampler_ptr   smpl_ghost;     // the chain its rows sample with, one per round (a chain registers once)
+    llama_tokens         spec_out; // the last verify's accepted tokens, their bookkeeping done once the next draft is launched
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -303,13 +354,22 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // positions [0, n) copied from another slot's cache with every row a later query reads, the window's included
+    // (prompt_copy_prefix); the cache's window check need not look for a checkpoint for them
+    int32_t n_prefix_copied = 0;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
+        // the state's size is a walk over the slot's cells: an idle slot saved again each time a task launches
+        // (cache_idle_slots) is usually cached already
+        if (prompt.tokens.size() == 0 || prompt_cache.contains(prompt)) {
             return false;
         }
 
+        static const bool say_parts = getenv("LLAMA_STEP_LOG") != nullptr;
+        const int64_t tp0 = say_parts ? ggml_time_us() : 0;
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const int64_t tp1 = say_parts ? ggml_time_us() : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -320,10 +380,26 @@ struct server_slot {
         if (cur == nullptr) {
             return false;
         }
+        const int64_t tp2 = say_parts ? ggml_time_us() : 0;
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // the copies are queued beside the next decodes (into pinned memory; plain memory takes the blocking copy);
+        // the entry waits for them before it is read or reused
+        const llama_state_seq_flags fl_tgt = cur->data.main.pinned() ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl_tgt);
+        if (fl_tgt & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+            cur->data.main.set_async(ctx_tgt);
+        }
+        const int64_t tp3 = say_parts ? ggml_time_us() : 0;
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const llama_state_seq_flags fl_dft = cur->data.drft.pinned() ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, fl_dft);
+            if (fl_dft & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+                cur->data.drft.set_async(ctx_dft);
+            }
+        }
+        if (say_parts) {
+            fprintf(stderr, "[cache]   save parts: size %.2f alloc %.2f tgt %.2f dft %.2f ms (%.1f MB)\n", (tp1 - tp0) / 1000.0, (tp2 - tp1) / 1000.0,
+                    (tp3 - tp2) / 1000.0, (ggml_time_us() - tp3) / 1000.0, (cur_size_tgt + cur_size_dft) / 1e6);
         }
 
         return true;
@@ -397,6 +473,7 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_out.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -497,6 +574,8 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
+    bool pad_draft = false; // see update_slots: drafts padded to the full length while several slots generate
+
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
@@ -518,7 +597,9 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        if (n_remaining() > 0) {
+        // a padded draft keeps its full length to the end: the rows past the budget are verified and dropped, and
+        // the verify keeps one shape for every slot in it
+        if (n_remaining() > 0 && !pad_draft) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
@@ -593,6 +674,28 @@ struct server_slot {
 
         prompt.tokens.push_back(sampled);
         prompt.tokens.insert(spec_draft);
+    }
+
+    // a ghost's round: an anchor and n_max drafted tokens after its cache, verify rows like any slot's, dropped
+    // after the decode (see update_slots: padded rounds)
+    void add_ghost_rows(server_batch & batch, llama_token tok_anchor, int n_max) {
+        GGML_ASSERT(spec_i_batch.empty());
+        if ((int) spec_draft.size() < n_max) {
+            spec_draft.resize(n_max, tok_anchor);
+        }
+        for (auto & token : spec_draft) {
+            if (token < 0) {
+                token = tok_anchor;
+            }
+        }
+        llama_pos pos = ghost_pos0;
+        spec_i_batch.push_back(batch.size());
+        bool add_ok = batch.add_pad_out(id, tok_anchor, pos++);
+        for (auto token : spec_draft) {
+            spec_i_batch.push_back(batch.size());
+            add_ok &= batch.add_pad_out(id, token, pos++);
+        }
+        GGML_ASSERT(add_ok && "batch must be large enough to hold the ghost rows");
     }
 
     void release() {
@@ -1041,6 +1144,15 @@ private:
 
     int32_t n_ctx; // total context for all clients / slots
 
+    // prompt chunks padded to a few lengths, see update_slots; off with LLAMA_PROMPT_NO_PAD
+    bool        prompt_pad_on    = false;
+    // a verify's rows and the step's prompt chunks in one forward (llama_set_next_decode_grouped), as vLLM puts its
+    // decodes and prefills in one batch; LLAMA_NO_GROUPED=1 gives each prompt a decode of its own
+    bool        grouped_on       = false;
+    llama_token prompt_pad_token = 0;
+    common_params_sampling sp_ghost; // a greedy request's sampling, for the chain a ghost slot's rows sample with
+    std::vector<server_slot *> ghosts; // the round's ghosts, see update_slots
+
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
@@ -1266,6 +1378,22 @@ private:
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        prompt_pad_on = params_base.n_parallel > 1 && !llama_context_kv_unified(ctx_tgt) && !getenv("LLAMA_PROMPT_NO_PAD");
+        grouped_on    = prompt_pad_on && !getenv("LLAMA_NO_GROUPED");
+        prompt_pad_token = llama_vocab_pad(vocab) >= 0 ? llama_vocab_pad(vocab) : llama_vocab_eos(vocab) >= 0 ? llama_vocab_eos(vocab) : 0;
+        {
+            common_params_sampling sp = params_base.sampling;
+            sp.temp              = 0.0f;
+            sp.n_probs           = 0;
+            sp.penalty_repeat    = 1.0f;
+            sp.penalty_freq      = 0.0f;
+            sp.penalty_present   = 0.0f;
+            sp.dry_multiplier    = 0.0f;
+            sp.grammar = {};
+            sp.logit_bias.clear();
+            sp_ghost = sp;
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1679,6 +1807,118 @@ private:
             }
         }
 
+        // the prompt cache's states live in pinned memory: pinned now, for the cache's size
+        if (params_base.cache_ram_mib != 0) {
+            const int64_t t0 = ggml_time_us();
+            // the cache's size now, up to the pool's cap (common_state_buf_warm): a slab pinned while serving holds every
+            // CUDA call in the driver for its ~110 ms a GB (the decodes stop, once or twice a run as states pile up); the
+            // page-locked memory stays resident
+            const size_t bytes  = params_base.cache_ram_mib < 0 ? (4ull << 30) : (size_t) params_base.cache_ram_mib << 20;
+            const size_t pinned = common_state_buf_warm(bytes);
+            SRV_INF("state pool: %.1f of %.1f GB pinned in %.0f ms\n", pinned / 1e9, bytes / 1e9, (ggml_time_us() - t0) / 1000.0);
+        }
+
+        // As vLLM captures its graphs at load: each slot's prompt graph (a padded chunk on that slot's stream, one
+        // output row, greedy on the device) is built and its CUDA graph captured now, twice because the backend
+        // captures a shape on its second sight, instead of in the first request of every slot. LLAMA_NO_WARMUP_GRAPHS=1
+        // skips this.
+        if (prompt_pad_on && params_base.n_parallel > 1 && !getenv("LLAMA_NO_WARMUP_GRAPHS")) {
+            const int64_t t0 = ggml_time_us();
+            const int32_t n_rows = prompt_pad_len(8);
+            llama_batch wb = llama_batch_init(n_rows, 0, 1);
+            int n_ok = 0;
+            // every slot's chain is registered before the first decode: its reserve measures the worst case with all
+            // of them, and a greedy request's chain is then covered on every slot (no reserve, which would take the
+            // scheduler from the graphs built here)
+            std::vector<common_sampler_ptr> smpls;
+            for (auto & slot : slots) {
+                smpls.emplace_back(common_sampler_init(llama_get_model(ctx_tgt), sp_ghost));
+                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(smpls.back().get()));
+            }
+            // a chained MTP drafter leaves its drafts on the device from its first round on, and every small decode
+            // after that takes the device form of the token input: the graphs are built in that form now
+            if (spec && std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
+                llama_set_tokens_device_enable(ctx_tgt);
+            }
+            // a prompt's last chunk samples its last row; the chunks before it sample nothing (another graph)
+            for (int pass = 0; pass < 2; ++pass) {
+                for (auto & slot : slots) {
+                  for (int cls = 0; cls < 2; ++cls) {
+                    common_batch_clear(wb);
+                    for (int32_t i = 0; i < n_rows; ++i) {
+                        common_batch_add(wb, prompt_pad_token, i, { slot.id }, cls == 1 && i == n_rows - 1);
+                    }
+                    int ret = llama_decode(ctx_tgt, wb);
+                    // the drafter's pass over the chunk, as after a prompt chunk
+                    if (ret == 0 && spec && !common_speculative_process(spec.get(), wb)) {
+                        ret = -1;
+                    }
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                    if (ctx_dft) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                    }
+                    if (ret != 0) {
+                        SRV_WRN("graph warm-up: slot %d decode returned %d\n", slot.id, ret);
+                        break;
+                    }
+                    n_ok++;
+                  }
+                }
+            }
+            // The grouped forwards of a full server (verify rows of the other slots, one or two prompt chunks): a
+            // prompt group reads its stream from an input, so one graph per shape serves every slot
+            int n_grouped = 0;
+            if (grouped_on && spec && (int) slots.size() >= 4) {
+                const int K1 = std::max(1, params_base.speculative.draft.n_max) + 1; // a verify's rows per slot
+                for (int n_prompt = 1; n_prompt <= 2; ++n_prompt) {
+                    for (int32_t p_rows : { n_rows, prompt_pad_len(n_rows + 1) }) {
+                        if (n_prompt == 2 && p_rows != n_rows) {
+                            continue;
+                        }
+                        const int n_ver = (int) slots.size() - n_prompt;
+                        const int32_t n_all = n_ver*K1 + n_prompt*p_rows;
+                        if (n_all > (int32_t) llama_n_ubatch(ctx_tgt) || n_all > (int32_t) llama_n_batch(ctx_tgt)) {
+                            continue;
+                        }
+                        llama_batch gb = llama_batch_init(n_all, 0, 1);
+                        for (int pass = 0; pass < 2; ++pass) {
+                            common_batch_clear(gb);
+                            for (int sl = 0; sl < n_ver; ++sl) {
+                                for (int j = 0; j < K1; ++j) {
+                                    common_batch_add(gb, prompt_pad_token, j, { sl }, true);
+                                }
+                            }
+                            for (int pi = 0; pi < n_prompt; ++pi) {
+                                const int sl = n_ver + pi;
+                                for (int32_t i = 0; i < p_rows; ++i) {
+                                    common_batch_add(gb, prompt_pad_token, i, { sl }, i == p_rows - 1);
+                                }
+                            }
+                            llama_set_next_decode_grouped(ctx_tgt, true);
+                            const int ret = llama_decode(ctx_tgt, gb);
+                            for (auto & slot : slots) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                            }
+                            if (ret != 0) {
+                                SRV_WRN("graph warm-up: grouped decode returned %d\n", ret);
+                                break;
+                            }
+                            n_grouped++;
+                        }
+                        llama_batch_free(gb);
+                    }
+                }
+            }
+
+            for (auto & slot : slots) {
+                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            }
+            llama_batch_free(wb);
+            llama_synchronize(ctx_tgt);
+            SRV_INF("graph warm-up: %d prompt graphs of %d rows, %d grouped forwards, in %.1f s\n", n_ok, (int) n_rows, n_grouped, (ggml_time_us() - t0) / 1e6);
+        }
+
         return true;
     }
 
@@ -1731,8 +1971,8 @@ private:
                     continue;
                 }
 
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
+                // skip the slot if it is not available (a ghost's cache is in a round, see update_slots)
+                if (slot.is_processing() || slot.ghost_busy) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
@@ -1810,18 +2050,92 @@ private:
                 const int64_t t_start = ggml_time_us();
 
                 ret->prompt_save(*prompt_cache);
+                const int64_t t_save = ggml_time_us();
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
+                const int64_t t_load = ggml_time_us();
 
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                static const bool say = getenv("LLAMA_STEP_LOG") != nullptr;
+                if (say) {
+                    fprintf(stderr, "[cache] slot %d: save %.2f ms (%zu tokens) load %.2f ms update %.2f ms, at %lld\n", ret->id, (t_save - t_start) / 1000.0,
+                            ret->prompt.tokens.size(), (t_load - t_save) / 1000.0, (ggml_time_us() - t_load) / 1000.0, (long long) ggml_time_us());
+                }
+            }
+
+            // another slot's prefix is prompt reuse too: a request that turns caching off gets none
+            if (task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt) {
+                prompt_copy_prefix(*ret, task.tokens);
             }
         }
 
         return ret;
+    }
+
+    // vLLM's prefix cache hands a request the blocks any other request filled, a running one's included: the longest
+    // prefix of the new prompt another slot holds (a request with the same system prompt or question, still
+    // generating) is copied into this slot's cache when it is well ahead of what the slot kept. LLAMA_PREFIX_COPY=0
+    // turns it off.
+    void prompt_copy_prefix(server_slot & dst, const server_tokens & tokens) {
+        static const bool on = getenv("LLAMA_PREFIX_COPY") == nullptr || atoi(getenv("LLAMA_PREFIX_COPY")) != 0;
+        if (!on || tokens.has_mtmd || tokens.size() < 2 || dst.prompt.tokens.has_mtmd) {
+            return;
+        }
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        const size_t lcp_own = dst.prompt.tokens.get_common_prefix(tokens);
+
+        server_slot * src = nullptr;
+        size_t lcp_src = 0;
+        for (server_slot & s : slots) {
+            // a finished prompt's cells are final; a prompt still loading is not
+            if (&s == &dst || (s.state != SLOT_STATE_GENERATING && s.state != SLOT_STATE_IDLE) || s.prompt.tokens.has_mtmd) {
+                continue;
+            }
+            const llama_pos n_cells = llama_memory_seq_pos_max(mem, s.id) + 1;
+            const size_t l = std::min<size_t>(s.prompt.tokens.get_common_prefix(tokens), (size_t) std::max<llama_pos>(0, n_cells));
+            if (l > lcp_src) {
+                lcp_src = l;
+                src = &s;
+            }
+        }
+        // the prompt's last token is decoded again for its logits
+        lcp_src = std::min(lcp_src, tokens.size() - 1);
+        if (src == nullptr || lcp_src < 32 || lcp_src < lcp_own + 16) {
+            return;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        // a drafter with a cache of its own takes the same rows; one reading the target's has nothing to copy
+        llama_context * dft = ctx_dft && llama_get_ctx_other(ctx_dft) != ctx_tgt ? ctx_dft : nullptr;
+        // the cache save just queued still reads this slot's cells: the copies wait for it on the device
+        llama_memory_seq_rm(mem, dst.id, -1, -1);
+        if (dft) {
+            llama_memory_seq_rm(llama_get_memory(dft), dst.id, -1, -1);
+        }
+        bool ok = llama_seq_cp_prefix_async(ctx_tgt, src->id, dst.id, (llama_pos) lcp_src);
+        if (ok && dft && !llama_seq_cp_prefix_async(dft, src->id, dst.id, (llama_pos) lcp_src)) {
+            llama_memory_seq_rm(mem, dst.id, -1, -1);
+            ok = false;
+        }
+        if (ok) {
+            server_tokens t = src->prompt.tokens.clone();
+            t.keep_first(lcp_src);
+            dst.prompt.tokens = std::move(t);
+            dst.prompt.checkpoints.clear();
+            dst.n_prefix_copied = (int32_t) lcp_src;
+        } else {
+            dst.prompt.clear();
+            dst.n_prefix_copied = 0;
+        }
+        static const bool say = getenv("LLAMA_STEP_LOG") != nullptr;
+        if (say) {
+            fprintf(stderr, "[prefix] slot %d: %s %zu tokens from slot %d (kept %zu of its own) in %.2f ms\n", dst.id, ok ? "copied" : "could not copy",
+                    lcp_src, src->id, lcp_own, (ggml_time_us() - t0) / 1000.0);
+        }
     }
 
     // return true if at least one slot has been cleared
@@ -1870,6 +2184,12 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // copies of the slot's last state still in flight read its cells
+        llama_state_async_wait_seq(ctx_tgt, slot.id);
+        if (ctx_dft) {
+            llama_state_async_wait_seq(ctx_dft, slot.id);
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1935,11 +2255,14 @@ private:
             }
         }
 
+        static const bool say_launch = getenv("LLAMA_STEP_LOG") != nullptr;
+        const int64_t tl0 = say_launch ? ggml_time_us() : 0;
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
 
+        const int64_t tl1 = say_launch ? ggml_time_us() : 0;
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         // initialize samplers
@@ -1960,10 +2283,15 @@ private:
             use_backend_sampling &= !need_pre_sample_logits;
 
             // TODO: tmp until backend sampling is fully implemented
+            const int64_t tl2 = say_launch ? ggml_time_us() : 0;
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            }
+            if (say_launch) {
+                fprintf(stderr, "[launch] slot %d: validate %.2f ms, sampler init %.2f ms, set_sampler %.2f ms, at %lld\n", slot.id,
+                        (tl1 - tl0) / 1000.0, (tl2 - tl1) / 1000.0, (ggml_time_us() - tl2) / 1000.0, (long long) ggml_time_us());
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2525,8 +2853,8 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2993,6 +3321,47 @@ private:
 #endif
 
     void update_slots() {
+        // LLAMA_STEP_LOG=1: a line per call, whatever path it leaves by: its wall time, the gap since the last call
+        // ended, the tokens it decoded (prompt tokens among them), how many slots were generating and how many tokens
+        // the call committed to replies (the benchmark's steady-decode counter)
+        struct step_log {
+            server_context_impl & s;
+            const bool on;
+            const int64_t t0;
+            std::vector<uint64_t> n_gen0;
+            static int64_t & t_end() { static int64_t t = 0; return t; }
+            explicit step_log(server_context_impl & s) : s(s), on(getenv("LLAMA_STEP_LOG") != nullptr), t0(on ? ggml_time_us() : 0) {
+                if (on) {
+                    for (const auto & slot : s.slots) {
+                        n_gen0.push_back(slot.stats.n_gen);
+                    }
+                }
+            }
+            ~step_log() {
+                if (!on) {
+                    return;
+                }
+                const int64_t t1 = ggml_time_us();
+                int n_gen = 0;
+                uint64_t n_tok = 0;
+                for (size_t i = 0; i < s.slots.size(); ++i) {
+                    const auto & slot = s.slots[i];
+                    n_gen += slot.state == SLOT_STATE_GENERATING;
+                    if (i < n_gen0.size() && slot.stats.n_gen > n_gen0[i]) {
+                        n_tok += slot.stats.n_gen - n_gen0[i];
+                    }
+                }
+                int n_prompt = 0;
+                for (const auto & t : s.batch.tokens) {
+                    n_prompt += t.is_prompt && !t.is_pad;
+                }
+                fprintf(stderr, "[step] %.3f ms gap %.3f ms T %d prompt %d gen %d at %lld tok %llu\n", (t1 - t0) / 1000.0,
+                        t_end() ? (t0 - t_end()) / 1000.0 : 0.0, s.batch.size(), n_prompt, n_gen, (long long) t1,
+                        (unsigned long long) n_tok);
+                t_end() = t1;
+            }
+        } step_log_guard(*this);
+
         {
             // LLAMA_ROUND_TIMING=2: three whole rounds of marks, every 400 calls
             static int n_calls = 0;
@@ -3058,13 +3427,21 @@ private:
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+            order_uniform_round();
             batch.render();
 
             // a draft whose ids are on the device goes to its verify there when the batch is one decode; any other
             // has its ids read back before the batch is decoded
             handoff_slots.clear();
             if (spec) {
-                const bool one_decode = batch.size() <= (int32_t) llama_n_batch(ctx_tgt) && batch.size() <= (int32_t) llama_n_ubatch(ctx_tgt);
+                bool one_decode = batch.size() <= (int32_t) llama_n_batch(ctx_tgt) && batch.size() <= (int32_t) llama_n_ubatch(ctx_tgt);
+                // a prompt in the batch goes to its own decode (see the decode loop below) when the cache has a
+                // stream per slot
+                if (params_base.n_parallel > 1 && !llama_context_kv_unified(ctx_tgt) && !(grouped_on && !batch.has_embd)) {
+                    for (const auto & t : batch.tokens) {
+                        one_decode = one_decode && !t.is_prompt;
+                    }
+                }
                 for (auto & slot : slots) {
                     if (slot.spec_draft.empty() || !common_speculative_ids_pending(spec.get(), slot.id)) {
                         continue;
@@ -3111,8 +3488,50 @@ private:
 
         chain_start = chain_on && chain_can_start(n_batch);
 
+        // With a cache stream per slot a ubatch takes the same number of tokens from each of its sequences, so the
+        // generating slots' rows and a new prompt in one decode are cut into several ubatches, each a graph of a shape
+        // not seen before. The generated rows, and each prompt, go to a decode of their own instead.
+        const bool split_mixed = params_base.n_parallel > 1 && !llama_context_kv_unified(ctx_tgt);
+        // prompts with the same number of rows (pads included) go to one decode as one ubatch of equal parts, as vLLM
+        // puts every waiting prompt in one forward: 32 short prompts arriving together were 32 forwards of 128 rows
+        // (~380 ms), as groups they are a few (~170 ms with the group sizes' graph builds). LLAMA_NO_PROMPT_GROUP=1
+        // sends each prompt alone
+        static const bool prompt_group = getenv("LLAMA_NO_PROMPT_GROUP") == nullptr;
+        std::vector<int32_t> n_prompt_rows(slots.size(), 0);
+        for (const auto & t : batch.tokens) {
+            if (t.is_prompt) {
+                n_prompt_rows[t.id_slot]++;
+            }
+        }
+        bool batch_grouped = false;
+        if (grouped_on && spec && !batch.has_embd && batch.size() <= n_batch && batch.size() <= (int32_t) llama_n_ubatch(ctx_tgt)) {
+            bool has_prompt = false;
+            bool has_other  = false;
+            for (const auto & t : batch.tokens) {
+                has_prompt |= t.is_prompt;
+                has_other  |= !t.is_prompt;
+            }
+            batch_grouped = has_prompt && has_other;
+        }
+        auto chunk_end = [&](int32_t off) {
+            if (batch_grouped && off == 0) {
+                return (int32_t) batch.size();
+            }
+            int32_t end = off + 1;
+            const auto & t0 = batch.tokens[off];
+            while (end < batch.size() && end - off < n_batch) {
+                const auto & t = batch.tokens[end];
+                if (split_mixed && (t.is_prompt != t0.is_prompt ||
+                        (t.is_prompt && t.id_slot != t0.id_slot && (!prompt_group || n_prompt_rows[t.id_slot] != n_prompt_rows[t0.id_slot])))) {
+                    break;
+                }
+                end++;
+            }
+            return end;
+        };
+
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int32_t n_tokens = std::min(n_batch, chunk_end(off) - off);
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -3124,6 +3543,21 @@ private:
 #endif
 
                 if (ok) {
+                    // the pad rows leave the cache before anything reads their sequences
+                    std::map<int32_t, llama_pos> pad_pos0;
+                    for (int32_t i = off; i < off + n_tokens; ++i) {
+                        const auto & t = batch.tokens[i];
+                        if (t.is_pad) {
+                            auto it = pad_pos0.find(t.id_slot);
+                            if (it == pad_pos0.end() || t.pos < it->second) {
+                                pad_pos0[t.id_slot] = t.pos;
+                            }
+                        }
+                    }
+                    for (const auto & [id_slot, pos0] : pad_pos0) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, pos0, -1);
+                    }
+
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
@@ -3234,14 +3668,40 @@ private:
             }
         });
 
+        // one request alone runs as it always did, its prompt unpadded
+        int n_active = 0;
+        for (const auto & slot : slots) {
+            n_active += slot.is_processing();
+        }
+
         // start populating the batch for this iteration
         batch.clear();
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
+        // LLAMA_NO_PROCESS_DEFER=1: the last verify's tokens before the draft, the old order
+        static const bool no_defer = getenv("LLAMA_NO_PROCESS_DEFER") != nullptr;
+        if (no_defer) {
+            process_pending_tokens();
+        }
+
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
+
+        // With several slots in the round every draft runs to the full length (see the padding below): a cache
+        // with a stream per slot splits a verify whose slots have unequal rows into a decode per row count, each a
+        // graph of its own shape
+        {
+            int n_generating = 0;
+            for (const auto & slot : slots) {
+                n_generating += slot.state == SLOT_STATE_GENERATING;
+            }
+            const bool pad = spec && n_generating > 1 && !getenv("LLAMA_SPEC_NO_PAD");
+            for (auto & slot : slots) {
+                slot.pad_draft = pad;
+            }
+        }
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
@@ -3274,7 +3734,9 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
-                    } else if (!slot.spec_rested()) {
+                    } else if (slot.pad_draft || !slot.spec_rested()) {
+                        // while the drafts are padded a rest saves nothing: the slot's rows are in the verify either
+                        // way, and as the one unpadded sequence they would split it into two shapes
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(
@@ -3305,6 +3767,70 @@ private:
             }
         });
 
+        // Pad the round to a bucket of 8 slots, as vLLM pads a forward to a captured size: idle slots lend their
+        // sequence for a draft and K+1 verify rows after their cache (sampled greedily on the device, dropped after
+        // the decode), so the draft and verify graphs keep their shape while requests end and start instead of
+        // being rebuilt. LLAMA_NO_SLOT_PAD=1 turns this off.
+        ghosts.clear();
+        if (spec && generating.size() > 1 && !getenv("LLAMA_NO_SLOT_PAD")) {
+            const int n_gen    = (int) generating.size();
+            const int n_bucket = std::min<int>((n_gen + 7) & ~7, (int) slots.size());
+            int n_ghost = n_bucket - n_gen;
+            // any slot not generating: idle, or one whose prompt goes in a later view of this batch (its rows
+            // leave the cache before that view). An empty cache leaves the drafter's row for it undefined,
+            // which stays in that row: the verify rows see themselves. A slot whose last state is still being
+            // copied out (its rows would write the cells being read) is taken last, after the copy
+            for (int pass = 0; pass < 2 && n_ghost > 0; ++pass) {
+                for (auto & slot : slots) {
+                    if (n_ghost <= 0) {
+                        break;
+                    }
+                    if (slot.state == SLOT_STATE_GENERATING || slot.ghost_busy) {
+                        continue;
+                    }
+                    if (grouped_on && slot.state != SLOT_STATE_IDLE) {
+                        continue;
+                    }
+                    const bool pending = llama_state_async_pending_seq(ctx_tgt, slot.id) || (ctx_dft && llama_state_async_pending_seq(ctx_dft, slot.id));
+                    if (pending != (pass == 1)) {
+                        continue;
+                    }
+                    if (pending) {
+                        llama_state_async_wait_seq(ctx_tgt, slot.id);
+                        if (ctx_dft) {
+                            llama_state_async_wait_seq(ctx_dft, slot.id);
+                        }
+                    }
+                    ghosts.push_back(&slot);
+                    slot.ghost_busy = true;
+                    n_ghost--;
+                }
+            }
+            if (n_ghost > 0) {
+                for (server_slot * g : ghosts) {
+                    g->ghost_busy = false;
+                }
+                ghosts.clear(); // not enough idle slots: the round keeps its own shape
+            }
+            const int n_max = params_base.speculative.draft.n_max;
+            for (server_slot * g : ghosts) {
+                g->spec_draft.clear();
+                g->spec_i_batch.clear();
+                g->spec_prompt.clear();
+                g->ghost_pos0 = std::max<llama_pos>(0, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), g->id) + 1);
+                common_speculative_get_draft_params(spec.get(), g->id) = {
+                    /* .drafting = */ true,
+                    /* .n_max    = */ n_max,
+                    /* .pos0     = */ g->ghost_pos0,
+                    /* .id_last  = */ prompt_pad_token,
+                    /* .prompt   = */ &g->spec_prompt,
+                    /* .result   = */ &g->spec_draft,
+                };
+                drafting.push_back(g);
+            }
+            llama_round_mark("ghosts", (int32_t) ghosts.size());
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
@@ -3315,6 +3841,53 @@ private:
                     common_speculative_draft(spec.get());
                     llama_round_mark("draft.end", 0);
                     if (srt.on) { srt.draft += (ggml_time_us() - t0) / 1000.0; }
+                }
+            });
+        }
+
+        // the last verify's tokens, now that the draft runs; a slot that stops leaves the round
+        const std::vector<server_slot *> generating_planned = generating;
+        process_pending_tokens();
+        {
+            auto gone = [](server_slot * s) { return s->state != SLOT_STATE_GENERATING; };
+            generating.erase(std::remove_if(generating.begin(), generating.end(), gone), generating.end());
+            drafting.erase(std::remove_if(drafting.begin(), drafting.end(), gone), drafting.end());
+            if (slot_batched && gone(slot_batched)) {
+                slot_batched = generating.empty() ? nullptr : generating[0];
+            }
+            if (generating.empty()) {
+                for (server_slot * g : ghosts) {
+                    g->spec_draft.clear();
+                    g->spec_i_batch.clear();
+                    g->ghost_busy = false;
+                }
+                ghosts.clear();
+            } else if (spec && !getenv("LLAMA_NO_SLOT_PAD")) {
+                // a slot that stopped here was counted when the round's shape was planned: it stays in the round
+                // as a ghost, placeholder rows after its cache, so the verify keeps that shape
+                for (server_slot * s : generating_planned) {
+                    if (!gone(s) || std::find(ghosts.begin(), ghosts.end(), s) != ghosts.end()) {
+                        continue;
+                    }
+                    s->spec_draft.clear();
+                    s->spec_i_batch.clear();
+                    s->spec_prompt.clear();
+                    s->ghost_pos0 = std::max<llama_pos>(0, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), s->id) + 1);
+                    s->ghost_busy = true;
+                    ghosts.push_back(s);
+                }
+            }
+        }
+
+        // A pad token stays only where the target itself picks it, as any drafted token does; a slot the drafter
+        // gave nothing gets copies of its last token
+        if (generating.size() > 1 && !getenv("LLAMA_SPEC_NO_PAD")) {
+            const int n_max = params_base.speculative.draft.n_max;
+            iterate(drafting, [&](server_slot & slot) {
+                auto & draft = slot.spec_draft;
+                const int n = std::min(n_max, slot.get_n_draft_max());
+                if ((int) draft.size() < n && !common_speculative_ids_pending(spec.get(), slot.id)) {
+                    draft.resize(n, draft.empty() ? slot.sampled : draft.back());
                 }
             });
         }
@@ -3375,9 +3948,37 @@ private:
 
         // update the batch with the sampled/drafted tokens
         const int64_t t_batch0 = srv_round_timer().on ? ggml_time_us() : 0;
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
+        // in slot order, the ghosts among the generating slots: a cache with a stream per slot cuts a ubatch
+        // where the sequence ids stop increasing
+        if (ghosts.empty()) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        } else {
+            std::vector<uint8_t> is_gen(slots.size(), 0), is_ghost(slots.size(), 0);
+            for (server_slot * s : generating) {
+                is_gen[s->id] = 1;
+            }
+            for (server_slot * g : ghosts) {
+                is_ghost[g->id] = 1;
+            }
+            for (auto & slot : slots) {
+                if (is_gen[slot.id]) {
+                    slot.handle_last_sampled_token(batch);
+                } else if (is_ghost[slot.id]) {
+                    // its cache may have changed since it was chosen: the queue ran while the draft was drawn
+                    // (a new task on this slot keeps a prefix and drops the rest)
+                    slot.ghost_pos0 = std::max<llama_pos>(0, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1);
+                    slot.add_ghost_rows(batch, prompt_pad_token, params_base.speculative.draft.n_max);
+                    // a slot loading its prompt has its request's sampler registered already and keeps it; an
+                    // idle one gets a greedy chain for the round
+                    if (!llama_sampler_on_backend(ctx_tgt, slot.id)) {
+                        slot.smpl_ghost.reset(common_sampler_init(llama_get_model(ctx_tgt), sp_ghost));
+                        llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl_ghost.get()));
+                    }
+                }
+            }
+        }
         {
             auto & srt = srv_round_timer();
             if (srt.on) { srt.batch += (ggml_time_us() - t_batch0) / 1000.0; }
@@ -3629,7 +4230,8 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                const bool copied = slot.n_prefix_copied > 0 && n_past == slot.n_prefix_copied;
+                                if (pos_min >= pos_min_thold && !copied) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3695,6 +4297,19 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+                        slot.n_prefix_copied = 0;
+
+                        // a ghost this round: its rows went into the batch before this trim, after the cache's
+                        // old end; they move to the kept cache's end (their content never mattered)
+                        if (slot.ghost_busy) {
+                            llama_pos p = slot.prompt.tokens.pos_next();
+                            slot.ghost_pos0 = p;
+                            for (auto & t : batch.tokens) {
+                                if (t.id_slot == slot.id && t.is_pad && !t.is_prompt) {
+                                    t.pos = p++;
+                                }
+                            }
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -3897,6 +4512,40 @@ private:
                         }
                     }
 
+                    // Pad the chunk to one of a few lengths, as vLLM pads a forward to its CUDA graph sizes: prompts
+                    // of different lengths then share one ubatch and one graph, which the next prompts replay. The
+                    // pad rows leave the cache right after the decode, before anything reads the sequence.
+                    if (prompt_pad_on && n_active > 1 && n_tokens_cur > 0 && !slot.need_embd() && !has_mtmd) {
+                        const int32_t   n_verify = spec ? std::max(1, params_base.speculative.draft.n_max) + 1 : 1;
+                        const int32_t   n_pad = prompt_pad_len(n_tokens_cur, n_verify) - n_tokens_cur;
+                        const llama_pos pos0  = slot.prompt.tokens.pos_next();
+                        // a chunk of a verify's rows (a cached prompt's last tokens) is sampled on every row like one:
+                        // beside the generating slots' verifies the step is then a round of the usual shape, as vLLM's
+                        // uniform decode batch, not a graph of its own. LLAMA_PROMPT_AS_VERIFY=0 off
+                        static const bool as_verify_on = getenv("LLAMA_PROMPT_AS_VERIFY") == nullptr || atoi(getenv("LLAMA_PROMPT_AS_VERIFY")) != 0;
+                        const bool as_verify = as_verify_on && n_verify > 1 && n_tokens_cur + n_pad == n_verify;
+                        if (n_pad > 0 && slot.prompt.n_tokens() + n_pad + 8 < slot.n_ctx) {
+                            for (int32_t i = 0; i < n_pad; ++i) {
+                                if (!(as_verify ? batch.add_pad_out(slot.id, prompt_pad_token, pos0 + i) : batch.add_pad(slot.id, prompt_pad_token, pos0 + i))) {
+                                    break;
+                                }
+                            }
+                        }
+                        if (as_verify) {
+                            for (int32_t i = n_tokens_prev; i < batch.size(); ++i) {
+                                batch.set_output(i, true);
+                            }
+                        }
+                        // LLAMA_PROMPT_PAD_ALL_OUTPUT=1: every row of the padded chunk is an output (backend sampling
+                        // allows at most n_max + 1 outputs per sequence, so this needs that limit raised)
+                        static const bool all_output = getenv("LLAMA_PROMPT_PAD_ALL_OUTPUT") != nullptr;
+                        if (all_output) {
+                            for (int32_t i = n_tokens_prev; i < batch.size(); ++i) {
+                                batch.set_output(i, true);
+                            }
+                        }
+                    }
+
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
@@ -3981,12 +4630,31 @@ private:
             }
         }
         handoff_slots.clear();
+        if (spec) {
+            // the step's last decode: a drafter taking the target's hidden rows on the device spares it the copy back
+            const bool leaves = common_speculative_set_last_decode(spec.get(), off + batch_view.n_tokens >= batch.size());
+            llama_set_embd_nextn_readback(ctx_tgt, !leaves);
+        }
         auto & spt = srv_plain_timer();
         queue_tasks.yield_to_queue([&]() {
             {
                 auto & srt = srv_round_timer();
                 const int64_t t0 = srt.on ? ggml_time_us() : 0;
                 if (spt.on && !spec) { spt.decode_begin(); }
+                for (auto & slot : slots) {
+                    if (slot.is_processing() && llama_state_async_pending_seq(ctx_tgt, slot.id)) {
+                        llama_state_async_wait_seq(ctx_tgt, slot.id);
+                    }
+                }
+                if (grouped_on && spec && off == 0 && batch_view.n_tokens == batch.size() && !batch.has_embd) {
+                    bool has_prompt = false;
+                    bool has_other  = false;
+                    for (const auto & t : batch.tokens) {
+                        has_prompt |= t.is_prompt;
+                        has_other  |= !t.is_prompt;
+                    }
+                    llama_set_next_decode_grouped(ctx_tgt, has_prompt && has_other);
+                }
                 ret = llama_decode(ctx_tgt, batch_view);
                 if (srt.on) { srt.decode += (ggml_time_us() - t0) / 1000.0; }
             }
@@ -4128,6 +4796,64 @@ private:
             n_gen++;
         }
         return n_gen == batch.size();
+    }
+
+    // A round in which every slot has the same number of rows (a cached prompt's last tokens padded to a verify's rows
+    // beside the verifies) goes in slot order: the cache's split then takes it as one ubatch of equal sequences, the
+    // round's own graph, rather than as groups of a graph of their own (vLLM's uniform decode batch). The slots' row
+    // indices follow their rows. LLAMA_PROMPT_AS_VERIFY=0 off
+    void order_uniform_round() {
+        static const bool on = getenv("LLAMA_PROMPT_AS_VERIFY") == nullptr || atoi(getenv("LLAMA_PROMPT_AS_VERIFY")) != 0;
+        const int32_t n = batch.size();
+        if (!on || !grouped_on || n < 2 || batch.has_embd) {
+            return;
+        }
+        std::vector<int32_t> n_rows(slots.size(), 0);
+        bool has_prompt = false;
+        bool in_order   = true;
+        for (int32_t i = 0; i < n; ++i) {
+            const auto & t = batch.tokens[i];
+            if (t.id_slot < 0 || t.id_slot >= (int32_t) slots.size()) {
+                return;
+            }
+            n_rows[t.id_slot]++;
+            has_prompt |= t.is_prompt;
+            in_order = in_order && (i == 0 || t.id_slot >= batch.tokens[i - 1].id_slot);
+        }
+        if (!has_prompt || in_order) {
+            return;
+        }
+        int32_t n_eq = 0;
+        for (const int32_t r : n_rows) {
+            if (r > 0) {
+                if (n_eq > 0 && r != n_eq) {
+                    return;
+                }
+                n_eq = r;
+            }
+        }
+        std::vector<int32_t> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+            return batch.tokens[a].id_slot < batch.tokens[b].id_slot;
+        });
+        std::vector<int32_t> at(n);
+        std::vector<server_batch::token> tokens(n);
+        for (int32_t k = 0; k < n; ++k) {
+            at[order[k]] = k;
+            tokens[k]    = batch.tokens[order[k]];
+        }
+        batch.tokens = std::move(tokens);
+        for (auto & slot : slots) {
+            if (slot.i_batch >= 0 && slot.i_batch < n) {
+                slot.i_batch = at[slot.i_batch];
+            }
+            for (auto & i : slot.spec_i_batch) {
+                if (i >= 0 && i < n) {
+                    i = at[i];
+                }
+            }
+        }
     }
 
     // The queued decode D's rows are its slots' i_batch. Queue the next decode behind it, taking D's tokens on the
@@ -4332,6 +5058,19 @@ private:
             slot.print_timings_tg();
         });
 
+        // the ghosts' rows were in the batch's first view; their ids were resolved with everyone's
+        if (off == 0) {
+            for (server_slot * g : ghosts) {
+                if (g->smpl_ghost) {
+                    llama_set_sampler(ctx_tgt, g->id, nullptr);
+                    g->smpl_ghost.reset();
+                }
+                g->spec_draft.clear();
+                g->spec_i_batch.clear();
+                g->ghost_busy = false;
+            }
+        }
+
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
@@ -4445,6 +5184,32 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            // the text, stop checks and streaming of these wait until the next draft is on the device, see
+            // process_pending_tokens (vLLM orders a step the same way: sample, draft, then the bookkeeping)
+            slot.spec_out = ids;
+
+            SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+        });
+    }
+
+    // the accepted tokens of the last verify, while the drafter runs on the device; a slot that stops here leaves
+    // before the batch takes its rows
+    void process_pending_tokens() {
+        auto accept_special_token = [&](server_slot & slot, llama_token token) {
+            return params_base.special ||
+                slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+        };
+
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.spec_out.empty()) {
+                return;
+            }
+            const llama_tokens ids = std::move(slot.spec_out);
+            slot.spec_out.clear();
+            if (!slot.is_processing()) {
+                return;
+            }
+
             const int64_t t_tok0 = srv_round_timer().on ? ggml_time_us() : 0;
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -4458,10 +5223,14 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
+                    llama_round_mark("stop.begin", slot.id);
                     slot.print_timings();
                     send_final_response(slot);
+                    llama_round_mark("stop.final", slot.id);
                     checkpoint_after_generation(slot);
+                    llama_round_mark("stop.ckpt", slot.id);
                     slot.release();
+                    llama_round_mark("stop.release", slot.id);
 
                     return;
                 }
@@ -4473,8 +5242,6 @@ private:
             }
 
             slot.print_timings_tg();
-
-            SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
     }
 
@@ -4491,6 +5258,75 @@ private:
 
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+    }
+
+    // A client per slot sends a few short greedy requests of staggered lengths: requests end one by one, so the
+    // rounds go through every slot count, and each client's next prompt lands beside the others' verify. Two passes:
+    // a shape's second sight captures its CUDA graph. The prompts are not cached.
+    void warmup_traffic() {
+        const int n_clients = params_base.n_parallel;
+        if (n_clients < 2 || getenv("LLAMA_NO_WARMUP_TRAFFIC")) {
+            return;
+        }
+        static const char * topics[] = {
+            "the history of the printing press", "how a refrigerator works", "the rules of chess",
+            "why the sky is blue", "the life cycle of a star", "how to bake bread", "the water cycle",
+            "the causes of the first world war",
+        };
+        const int64_t t0 = ggml_time_us();
+        std::atomic<int> n_done{0};
+        for (int pass = 0; pass < 2; ++pass) {
+            std::vector<std::thread> clients;
+            for (int c = 0; c < n_clients; ++c) {
+                clients.emplace_back([&, c]() {
+                    for (int r = 0; r < 2; ++r) {
+                        auto rd = get_response_reader();
+                        std::string prompt = std::string("Write a short note about ") + topics[(c + r) % 8] +
+                                             std::string(1 + (c*7 + r*3) % 9, ' ') + "in plain words.";
+                        // a few clients bring long contexts: the rounds then see cache views of 512 and 1024 cells
+                        if (r == 1 && (c % 8 == 3 || c % 8 == 6)) {
+                            std::string filler;
+                            const int n_rep = c % 8 == 3 ? 40 : 90;
+                            for (int k = 0; k < n_rep; ++k) {
+                                filler += topics[k % 8];
+                                filler += ", ";
+                            }
+                            prompt = "Here is a list: " + filler + "\n" + prompt;
+                        }
+                        // greedy, then the server's own default sampling: both forms of the batched sampler are built
+                        // (and their kernels loaded) before the first request
+                        json data = {
+                            { "n_predict",    12 + (c*5 + r*11) % 44 },
+                            { "cache_prompt", false },
+                        };
+                        if (r == 0) {
+                            data["temperature"] = 0.0;
+                        }
+                        try {
+                            auto inputs = tokenize_input_prompts(vocab, mctx, json(prompt), true, true, init_opt);
+                            if (inputs.empty()) {
+                                return;
+                            }
+                            server_task task(SERVER_TASK_TYPE_COMPLETION);
+                            task.id     = rd.get_new_id();
+                            task.tokens = std::move(inputs[0]);
+                            task.params = server_schema::eval_llama_cmpl_schema(vocab, params_base, params_base.sampling.logit_bias_eog, data);
+                            task.params.res_type = TASK_RESPONSE_TYPE_NONE;
+                            rd.post_task(std::move(task));
+                            rd.wait_for_all([]() { return false; });
+                            n_done++;
+                        } catch (const std::exception & e) {
+                            SRV_WRN("warm-up request failed: %s\n", e.what());
+                            return;
+                        }
+                    }
+                });
+            }
+            for (auto & t : clients) {
+                t.join();
+            }
+        }
+        SRV_INF("warm-up traffic: %d requests in %.1f s\n", n_done.load(), (ggml_time_us() - t0) / 1e6);
     }
 
     //
@@ -4540,7 +5376,7 @@ private:
         for (int i = off; i < off + n_tokens; ++i) {
             const auto & t = batch.tokens[i];
 
-            if (!t.is_prompt) {
+            if (!t.is_prompt || t.is_pad) {
                 continue; // generated tokens are handled after sampling
             }
 
@@ -4631,6 +5467,10 @@ llama_context * server_context::get_llama_context() const {
 
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
+}
+
+void server_context::warmup_traffic() {
+    impl->warmup_traffic();
 }
 
 server_context_meta server_context::get_meta() const {

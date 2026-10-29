@@ -311,9 +311,14 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_F8_E4M3, // with a model's static scales (an FP8 cache scheme), as vLLM stores it
 };
 
+// auto (GGML_TYPE_COUNT): the model decides, see llama_init_from_model
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    if (s == "auto") {
+        return GGML_TYPE_COUNT;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -325,8 +330,9 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+        msg << ggml_type_name(type) << ", ";
     }
+    msg << "auto (FP8 for a model with the cache's scales, as vLLM does, else f16)";
     return msg.str();
 }
 
@@ -2437,7 +2443,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_k)
+            params.cache_type_k == GGML_TYPE_COUNT ? "auto" : ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
             params.cache_type_k = kv_cache_type_from_str(value);
@@ -2450,7 +2456,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_v)
+            params.cache_type_v == GGML_TYPE_COUNT ? "auto" : ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
             params.cache_type_v = kv_cache_type_from_str(value);

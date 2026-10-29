@@ -1,6 +1,9 @@
 #pragma once
 
 #include "common.cuh"
+
+#include <array>
+#include <set>
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
@@ -25,6 +28,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_strm,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -661,10 +665,46 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
+// The variable-length layout (vLLM's unified attention): the rows of several sequences one after another in one
+// "sequence" of queries, and a table in place of the K/V streams: tab[0] = -n, then per sequence its first row, its
+// rows and its stream. Query tile t is the t-th tile of ncols1 rows counted sequence after sequence; false past the
+// last one (the grid is sized for the most tiles the rows can make).
+static __device__ __forceinline__ bool flash_attn_varlen_tile(const int * __restrict__ tab, const int ncols1, int t,
+        int & row0, int & nrows, int & strm) {
+    const int n = -tab[0];
+    for (int s = 0; s < n; ++s) {
+        const int r0 = tab[1 + 3*s + 0];
+        const int nr = tab[1 + 3*s + 1];
+        const int nt = (nr + ncols1 - 1) / ncols1;
+        if (t < nt) {
+            row0  = r0 + t*ncols1;
+            nrows = min(ncols1, nr - t*ncols1);
+            strm  = tab[1 + 3*s + 2];
+            return true;
+        }
+        t -= nt;
+    }
+    return false;
+}
+
+// init_fastdiv_values on the device, for a tile's own row count
+static __device__ __forceinline__ uint3 flash_attn_fastdiv_device(const uint32_t d) {
+    uint32_t L = 0;
+    while (L < 32 && (uint32_t{ 1 } << L) < d) {
+        L++;
+    }
+    const uint32_t mp = (uint32_t) ((uint64_t{ 1 } << 32) * ((uint64_t{ 1 } << L) - d) / d + 1);
+    return make_uint3(mp, L, d);
+}
+
+// the mask scan's block (flash_attn_mask_to_KV_max)
+#define FATTN_MASK_SCAN_THREADS 1024
+
 template <int ncols1>
-__launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+__launch_bounds__(FATTN_MASK_SCAN_THREADS, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33, const int * varlen_tab,
+        const int ne31_rows) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -672,6 +712,112 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
+
+    int nrows = ncols1;
+    if (varlen_tab) {
+        int row0 = 0, strm = 0;
+        if (!flash_attn_varlen_tile(varlen_tab, ncols1, jt, row0, nrows, strm)) {
+            if (tid == 0) {
+                for (int slot = 0; slot < 5; ++slot) {
+                    KV_max[slot*ne31*gridDim.y + sequence*ne31 + jt] = 0;
+                }
+            }
+            return;
+        }
+        mask += row0*s31;
+    } else {
+        mask += sequence*s33 + jt*ncols1*s31;
+        // the mask's own rows only: a tile of one row a sequence would read the next sequences' rows
+        nrows = min(ncols1, ne31_rows - jt*ncols1);
+    }
+
+    // One pass from the first key in chunks of a warp's 64 keys, the block's warps a chunk each: the first visible
+    // key, the end of the last, and the largest masked run between (a sliding window that wraps around its ring of
+    // cells sees two runs of keys). The slots: the end of the last visible FATTN_KQ_STRIDE tile (the maxima), then
+    // start, end, gap start, gap end (gap start == gap end == end without a gap); a kernel may start at the start and
+    // skip the gap
+    constexpr int nwarps = FATTN_MASK_SCAN_THREADS/WARP_SIZE;
+    __shared__ int buf_vis[nwarps];
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    const int n_kv = ne30*FATTN_KQ_STRIDE;
+
+    ggml_cuda_pdl_sync();
+
+    int kv_lo = -1, kv_end = 0, run_lo = -1, gap_lo = 0, gap_hi = 0;
+    for (int t = 0; t < n_kv; t += 64*nwarps) {
+        const int c0 = t + 64*warp;
+        int all_inf = 1;
+        if (c0 < n_kv) {
+#pragma unroll
+            for (int j = 0; j < ncols1; ++j) {
+                if (j < nrows) {
+                    const float2 tmp = __half22float2(mask[j*s31 + c0/2 + lane]);
+                    all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+                }
+            }
+        }
+        all_inf = warp_reduce_all(all_inf);
+        if (lane == 0) {
+            buf_vis[warp] = !all_inf;
+        }
+        __syncthreads();
+        for (int w = 0; w < nwarps; ++w) {
+            const int c = t + 64*w;
+            if (c >= n_kv) {
+                break;
+            }
+            if (buf_vis[w]) {
+                if (kv_lo < 0) {
+                    kv_lo = c;
+                } else if (run_lo >= 0) {
+                    if (c - run_lo > gap_hi - gap_lo) {
+                        gap_lo = run_lo;
+                        gap_hi = c;
+                    }
+                    run_lo = -1;
+                }
+                kv_end = c + 64;
+            } else if (kv_lo >= 0 && run_lo < 0) {
+                run_lo = c;
+            }
+        }
+        __syncthreads();
+    }
+    if (kv_lo < 0) {
+        kv_lo = 0;
+    }
+    if (gap_hi <= gap_lo) {
+        gap_lo = kv_end;
+        gap_hi = kv_end;
+    }
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int ne_slot = ne31*gridDim.y;
+    KV_max[0*ne_slot + sequence*ne31 + jt] = (kv_end + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE * FATTN_KQ_STRIDE;
+    KV_max[1*ne_slot + sequence*ne31 + jt] = kv_lo;
+    KV_max[2*ne_slot + sequence*ne31 + jt] = kv_end;
+    KV_max[3*ne_slot + sequence*ne31 + jt] = gap_lo;
+    KV_max[4*ne_slot + sequence*ne31 + jt] = gap_hi;
+}
+
+// the end alone, for kernels that stop early only: the last unmasked FATTN_KQ_STRIDE tile from the end (a causal mask:
+// one step), in slot 0
+template <int ncols1>
+__launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+static __global__ void flash_attn_mask_to_KV_max_end(
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33, const int ne31_rows) {
+    const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
+    int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
+
+    const int ne31     = gridDim.x;
+    const int tid      = threadIdx.x;
+    const int sequence = blockIdx.y;
+    const int jt       = blockIdx.x;
+    const int nrows    = min(ncols1, ne31_rows - jt*ncols1);
 
     mask += sequence*s33 + jt*ncols1*s31;
 
@@ -686,9 +832,10 @@ static __global__ void flash_attn_mask_to_KV_max(
     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
         int all_inf = 1;
 
+        // a row past the mask's reads the tile's last row again
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+            const float2 tmp = __half22float2(mask[min(j, nrows - 1)*s31 + KV_max_sj/2 + tid]);
             all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
         }
 
@@ -705,10 +852,6 @@ static __global__ void flash_attn_mask_to_KV_max(
             break;
         }
     }
-
-    // If the break in the loop was not triggered, KV_max_sj is now -FATTN_KQ_STRIDE.
-    // If the break was triggered it's the lower edge of the tile with the first non-masked values.
-    // In either case, walk back the decrementation by FATTN_KQ_STRIDE.
     KV_max_sj += FATTN_KQ_STRIDE;
 
     if (threadIdx.x != 0) {
@@ -732,7 +875,8 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const int blocks_per_tile,
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
-        const uint3 fd_iter_j) {
+        const uint3 fd_iter_j,
+        const float out_scale) {
     constexpr int ncols = ncols1*ncols2;
     ggml_cuda_pdl_lc();
     float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
@@ -779,29 +923,60 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         rowsum  = tmp.y;
     }
 
-    // Combine with all previous blocks in this tile.
-    for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
-        const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
+    // Combine with all previous blocks in this tile, newest first. A group's reads go out together: one at a time, a
+    // tile of 80 partials waits on 160 dependent reads
+    constexpr int group = 8;
+    bool done = false;
+    for (int b0 = b_last - 1; b0 >= b_first && !done; b0 -= group) {
+        float2 tmp[group];
+        float  add[group];
+#pragma unroll
+        for (int i = 0; i < group; ++i) {
+            const int bidx = b0 - i;
+            if (bidx >= b_first) {
+                tmp[i] = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
+                add[i] = dst_fixup_data[bidx*ncols*D + jc*D + tid];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < group; ++i) {
+            // a share given no keys (flash_attn_ext_f16's variant for several sequences gives a tile's keys to its last
+            // blocks): it and every block before it add nothing
+            if (done || b0 - i < b_first || tmp[i].x == -INFINITY) {
+                done = true;
+                continue;
+            }
+            const float max_val_new = fmaxf(max_val, tmp[i].x);
 
-        const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
+            const float diff_val = max_val  - max_val_new;
+            const float diff_add = tmp[i].x - max_val_new;
 
-        const float max_val_new = fmaxf(max_val, tmp.x);
+            const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
+            const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
 
-        const float diff_val = max_val - max_val_new;
-        const float diff_add = tmp.x   - max_val_new;
+            // a block that had no keys wrote its meta only (rowsum 0, the lowest max): its data is never used
+            dst_val = scale_add != 0.0f ? scale_val*dst_val + scale_add*add[i] : scale_val*dst_val;
+            rowsum  = scale_val*rowsum  + scale_add*tmp[i].y;
 
-        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
-        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
-
-        dst_val = scale_val*dst_val + scale_add*dst_add;
-        rowsum  = scale_val*rowsum  + scale_add*tmp.y;
-
-        max_val = max_val_new;
+            max_val = max_val_new;
+        }
     }
 
-    // Write back final result:
-    *dst = dst_val / rowsum;
+    // Write back final result (every cell masked: nothing to attend to), times the output's scale (the separate scale's
+    // two roundings, ggml_cuda_flash_attn_ext_scaled)
+    *dst = rowsum > 0.0f ? (dst_val / rowsum) * out_scale : 0.0f;
 }
+
+// the output's scale for a launch whose combine does not apply it: as the scale op computes it
+static __global__ void flash_attn_scale_out(float * __restrict__ x, const float s, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] = s*x[i] + 0.0f;
+    }
+}
+
+// the scale on the attention's output (ggml_cuda_flash_attn_ext_scaled), 1 otherwise
+extern thread_local float ggml_cuda_fattn_out_scale;
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
 // (blocks_num.x not a multiple of ntiles_dst)
@@ -816,26 +991,36 @@ static __global__ void flash_attn_stream_k_fixup_general(
         const uint3 fd_iter_k_j_z_ne12,
         const uint3 fd_iter_k_j_z,
         const uint3 fd_iter_k_j,
-        const uint3 fd_iter_k) {
+        const uint3 fd_iter_k,
+        const int nblocks) {
     float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
     const float2 * GGML_CUDA_RESTRICT dst_fixup = dst_fixup_ptr;
     constexpr int ncols = ncols1*ncols2;
 
-    const int bidx0 = blockIdx.x;
+    // A block per output tile (a grid per attention block was mostly blocks that exit at once: 24k of them for a
+    // 128-row prompt chunk, 25 us). The tile's combine starts from the attention block that holds its last unit of
+    // work, as before; nblocks is the attention kernel's grid.
+    const int tile  = blockIdx.x;
     const int j     = blockIdx.y;
     const int c     = blockIdx.z;
     const int jc    = j*ncols2 + c;
     const int tid   = threadIdx.x;
 
-    const float * dst_fixup_data = ((const float *) dst_fixup) + gridDim.x*(2*2*ncols);
+    const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks*(2*2*ncols);
 
-    const int kbc0      = int64_t(bidx0 + 0)*total_work / gridDim.x;
-    const int kbc0_stop = int64_t(bidx0 + 1)*total_work / gridDim.x;
+    const int iter_k = (int) fd_iter_k.z;
+    const int u_last = (tile + 1)*iter_k - 1;
+    int bidx0 = (int) ((int64_t(u_last) + 1)*nblocks / total_work);
+    while (bidx0 > 0 && int64_t(bidx0)*total_work / nblocks > u_last) {
+        bidx0--;
+    }
+    while (bidx0 + 1 < nblocks && int64_t(bidx0 + 1)*total_work / nblocks <= u_last) {
+        bidx0++;
+    }
+    const int kbc0 = int64_t(bidx0)*total_work / nblocks;
 
-    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
-    const bool wrote_beginning_of_tile = fastmodulo(kbc0, fd_iter_k) == 0;
-    const bool did_not_write_last      = fastdiv(kbc0, fd_iter_k) == fastdiv(kbc0_stop, fd_iter_k) && fastmodulo(kbc0_stop, fd_iter_k) != 0;
-    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+    // a block from the tile's beginning holds all of it: nothing to combine
+    if (kbc0 <= tile*iter_k) {
         return;
     }
 
@@ -877,7 +1062,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        const int kbc = int64_t(bidx)*total_work / gridDim.x;
+        const int kbc = int64_t(bidx)*total_work / nblocks;
         if (kbc == kbc_stop) { // Did not have any data.
             bidx--;
             kbc_stop = kbc;
@@ -886,7 +1071,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
 
         const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
 
-        const float2 tmp = dst_fixup[(gridDim.x + bidx)*ncols + jc];
+        const float2 tmp = dst_fixup[(nblocks + bidx)*ncols + jc];
 
         // Scale the current and new value accumulators depending on the max. values.
         const float max_val_new = fmaxf(max_val, tmp.x);
@@ -910,8 +1095,8 @@ static __global__ void flash_attn_stream_k_fixup_general(
         kbc_stop = kbc;
     }
 
-    // Write back final result:
-    *dst = dst_val / rowsum;
+    // Write back final result (every cell masked: nothing to attend to):
+    *dst = rowsum > 0.0f ? dst_val / rowsum : 0.0f;
 }
 
 template<int D> // D == head size
@@ -969,14 +1154,21 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    // every cell masked: nothing to attend to
+    dst[tid] = VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f;
 }
+
+// The scan of the mask for the furthest unmasked KV tile per query tile (flash_attn_mask_to_KV_max) depends on the
+// mask alone, which the layers of one kind share: one scan per mask per graph, kept in a buffer of the context's
+// (fattn.cu). Returns the buffer and whether this call has to fill it; null for no buffer.
+int * ggml_cuda_kv_max_lookup(ggml_backend_cuda_context & ctx, const void * mask, int ne, int iter_k, int ncols1, int64_t s31, int64_t s33, bool gaps, bool & fresh);
+void  ggml_cuda_kv_max_graph_begin(ggml_backend_cuda_context & ctx);
 
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool force_one_per_tile = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1002,6 +1194,8 @@ void launch_fattn(
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
+    const float out_scale  = ggml_cuda_fattn_out_scale;
+    bool        out_scaled = false;
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1010,6 +1204,7 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    int *                        KV_max_shared = nullptr; // the scan kept across the graph's layers, see ggml_cuda_kv_max_lookup
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1087,7 +1282,13 @@ void launch_fattn(
         }
     }
 
-    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    // the variable-length layout (flash_attn_varlen_tile): one sequence of all the rows and the table as K/V streams
+    const ggml_tensor * vtab = KQV->src[5];
+    const bool varlen        = vtab != nullptr && Q->ne[3] == 1 && vtab->ne[0] > 1;
+    const int  n_seq_varlen  = varlen ? (int) ((vtab->ne[0] - 1) / 3) : 0;
+    GGML_ASSERT(!varlen || force_one_per_tile);
+
+    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1) + n_seq_varlen;
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
@@ -1109,21 +1310,36 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || varlen)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
+        // the gaps only for the variant for several sequences (force_one_per_tile), which skips them; the others stop
+        // early only, and the scan from the end stops at the first tile with keys
+        const bool gaps = force_one_per_tile;
         const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
-        const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
+        const dim3 block_dim_KV_max(gaps ? FATTN_MASK_SCAN_THREADS : FATTN_KQ_STRIDE/2, 1, 1);
 
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
-        CUDA_CHECK(cudaGetLastError());
+        bool fresh = true;
+        KV_max_shared = ggml_cuda_kv_max_lookup(ctx, mask->data, 5*ne_KV_max, iter_k, ncols1, s31, s33, gaps, fresh);
+        if (KV_max_shared == nullptr) {
+            KV_max.alloc(5*ne_KV_max);
+        }
+        if (fresh) {
+            ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+            if (gaps) {
+                ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
+                    (const half2 *) mask->data, KV_max_shared ? KV_max_shared : KV_max.ptr, iter_k, s31, s33,
+                    varlen ? (const int *) vtab->data : nullptr, (int) mask->ne[1]);
+            } else {
+                ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max_end<ncols1>, launch_params,
+                    (const half2 *) mask->data, KV_max_shared ? KV_max_shared : KV_max.ptr, iter_k, s31, s33, (int) mask->ne[1]);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1151,11 +1367,28 @@ void launch_fattn(
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
-        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+        static const int split_env = [] { const char * e = getenv("GGML_CUDA_FA_SPLIT"); return e ? atoi(e) : -1; }();
+        // one block per tile measured 0.25 ms slower per verify step than stream-k (E4B, 32 streams): opt-in only.
+        // The variant for several sequences (force_one_per_tile) splits a tile by its own keys, so a sequence's keys
+        // are summed the same way wherever it sits in the batch; the others keep stream-k, which a block a tile starves
+        // at a few sequences (D128, 2 sequences: 16 blocks)
+        const bool one_per_tile = force_one_per_tile || split_env == 0;
+        const bool use_stream_k = !one_per_tile && should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
         blocks_num.z = 1;
+
+        static const bool fa_trace = getenv("GGML_CUDA_FA_TRACE") != nullptr;
+        if (fa_trace) {
+            static std::mutex mtx;
+            static std::set<std::array<int64_t, 6>> seen;
+            std::lock_guard<std::mutex> lock(mtx);
+            if (seen.insert({K->ne[1], Q->ne[1], Q->ne[3], ntiles_dst, (int64_t) use_stream_k, max_blocks}).second) {
+                fprintf(stderr, "[fa] n_kv %lld q_rows %lld streams %lld tiles %d stream_k %d max_blocks %d ncols %d\n",
+                        (long long) K->ne[1], (long long) Q->ne[1], (long long) Q->ne[3], ntiles_dst, (int) use_stream_k, max_blocks, ncols1*ncols2);
+            }
+        }
 
         if(use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
@@ -1171,6 +1404,17 @@ void launch_fattn(
                 : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
+        } else if (force_one_per_tile && !varlen && (KV_max_shared || KV_max.ptr)) {
+            // several blocks a tile, each a share of the keys the tile sees (flash_attn_ext_f16): every tile of the
+            // launch splits its own keys by the same rule, so a sequence's keys are summed the same way wherever it
+            // sits in the batch. As many shares as the card holds blocks for the tiles, up to 24: two sequences split
+            // finely, 32 coarsely (a tile with fewer batches than shares works on its last blocks only).
+            // GGML_CUDA_FA_SHARES=N fixes the number, 1 keeps one block a tile
+            static const int shares_env = getenv("GGML_CUDA_FA_SHARES") ? atoi(getenv("GGML_CUDA_FA_SHARES")) : 0;
+            const int s = shares_env > 0 ? shares_env : std::max(1, std::min(24, max_blocks / ntiles_dst));
+            if (s > 1) {
+                blocks_num.x = ntiles_dst*s;
+            }
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
@@ -1242,7 +1486,8 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        KV_max_shared ? KV_max_shared : KV_max.ptr,
+        KQV->src[5] ? (const int *) KQV->src[5]->data : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
@@ -1270,7 +1515,8 @@ void launch_fattn(
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
-                 gqa_ratio, bpt, fd0, fd1, fd2);
+                 gqa_ratio, bpt, fd0, fd1, fd2, out_scale);
+            out_scaled = true;
         } else if (ntiles_dst % blocks_num.x != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;
@@ -1281,13 +1527,13 @@ void launch_fattn(
             const uint3 fd_k          = init_fastdiv_values(ntiles_KV);
 
             const dim3 block_dim_combine(DV, 1, 1);
-            const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
+            const dim3 blocks_num_combine = {(unsigned) ntiles_dst, ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
-                 fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
+                 fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k, (int) blocks_num.x);
         }
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
@@ -1297,6 +1543,10 @@ void launch_fattn(
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+    }
+    if (out_scale != 1.0f && !out_scaled) {
+        const int64_t n = ggml_nelements(KQV);
+        flash_attn_scale_out<<<(unsigned) ((n + 255) / 256), 256, 0, main_stream>>>((float *) KQV->data, out_scale, n);
     }
     CUDA_CHECK(cudaGetLastError());
 }

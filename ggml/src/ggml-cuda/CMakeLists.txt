@@ -120,6 +120,7 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+
     # The weight quantizers reproduce ggml-quants.c block for block, so this
     # file opts out of the -use_fast_math set above: an approximate reciprocal
     # or a contracted multiply-add moves a scale by one ulp, which is enough to
@@ -154,7 +155,7 @@ if (CUDAToolkit_FOUND)
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
+            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
         else ()
             if (GGML_CUDA_CUB_3DOT2)
                 target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
@@ -169,7 +170,7 @@ if (CUDAToolkit_FOUND)
         if (GGML_CUDA_CUB_3DOT2)
             target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
         endif()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
     endif()
 
     if (GGML_CUDA_NO_VMM)

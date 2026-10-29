@@ -765,6 +765,15 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    // a float type as BF16 is (no blocks, no scale inside): the quantized-type kernels do not take it
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -3373,6 +3382,16 @@ void ggml_mul_mat_set_hint(
     const int32_t hint_i32 = (int32_t) hint;
 
     ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
+void ggml_mul_mat_set_n_seqs(struct ggml_tensor * a, int32_t n_seqs) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+
+    ggml_set_op_params_i32(a, 2, n_seqs);
+}
+
+int32_t ggml_mul_mat_get_n_seqs(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_MUL_MAT ? ggml_get_op_params_i32(a, 2) : 0;
 }
 
 // ggml_mul_mat_id
@@ -8088,6 +8107,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_F8_E4M3: result = quantize_f8_e4m3(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

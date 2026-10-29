@@ -87,11 +87,13 @@ struct time_meas {
 };
 
 // LLAMA_HOST_OFF=<mask> turns host-side paths off for A/B: 1 sync once, 2 greedy candidates dedupe, 4 batched greedy rows,
-// 8 the server yield that does not wait for an idle worker (read in tools/server)
+// 8 the server yield that does not wait for an idle worker (read in tools/server), 16 one staged copy of the greedy rows'
+// logits
 enum llama_host_off_bit : uint32_t {
     LLAMA_HOST_OFF_SYNC_ONCE     = 1,
     LLAMA_HOST_OFF_CAND_DEDUPE   = 2,
     LLAMA_HOST_OFF_GREEDY_BATCH  = 4,
+    LLAMA_HOST_OFF_LOGIT_STAGE   = 16,
 };
 
 bool llama_host_off(uint32_t bit);

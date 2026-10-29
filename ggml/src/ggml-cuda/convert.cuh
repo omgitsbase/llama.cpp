@@ -60,6 +60,11 @@ template<typename dst_t, typename src_t>
 #endif // GGML_USE_HIP
     } else if constexpr(std::is_same_v<dst_t, int32_t>) {
         return int32_t(x);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    } else if constexpr(std::is_same_v<dst_t, __nv_fp8_e4m3>) {
+        // round to nearest even, saturating at 448 (ggml_fp32_to_e4m3)
+        return __nv_fp8_e4m3(float(x));
+#endif
     } else {
         return float(x);
     }

@@ -46,6 +46,8 @@ public:
         }
 
         has_shift = false;
+        ordered   = true;
+        seq_only  = -1;
 
         used.clear();
 
@@ -56,6 +58,8 @@ public:
 
     void reset_shift() {
         has_shift = false;
+        ordered   = true;
+        seq_only  = -1;
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
             shift[i] = 0;
@@ -84,6 +88,16 @@ public:
 
     uint32_t get_used() const {
         return used.size();
+    }
+
+    // every used cell i holds position i for the one sequence seq_only, with no hole and no shift: a decode
+    // stream filled in order. Its mask row is one span, see set_input_kq_mask_impl
+    bool is_ordered() const {
+        return ordered && !used.empty() && *used.rbegin() + 1 == used.size();
+    }
+
+    llama_seq_id get_seq_only() const {
+        return seq_only;
     }
 
     // the index of the first cell that is used
@@ -143,11 +157,20 @@ public:
         return res;
     }
 
-    // copy the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
-    llama_kv_cells cp(const std::vector<uint32_t> & idxs) const {
-        llama_kv_cells res;
+    // the saved state of some cells; a whole llama_kv_cells would also build LLAMA_MAX_SEQ empty position sets
+    struct snapshot {
+        std::vector<llama_pos>         pos;
+        std::vector<llama_kv_cell_ext> ext;
+        std::vector<seq_set_t>         seq;
+    };
 
-        res.resize(idxs.size());
+    // copy the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
+    snapshot cp(const std::vector<uint32_t> & idxs) const {
+        snapshot res;
+
+        res.pos.resize(idxs.size());
+        res.ext.resize(idxs.size());
+        res.seq.resize(idxs.size());
 
         for (uint32_t j = 0; j < idxs.size(); ++j) {
             const auto idx = idxs[j];
@@ -187,6 +210,7 @@ public:
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
+                note_cell(idx);
             }
 
             assert(shift[idx] == 0);
@@ -194,7 +218,7 @@ public:
     }
 
     // set the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
-    void set(const std::vector<uint32_t> & idxs, const llama_kv_cells & other) {
+    void set(const std::vector<uint32_t> & idxs, const snapshot & other) {
         assert(idxs.size() == other.pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
@@ -218,6 +242,7 @@ public:
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
+                note_cell(idx);
             }
 
             assert(shift[idx] == 0);
@@ -237,6 +262,7 @@ public:
         shift[i] = 0;
 
         used.erase(i);
+        note_empty();
     }
 
     // note: call only if the cell has seq_id
@@ -256,6 +282,7 @@ public:
             shift[i] = 0;
 
             used.erase(i);
+            note_empty();
 
             return true;
         }
@@ -350,6 +377,15 @@ public:
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
 
+        if (seq[i].any()) {
+            ordered = false;
+        }
+        if (seq_only == -1) {
+            seq_only = seq_id;
+        } else if (seq_only != seq_id) {
+            ordered = false;
+        }
+
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
     }
@@ -394,6 +430,11 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // every cell's position, -1 for an empty one
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
@@ -435,6 +476,8 @@ public:
         pos[i] = p;
 
         used.insert(i);
+
+        ordered = ordered && (llama_pos) i == p;
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
@@ -448,6 +491,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        ordered = false;
 
         seq_pos_rm(i);
 
@@ -478,6 +523,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        ordered = false;
+
         const llama_pos p_old = pos[i];
 
         seq_pos_rm(i);
@@ -495,6 +542,32 @@ private:
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;
+
+    // see is_ordered
+    bool         ordered  = true;
+    llama_seq_id seq_only = -1;
+
+    // a cell written whole (a restore): in order only at its own position with the one sequence
+    void note_cell(uint32_t i) {
+        if (pos[i] != (llama_pos) i || seq[i].count() != 1) {
+            ordered = false;
+            return;
+        }
+        const llama_seq_id s = seq_get(i);
+        if (seq_only == -1) {
+            seq_only = s;
+        } else if (seq_only != s) {
+            ordered = false;
+        }
+    }
+
+    // an emptied stream starts over
+    void note_empty() {
+        if (used.empty()) {
+            ordered  = true;
+            seq_only = -1;
+        }
+    }
 
     std::vector<llama_pos> pos;
 

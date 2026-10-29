@@ -776,6 +776,15 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Copies positions [0, n) of seq_id_src into seq_id_dst, which holds none of them, also between the streams of a
+    // cache with a stream per sequence. Returns false, changing nothing, when the memory cannot (the source no longer
+    // holds a position the copy needs, recurrent state)
+    LLAMA_API bool llama_memory_seq_cp_prefix(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos n);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

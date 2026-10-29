@@ -172,6 +172,11 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // the batch process() sees next is the step's last decode, see common_speculative_set_last_decode
+    bool last_decode = false;
+    // (optional) whether the drafter takes the target's hidden rows of such a decode on the device
+    virtual bool leaves_rows() const { return false; }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1426,9 +1431,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_tokens *           ids_result    = nullptr;
         int32_t                  ids_col       = -1;
         llama_pos                ids_n_past    = -1;
+        // a round launched behind the last verify (chain_host_early): this sequence's column in it, and the verify's
+        // first position; ids_early marks drafts handed on from such a round
+        int32_t                  early_col     = -1;
+        llama_pos                early_base    = -1;
+        bool                     ids_early     = false;
     };
     std::vector<chain_seq> chain;
     bool chain_launched = false; // a chained decode no draft has taken yet is in flight
+
+    // the round chain_host_early put behind the last verify, and how such rounds fared (LLAMA_ROUND_TIMING)
+    bool        early_launched = false;
+    llama_batch early_batch    = {};
+    struct early_stats {
+        int launched = 0, used = 0, fallback = 0, here = 0, stale = 0;
+        void note() {
+            static const bool on = getenv("LLAMA_ROUND_TIMING") != nullptr;
+            if (on && (used + fallback) % 200 == 0 && used + fallback > 0) {
+                fprintf(stderr, "[round] early drafts: launched %d, used %d, host fallback %d, anchors right %d, stale %d\n",
+                        launched, used, fallback, here, stale);
+            }
+        }
+    } early;
 
     std::vector<int32_t>             round_c; // the host route's inputs
     std::vector<float>               round_h;
@@ -1441,6 +1465,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         cs.replay_n   = 0;
         cs.defer_last = false;
         cs.col        = -1;
+        cs.early_col  = -1;
         chain_launched = false;
         for (const auto & c : chain) {
             chain_launched = chain_launched || c.col >= 0;
@@ -1592,6 +1617,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return here;
     }
 
+    // the ids of a round over the target's cache: K per sequence, a column each; a round launched behind the verify
+    // (chain_host_early) has a row of accepted counts after them, which the host's acceptance should have matched
+    void take_ids_host(const chain_seq & cs, int32_t col, llama_tokens & result) {
+        const int K = n_chain_host;
+        int32_t n_ids = 0;
+        const llama_token * ids = llama_get_mtp_chain_ids(params.ctx_dft, &n_ids);
+        const int32_t S = llama_get_mtp_chain_n_seq(params.ctx_dft);
+        GGML_ASSERT((n_ids == K*S || n_ids == (K + 1)*S) && col >= 0 && col < S);
+        if (n_ids == (K + 1)*S && cs.ids_early) {
+            const int32_t n_acc = ids[K*S + col];
+            const bool here = cs.ids_n_past == cs.early_base + n_acc + 1;
+            if (here) {
+                early.here++;
+            } else {
+                early.stale++;
+                SPC_DBG("early draft for a stale anchor: n_past %d, round counted %d accepted from %d\n",
+                        (int) cs.ids_n_past, (int) n_acc, (int) cs.early_base);
+            }
+        }
+        const size_t n = std::min<size_t>(K, result.size());
+        for (size_t j = 0; j < n; ++j) {
+            result[j] = ids[j*S + col];
+        }
+    }
+
     bool resolve_ids(llama_seq_id seq_id) override {
         if (ids_pending(seq_id) == nullptr) {
             return false;
@@ -1599,6 +1649,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto & cs = chain[seq_id];
         llama_tokens * result = cs.ids_result;
         cs.ids_result = nullptr;
+        if (n_chain_host > 0) {
+            take_ids_host(cs, cs.ids_col, *result);
+            cs.ids_early = false;
+            return true;
+        }
         // drafted for a place the server has left, the verify took them on the device already and rejects them
         // like any other wrong guess
         take_ids(cs, cs.ids_col, cs.ids_n_past, *result, true);
@@ -1702,6 +1757,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    // the rows left on the target (the step's last decode): their first batch row, the accepted row the next draft
+    // anchors on, read back only when the device cannot take them (LLAMA_NO_EMBD_DEV=1 reads them back always)
+    std::vector<int32_t> verify_h_beg;
+    std::vector<bool>    verify_h_dev;
+    std::vector<int32_t> pending_i_h;
+
+    // LLAMA_NO_EMBD_DEV=1 reads the rows back after every verify
+    bool leaves_rows() const override {
+        static const bool no_embd_dev = getenv("LLAMA_NO_EMBD_DEV") != nullptr;
+        return n_chain_host > 0 && !no_embd_dev;
+    }
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1773,7 +1839,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const uint32_t n_round_rows = n_seq * (2*this->params.n_max + 1);
         const bool seqs_ok = n_seq == 1 || (chain_seqs && llama_context_kv_unified(ctx_dft) && llama_context_kv_unified(ctx_tgt) &&
                 n_round_rows <= llama_n_ubatch(ctx_dft) && n_round_rows <= llama_n_batch(ctx_dft));
-        if (!no_chain && is_mem_shared && n_seq == 1 && this->params.n_max >= 2 && llama_context_flash_attn(ctx_dft) &&
+        // over the target's cache every sequence's K rows go in one decode, sequence after sequence
+        const uint32_t n_host_rows = n_seq * (uint32_t) this->params.n_max;
+        if (!no_chain && is_mem_shared && n_host_rows <= llama_n_ubatch(ctx_dft) && n_host_rows <= llama_n_batch(ctx_dft) &&
+                this->params.n_max >= 2 && llama_context_flash_attn(ctx_dft) &&
                 llama_model_has_mtp_chain(llama_get_model(ctx_dft))) {
             n_chain_host = this->params.n_max;
             SPC_TRC("- chained drafting over the target's cache, n=%d\n", n_chain_host);
@@ -1815,6 +1884,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        verify_h_beg.assign(n_seq, -1);
+        verify_h_dev.assign(n_seq, false);
+        pending_i_h.assign(n_seq, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1835,6 +1907,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+        if (early_batch.token != nullptr) {
+            llama_batch_free(early_batch);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1951,7 +2026,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // the next round goes on the device right behind this verify when it holds every verify that was due
-        bool dev = all_deferred;
+        // every verify that was due is in this batch; other rows (a prompt chunk in the same forward) went through
+        // the drafter above and do not hold the device round back
+        bool dev = !deferred.empty();
         for (llama_seq_id seq = 0; dev && seq < (llama_seq_id) n_seq; ++seq) {
             dev = chain[seq].expect < 0 || is_deferred[seq];
         }
@@ -2095,6 +2172,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+            verify_h_beg[seq_id]  = i_batch_beg[seq_id];
+
+            // the step's last decode leaves its rows on the target until the next draft takes them there
+            if (last_decode && leaves_rows()) {
+                verify_h_dev[seq_id] = true;
+                pending_i_h[seq_id]  = n_rows - 1;
+                continue;
+            }
+            verify_h_dev[seq_id] = false;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -2106,43 +2192,246 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
+        if (n_chain_host > 0 && last_decode && leaves_rows()) {
+            chain_host_early(batch_in);
+        }
+
         return true;
     }
 
-    // the round of a drafter over the target's cache: one decode of n_chain_host rows at the anchor's position, the
-    // anchor in row 0, every other row filled on the device from the step before it; the ids come back together
+    // vLLM's runner drafts the next round from the rejection sampler's output on the device before the host sees
+    // either (gpu_model_runner: _sample, then propose_draft_token_ids from the padded batch, nothing read back), so the
+    // host's acceptance and the next step's setup run while the GPU drafts. The same here: the round of a drafter over
+    // the target's cache goes on the device right behind the verify. Its batch holds every outcome of the verify per
+    // sequence (llama_set_mtp_dev_anchors) and the graph drafts from the one the target's samples give; draft() hands
+    // those drafts to the next verify. LLAMA_NO_EARLY_DRAFT=1 drafts after the host's acceptance only.
+    void chain_host_early(const llama_batch & batch_in) {
+        static const bool off = getenv("LLAMA_NO_EARLY_DRAFT") != nullptr;
+        early_launched = false;
+        for (auto & cs : chain) {
+            cs.early_col = -1;
+        }
+        if (off || n_chain_host <= 0) {
+            return;
+        }
+        auto * ctx_tgt = params.ctx_tgt;
+        auto * ctx_dft = params.ctx_dft;
+        const int K = n_chain_host;
+        const int V = K + 1;
+
+        // the sequences whose rows are a verify: V of them at consecutive positions, all sampled on the device
+        std::vector<llama_seq_id>        seqs;
+        std::vector<llama_mtp_round_seq> rs;
+        for (llama_seq_id seq = 0; seq < (llama_seq_id) n_seq; ++seq) {
+            const int32_t beg = i_batch_beg[seq];
+            if (beg < 0) {
+                continue;
+            }
+            bool ok = i_batch_end[seq] - beg + 1 == V && llama_sampler_on_backend(ctx_tgt, seq);
+            for (int32_t k = beg; ok && k < beg + V; ++k) {
+                ok = batch_in.seq_id[k][0] == seq && batch_in.pos[k] == batch_in.pos[beg] + (k - beg);
+            }
+            llama_mtp_round_seq q;
+            q.seq_id = seq;
+            q.off    = 1;
+            ok = ok && llama_get_last_rows(ctx_tgt, seq, batch_in.pos[beg], V, &q.tgt_row, &q.tgt_out);
+            if (!ok) {
+                continue;
+            }
+            seqs.push_back(seq);
+            rs.push_back(q);
+        }
+        const int S = (int) seqs.size();
+        // the whole round in one ubatch
+        if (S < 2 || (uint32_t) (S*V) > llama_n_ubatch(ctx_dft) || (uint32_t) (S*V) > llama_n_batch(ctx_dft)) {
+            return;
+        }
+
+        // row j of a sequence: the verify's token j at the position of the anchor had the target accepted j drafts
+        if (early_batch.token == nullptr) {
+            early_batch = llama_batch_init((int32_t) llama_n_batch(ctx_dft), 0, 1);
+        }
+        common_batch_clear(early_batch);
+        for (int s = 0; s < S; ++s) {
+            const int32_t beg = i_batch_beg[seqs[s]];
+            for (int j = 0; j < V; ++j) {
+                common_batch_add(early_batch, batch_in.token[beg + j], batch_in.pos[beg] + 1 + j, { seqs[s] }, false);
+            }
+        }
+
+        llama_set_mtp_round_target(ctx_dft, ctx_tgt);
+        llama_set_mtp_round_seqs(ctx_dft, rs.data(), S);
+        llama_set_mtp_dev_anchors(ctx_dft, true);
+        llama_set_mtp_chain(ctx_dft, K);
+        // the verify's outputs go out before the round's work lands on the target's stream: the host reads them while
+        // the round runs (LLAMA_NO_OUTPUTS_FENCE=1 waits for both)
+        static const bool no_fence = getenv("LLAMA_NO_OUTPUTS_FENCE") != nullptr;
+        if (!no_fence) {
+            llama_outputs_fence(ctx_tgt);
+        }
+        llama_round_mark("early.launch.begin", S);
+        const int ret = llama_decode(ctx_dft, early_batch);
+        llama_round_mark("early.launch.end", ret);
+        llama_set_mtp_chain(ctx_dft, 0);
+        llama_set_mtp_dev_anchors(ctx_dft, false);
+        if (ret != 0) {
+            SPC_ERR("llama_decode(early round over the target's cache, n=%d, n_seq=%d) returned %d\n", K, S, ret);
+            return;
+        }
+        // the target's next graph overwrites the rows this round copies: it waits for the round
+        llama_order_after(ctx_tgt, ctx_dft);
+
+        early_launched = true;
+        early.launched++;
+        for (int s = 0; s < S; ++s) {
+            chain[seqs[s]].early_col  = s;
+            chain[seqs[s]].early_base = batch_in.pos[i_batch_beg[seqs[s]]];
+        }
+    }
+
+    // the round of a drafter over the target's cache: one decode of n_chain_host rows per drafting sequence, sequence
+    // after sequence, all at the anchor's position, the anchor in each sequence's first row and every other row filled
+    // on the device from the step before it; the ids come back together, step by step, a column per sequence
     void draft_chain_host(common_speculative_draft_params_vec & dparams) {
         auto * ctx_dft = params.ctx_dft;
         const int K = n_chain_host;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // ids of the last round nobody took (a request that ended) come back before the round's tensors go
+        resolve_all();
+
+        // the round launched behind the last verify drafted for every outcome the target could give: its drafts go to
+        // the next verify when every drafting sequence is in it, the host drafts otherwise. A few sequences outside it
+        // (a prompt that just ended: its last chunk was no verify) verify placeholder drafts this once and the rest
+        // keep theirs, where a host round redrafted every sequence (a step in six, ~3 ms each).
+        // LLAMA_NO_EARLY_PARTIAL=1 drafts on the host then.
+        if (early_launched) {
+            early_launched = false;
+            int n_drafting = 0;
+            int n_missing  = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!dparams[seq_id].drafting) {
+                    continue;
+                }
+                n_drafting++;
+                n_missing += chain[seq_id].early_col < 0 ? 1 : 0;
+            }
+            static const bool no_handoff_early = getenv("LLAMA_NO_DRAFT_HANDOFF") != nullptr;
+            static const bool no_partial       = getenv("LLAMA_NO_EARLY_PARTIAL") != nullptr;
+            const bool all     = n_missing == 0;
+            const bool partial = !no_partial && n_missing > 0 && n_missing <= std::max(2, n_drafting/8) && n_missing < n_drafting;
+            if (n_drafting > 0 && (all || partial) && !no_handoff_early) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    auto & dp = dparams[seq_id];
+                    if (!dp.drafting) {
+                        continue;
+                    }
+                    auto & cs = chain[seq_id];
+                    if (cs.early_col < 0) {
+                        // the placeholders are its draft, from the host: the verify rejects them like any wrong guess
+                        dp.result->insert(dp.result->end(), K, dp.id_last);
+                        continue;
+                    }
+                    dp.result->insert(dp.result->end(), K, dp.id_last);
+                    cs.ids_result = dp.result;
+                    cs.ids_col    = cs.early_col;
+                    cs.ids_n_past = dp.pos0;
+                    cs.ids_early  = true;
+                    // the round gathered this anchor's hidden row already
+                    verify_h_dev[seq_id] = false;
+                }
+                early.used++;
+                early.note();
+                return;
+            }
+            early.fallback++;
+            early.note();
+        }
+
+        std::vector<llama_seq_id> seqs;
+        // anchors left on the target: their sequence, the accepted token's position and the batch row
+        std::vector<llama_seq_id> dev_seq;
+        std::vector<llama_pos>    dev_pos;
+        std::vector<int32_t>      dev_row;
+        common_batch_clear(batch);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
             }
-            common_batch_clear(batch);
+            seqs.push_back(seq_id);
             for (int j = 0; j < K; ++j) {
                 common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.pos0, { seq_id }, false);
                 float * h = batch.embd + (size_t) (batch.n_tokens - 1) * n_embd;
                 if (j == 0) {
-                    std::memcpy(h, pending_h[seq_id].data(), row_bytes);
+                    if (verify_h_dev[seq_id]) {
+                        dev_seq.push_back(seq_id);
+                        dev_pos.push_back(dp.pos0 - 1);
+                        dev_row.push_back(batch.n_tokens - 1);
+                        std::memset(h, 0, row_bytes);
+                    } else {
+                        std::memcpy(h, pending_h[seq_id].data(), row_bytes);
+                    }
                 } else {
                     std::memset(h, 0, row_bytes);
                 }
             }
-            llama_set_mtp_chain(ctx_dft, K);
-            llama_round_mark("chain.launch.begin", 2);
-            const int ret = llama_decode(ctx_dft, batch);
-            llama_round_mark("chain.launch.end", ret);
-            llama_set_mtp_chain(ctx_dft, 0);
-            if (ret != 0) {
-                SPC_ERR("llama_decode(chained over the target's cache, n=%d) returned %d\n", K, ret);
-                continue;
+        }
+        if (seqs.empty()) {
+            return;
+        }
+        if (!dev_seq.empty()) {
+            std::vector<char> okc(dev_seq.size(), 0);
+            llama_set_embd_device_rows(ctx_dft, params.ctx_tgt, dev_seq.data(), dev_pos.data(), (int32_t) dev_seq.size(), (bool *) okc.data());
+            for (size_t i = 0; i < dev_seq.size(); ++i) {
+                const llama_seq_id seq_id = dev_seq[i];
+                verify_h_dev[seq_id] = false;
+                if (okc[i]) {
+                    continue;
+                }
+                // not on the target any more: the host copy, still the target's last output
+                const float * hh = llama_get_embeddings_nextn_ith(params.ctx_tgt, verify_h_beg[seq_id] + pending_i_h[seq_id]);
+                std::memcpy(pending_h[seq_id].data(), hh, row_bytes);
+                std::memcpy(batch.embd + (size_t) dev_row[i] * n_embd, hh, row_bytes);
             }
-            int32_t n_ids = 0;
-            const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft, &n_ids);
-            GGML_ASSERT(n_ids == K);
-            dp.result->insert(dp.result->end(), ids, ids + K);
+        }
+
+        llama_set_mtp_chain(ctx_dft, K);
+        llama_round_mark("chain.launch.begin", 2);
+        const int ret = llama_decode(ctx_dft, batch);
+        llama_round_mark("chain.launch.end", ret);
+        llama_set_mtp_chain(ctx_dft, 0);
+        if (ret != 0) {
+            SPC_ERR("llama_decode(chained over the target's cache, n=%d, n_seq=%d) returned %d\n", K, (int) seqs.size(), ret);
+            return;
+        }
+
+        const int S = (int) seqs.size();
+
+        // The ids stay on the device: the verify takes them there (llama_set_tokens_device_seq) and the host reads
+        // them after it, when they have long been written, so the verify is queued before this round has run.
+        // Placeholders stand in the draft until then. LLAMA_NO_DRAFT_HANDOFF reads them back now.
+        static const bool no_handoff = getenv("LLAMA_NO_DRAFT_HANDOFF") != nullptr;
+        if (!no_handoff) {
+            for (int s = 0; s < S; ++s) {
+                auto & dp = dparams[seqs[s]];
+                auto & cs = chain[seqs[s]];
+                dp.result->insert(dp.result->end(), K, dp.id_last);
+                cs.ids_result = dp.result;
+                cs.ids_col    = s;
+                cs.ids_n_past = dp.pos0;
+            }
+            return;
+        }
+
+        int32_t n_ids = 0;
+        const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft, &n_ids);
+        GGML_ASSERT(n_ids == K*S);
+        for (int s = 0; s < S; ++s) {
+            auto & result = *dparams[seqs[s]].result;
+            for (int j = 0; j < K; ++j) {
+                result.push_back(ids[j*S + s]);
+            }
         }
     }
 
@@ -2335,6 +2624,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        if (verify_h_dev[seq_id]) {
+            pending_i_h[seq_id] = i_h;
+            return;
+        }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
@@ -3373,6 +3666,18 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
+}
+
+bool common_speculative_set_last_decode(common_speculative * spec, bool last) {
+    if (spec == nullptr) {
+        return false;
+    }
+    bool leaves = false;
+    for (auto & impl : spec->impls) {
+        impl->last_decode = last;
+        leaves = leaves || (last && impl->leaves_rows());
+    }
+    return leaves;
 }
 
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {

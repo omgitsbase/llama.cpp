@@ -269,6 +269,7 @@ struct ggml_cuda_chain_args {
     int     n_steps;
     float * dst;
     int64_t ne[4];
+    nv_bfloat16 * dst_bf16 = nullptr; // a BF16 copy for the GEMM reading dst (ggml_cuda_bf16_shadow), or nullptr
 };
 
 static __device__ __forceinline__ float ggml_cuda_chain_unary(int op, float x) {

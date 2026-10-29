@@ -101,6 +101,8 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
 
     ggml_tensor * inp_tokens;
     ggml_tensor * inp_h;
+    ggml_tensor * inp_idx   = nullptr;
+    ggml_tensor * inp_stage = nullptr;
     {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_backbone);
 
@@ -115,20 +117,44 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         ggml_set_input(inp->embd);
         inp_h = inp->embd;
         res->t_inp_embd = inp->embd;
+        // anchor rows the target's verify left on the device, see llama_set_embd_device_rows
+        inp->embd_dev = embd_dev;
+        inp->sched    = sched;
+        // a chained draft gathers them from the stage by row index
+        if (K > 1 && embd_dev && embd_dev->stage && ubatch.embd) {
+            GGML_ASSERT(ubatch.n_tokens % K == 0);
+            inp->idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens / K);
+            cb(inp->idx, "inp_h_idx", -1);
+            ggml_set_input(inp->idx);
+            inp->chain_k = K;
+            inp_idx   = inp->idx;
+            inp_stage = embd_dev->stage;
+        }
 
         res->add_input(std::move(inp));
     }
 
     GGML_ASSERT(cparams.ctx_other != nullptr);
     const auto * model_other = llama_get_model(cparams.ctx_other);
+    // the target's ids are looked up in its head's device copy of the tied table (see llm_gather_table)
+    ggml_tensor * tgt_table = llm_gather_table(model_other->tok_embd, model_other->output);
 
     auto *        inp_attn    = build_attn_inp_kv_iswa();
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = K > 0 ? nullptr : build_inp_out_ids();
 
+    // a round over several sequences holds K rows of each, sequence after sequence; one taking its anchors on the
+    // device holds K + 1, one per outcome of the verify (llama_set_mtp_dev_anchors)
+    const bool    dev_anc     = K > 0 && cparams.mtp_dev_anchors;
+    const int64_t n_rows_seq  = dev_anc ? K + 1 : K;
+    const int64_t n_round_seq = K > 0 ? (int64_t) ubatch.n_tokens / n_rows_seq : 1;
+    ggml_tensor * round_mask[2] = { nullptr, nullptr };
+    dev_anchors   anc;
+
     // one pass over the rows of x_tok (the target's embeddings of the ids) and h_in (the target's hidden rows):
-    // the whole batch when row < 0, otherwise one row at `row` of the batch, attending with that row's mask
-    auto pass = [&](ggml_tensor * x_tok, ggml_tensor * h_in, ggml_tensor * pos, int row, ggml_tensor ** h_next) -> ggml_tensor * {
+    // the whole batch when row < 0, otherwise one row at `row` of the batch, attending with that row's mask, or in
+    // a round over several sequences a row of each
+    auto pass =[&](ggml_tensor * x_tok, ggml_tensor * h_in, ggml_tensor * pos, int row, ggml_tensor ** h_next) -> ggml_tensor * {
         const int64_t n_rows = x_tok->ne[1];
 
         ggml_tensor * x = ggml_scale(ctx0, x_tok, sqrtf((float) n_embd_backbone));
@@ -169,8 +195,43 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
                 cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                         Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
             } else {
-                cur = build_attn_mtp(llm_graph_mtp_attn_of(inp_attn, is_swa), model.layers[il].wo, nullptr, nullptr,
-                        Qcur, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il, row, false, nullptr);
+                const llm_graph_mtp_attn attn = llm_graph_mtp_attn_of(inp_attn, is_swa);
+                ggml_tensor * mask_in = nullptr;
+                if (n_round_seq > 1) {
+                    // a row per sequence, each at its anchor's position: every sequence's first row of the mask, made
+                    // contiguous for flash attention once per round and mask
+                    ggml_tensor *& mr = round_mask[is_swa ? 1 : 0];
+                    if (!mr && dev_anc) {
+                        // each sequence's mask row of the outcome the device counted: a stream per sequence, or one
+                        ggml_tensor * m = attn.kq_mask;
+                        ggml_tensor * g = nullptr;
+                        if (m->ne[3] > 1) {
+                            // the streams span the cache view, idle ones between the round's sequences included (their
+                            // rows all masked out): each stream takes the count of the sequence it holds
+                            ggml_tensor * sel = anc.sel_local;
+                            if (m->ne[3] != n_round_seq) {
+                                llm_graph_input_strm * si = build_inp_strm(n_round_seq, m->ne[3]);
+                                sel = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, anc.n_acc, 1, n_round_seq), si->strm_q), 1, m->ne[3]);
+                            }
+                            g = ggml_get_rows(ctx0, ggml_view_3d(ctx0, m, m->ne[0], n_rows_seq, m->ne[3], m->nb[1], m->nb[3], 0), sel);
+                        } else {
+                            g = ggml_get_rows(ctx0, ggml_view_2d(ctx0, m, m->ne[0], n_rows_seq*n_round_seq, m->nb[1], 0), anc.sel_flat);
+                        }
+                        mr = ggml_cast(ctx0, g, GGML_TYPE_F16);
+                        if (m->ne[3] > 1) {
+                            mr = ggml_reshape_4d(ctx0, mr, m->ne[0], 1, 1, m->ne[3]);
+                        }
+                    }
+                    if (!mr) {
+                        ggml_tensor * m = attn.kq_mask;
+                        mr = ggml_cont(ctx0, m->ne[3] > 1
+                            ? ggml_view_4d(ctx0, m, m->ne[0], 1, 1, m->ne[3], m->nb[1], m->nb[2], m->nb[3], 0)
+                            : ggml_view_2d(ctx0, m, m->ne[0], n_round_seq, m->nb[1]*K, 0));
+                    }
+                    mask_in = mr;
+                }
+                cur = build_attn_mtp(attn, model.layers[il].wo, nullptr, nullptr,
+                        Qcur, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il, row, false, mask_in);
             }
 
             if (row < 0 && il == n_layer_nextn - 1 && inp_out_ids) {
@@ -251,19 +312,64 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         // the round: row 0 of the batch is the anchor, its id and the target's hidden row; every step after it
         // takes the argmax and the hidden row of the one before, at the same position (all of the batch's rows
         // carry it) and over the cache as the host left it
-        GGML_ASSERT((int) ubatch.n_tokens == K && ubatch.token && "Gemma 4 assistant round: one row per draft, the anchor first");
+        GGML_ASSERT((int64_t) ubatch.n_tokens == n_rows_seq*n_round_seq && ubatch.token && "Gemma 4 assistant round: one row per draft, the anchor first");
         GGML_ASSERT(!ggml_backend_buffer_is_host(model_other->tok_embd->buffer) && "Gemma 4 assistant round: the target's token embedding must be readable by the device");
 
-        const size_t ps = ggml_element_size(inp_pos);
-        ggml_tensor * tok = ggml_get_rows(ctx0, model_other->tok_embd, ggml_view_1d(ctx0, inp_tokens, 1, 0));
-        ggml_tensor * h   = ggml_view_2d(ctx0, inp_h, n_embd_backbone, 1, inp_h->nb[1], 0);
+        const int64_t S  = n_round_seq;
+        const size_t  ps = ggml_element_size(inp_pos);
+
+        // the anchors: the first of each sequence's rows
+        ggml_tensor * tok;
+        ggml_tensor * h;
+        ggml_tensor * pos = nullptr;
+        if (dev_anc) {
+            // the anchor of the outcome the target's samples give, its hidden row and position (vLLM's padded drafter
+            // batch, its token_indices_to_sample worked out on the device)
+            GGML_ASSERT(S > 1 && "device anchors: a round over several sequences");
+            anc = build_mtp_dev_anchors(inp_tokens, K, n_embd_backbone, tgt_table);
+            tok = ggml_get_rows(ctx0, tgt_table, anc.id);
+            h   = anc.h;
+            pos = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, inp_pos, 1, n_rows_seq*S), anc.sel_flat), S);
+        } else if (S == 1) {
+            tok = ggml_get_rows(ctx0, tgt_table, ggml_view_1d(ctx0, inp_tokens, 1, 0));
+            h   = ggml_view_2d(ctx0, inp_h, n_embd_backbone, 1, inp_h->nb[1], 0);
+        } else {
+            ggml_tensor * ids0 = ggml_view_2d(ctx0, inp_tokens, 1, S, K*ggml_element_size(inp_tokens), 0);
+            tok = ggml_get_rows(ctx0, tgt_table, ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids0), S));
+            h   = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_h, n_embd_backbone, S, inp_h->nb[1]*K, 0));
+            // all of a sequence's rows carry its anchor's position
+            pos = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, inp_pos, 1, S, K*ps, 0)), S);
+        }
+        if (inp_idx) {
+            // the anchors as the target left them, gathered on the device
+            GGML_ASSERT(inp_idx->ne[0] == S);
+            h = ggml_get_rows(ctx0, inp_stage, inp_idx);
+            cb(h, "inp_h_gathered", -1);
+        }
+        // the drafts drawn from the drafter's distribution at each sequence's temperature and top-p, kept with their
+        // candidates' probabilities for the verify's speculative sampling (build_sampling); LLAMA_NO_SPEC_SAMPLING=1
+        // takes the argmax
+        static const bool spec_off = getenv("LLAMA_NO_SPEC_SAMPLING") != nullptr;
+        ggml_tensor * smp_par = nullptr;
+        ggml_tensor * smp_u   = nullptr;
+        std::vector<ggml_tensor *> q_steps;
+        if (dev_anc && !spec_off) {
+            auto sinp = std::make_unique<llm_graph_input_mtp_sample>(mtp_round, K, (int) n_rows_seq);
+            sinp->par = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2, S);
+            sinp->u   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, S, K);
+            ggml_set_input(sinp->par);
+            ggml_set_input(sinp->u);
+            smp_par = sinp->par;
+            smp_u   = sinp->u;
+            res->add_input(std::move(sinp));
+        }
         for (int j = 0; j < K; ++j) {
-            ggml_tensor * pos_j  = ggml_view_1d(ctx0, inp_pos, 1, (size_t) j*ps);
+            ggml_tensor * pos_j  = S == 1 ? ggml_view_1d(ctx0, inp_pos, 1, (size_t) j*ps) : pos;
             ggml_tensor * h_next = nullptr;
             ggml_tensor * cur    = pass(tok, h, pos_j, j, &h_next);
 
             ggml_tensor * next = nullptr;
-            if (sparse) {
+            if (sparse && S == 1) {
                 ggml_tensor * ids = nullptr;
                 ggml_tensor * sel = sparse_head(cur, &ids);
                 // the best of the scored tokens, as a token id
@@ -272,7 +378,39 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
             } else {
                 ggml_tensor * logits_j = build_lora_mm(model.output, cur);
                 cb(logits_j, "mtp_chain_logits", j);
-                next = ggml_argmax(ctx0, logits_j);
+                if (smp_par) {
+                    constexpr int64_t KQ = LLAMA_MTP_DRAFT_TOP_K;
+                    const int64_t nv = logits_j->ne[0];
+                    auto pcol = [&](int c) {
+                        return ggml_view_2d(ctx0, smp_par, 1, S, smp_par->nb[1], c*smp_par->nb[0]);
+                    };
+                    ggml_tensor * cand = ggml_top_k(ctx0, logits_j, (int) KQ); // [KQ, S]
+                    ggml_tensor * zc   = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits_j, 1, nv, S), cand), KQ, S);
+                    // in order, so the top-p keeps the most likely
+                    ggml_tensor * ord  = ggml_argsort(ctx0, zc, GGML_SORT_ORDER_DESC);
+                    zc   = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, zc,   1, KQ, S), ord), KQ, S);
+                    cand = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cand, 1, KQ, S), ord), KQ, S);
+                    // the target's final softcap, so q is the distribution the target's would be
+                    const float cap = model_other->hparams.f_final_logit_softcapping;
+                    if (cap > 0.0f) {
+                        zc = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, zc, 1.0f/cap)), cap);
+                    }
+                    ggml_tensor * zt   = ggml_mul(ctx0, zc, pcol(0));
+                    // top-p: a candidate stays while the probability before it is under p, on the logits before the
+                    // temperature, as the target's sampler (top-p, then the temperature)
+                    ggml_tensor * pr0  = ggml_soft_max(ctx0, zc);
+                    ggml_tensor * excl = ggml_sub(ctx0, ggml_cumsum(ctx0, pr0), pr0);
+                    ggml_tensor * keep = ggml_step(ctx0, ggml_scale(ctx0, ggml_sub(ctx0, excl, pcol(1)), -1.0f));
+                    ggml_tensor * pr   = ggml_soft_max(ctx0, ggml_add(ctx0, zt, ggml_log(ctx0, keep)));
+                    ggml_tensor * uj   = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, smp_u, S, (size_t) j*S*ggml_element_size(smp_u)), 1, S);
+                    ggml_tensor * past = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, pr), uj));
+                    ggml_tensor * idxf = ggml_clamp(ctx0, ggml_sum_rows(ctx0, past), 1.0f, (float) KQ);
+                    ggml_tensor * idx  = ggml_cast(ctx0, ggml_scale_bias(ctx0, idxf, -1.0f, (float) KQ), GGML_TYPE_I32);
+                    next = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cand, 1, KQ, S), ggml_reshape_2d(ctx0, idx, 1, S)), S);
+                    q_steps.push_back(ggml_reshape_3d(ctx0, ggml_concat(ctx0, ggml_cast(ctx0, cand, GGML_TYPE_F32), pr, 0), 2*KQ, 1, S));
+                } else {
+                    next = ggml_argmax(ctx0, logits_j);
+                }
             }
             cb(next, "mtp_chain_next", j);
             ggml_set_output(next);
@@ -280,14 +418,44 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
             res->t_mtp_ids.push_back(next);
 
             if (j + 1 < K) {
-                tok = ggml_get_rows(ctx0, model_other->tok_embd, next);
+                tok = ggml_get_rows(ctx0, tgt_table, next);
                 h   = h_next;
             }
+        }
+        // every step's ids as one tensor with a sequence's K together ([K, S]): the verify takes them as one
+        // strided copy, see llm_graph_input_embd::set_input
+        if (K > 1) {
+            ggml_tensor * all = res->t_mtp_ids[0];
+            for (int j = 1; j < K; ++j) {
+                all = ggml_concat(ctx0, all, res->t_mtp_ids[j], 0);
+            }
+            all = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, all, S, K)));
+            cb(all, "mtp_chain_ids_all", -1);
+            ggml_set_output(all);
+            ggml_build_forward_expand(gf, all);
+            res->t_mtp_ids_all = all;
+        }
+        // every draft's candidates and probabilities ([2*KQ, K, S]), a sequence's together as the verify reads them
+        if ((int) q_steps.size() == K) {
+            ggml_tensor * q = q_steps[0];
+            for (int j = 1; j < K; ++j) {
+                q = ggml_concat(ctx0, q, q_steps[j], 1);
+            }
+            cb(q, "mtp_chain_q", -1);
+            ggml_set_output(q);
+            ggml_build_forward_expand(gf, q);
+            res->t_mtp_q = q;
+        }
+        // the accepted count the round drafted for, after the drafted ids: the host checks it against its own
+        if (dev_anc) {
+            ggml_set_output(anc.n_acc);
+            ggml_build_forward_expand(gf, anc.n_acc);
+            res->t_mtp_ids.push_back(anc.n_acc);
         }
         return;
     }
 
-    ggml_tensor * x_tok  = ggml_get_rows(ctx0, model_other->tok_embd, inp_tokens);
+    ggml_tensor * x_tok  = ggml_get_rows(ctx0, tgt_table, inp_tokens);
     ggml_tensor * h_next = nullptr;
     ggml_tensor * cur    = pass(x_tok, inp_h, inp_pos, -1, &h_next);
 

@@ -7,9 +7,11 @@
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
+#include "../src/llama-ext.h" // llama_state_async_wait
 #include "speculative.h"
 #include "unicode.h"
 
+#include <map>
 #include <mutex>
 #include <new>
 #include <algorithm>
@@ -234,6 +236,22 @@ int32_t common_cpu_get_num_math() {
 #if defined(_WIN32)
 
 bool set_process_priority(enum ggml_sched_priority prio) {
+    if (prio != GGML_SCHED_PRIO_LOW) {
+        // Windows runs a process without the focus on efficiency cores at low clocks (EcoQoS) when it may: the thread
+        // that queues the decodes then fell behind the GPU (32 slots: 7.2k -> 4.2k tok/s). The CPU backend's workers
+        // opt out per thread; this covers every thread of the process.
+#if _WIN32_WINNT >= 0x0602
+        PROCESS_POWER_THROTTLING_STATE s;
+        ZeroMemory(&s, sizeof(s));
+        s.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        s.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        s.StateMask   = 0;
+        if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s, sizeof(s))) {
+            COM_WRN("failed to turn off process power throttling: (%d)\n", (int) GetLastError());
+        }
+#endif
+    }
+
     if (prio == GGML_SCHED_PRIO_NORMAL) {
         return true;
     }
@@ -2267,12 +2285,41 @@ bool common_prompt_batch_decode(
 
 namespace {
 
+// Pinning host memory costs milliseconds per call (a page-locked allocation and a registration with the driver), and
+// a server saves a state at every request's end. The pool pins memory in slabs and hands out ranges of them: a
+// released range goes back to the slab's free list, joined with its neighbours. A state larger than a slab gets a
+// pinned buffer of its own, parked on release for reuse.
+constexpr size_t kStateSlabSize = 1ull << 30;  // pinned slabs of this size
+constexpr size_t kStateSlabsMax = 4ull << 30;  // pinned in slabs, at most (page-locked memory the system cannot page out); beyond it states get buffers of their own
+constexpr size_t kStatePoolMax  = 4ull << 30;  // parked buffers of their own, at most
+constexpr size_t kStateAlign    = 256;
+
 struct common_state_pool {
     std::mutex mu;
     std::vector<std::pair<ggml_backend_buffer_t, size_t>> parked;  // buffer, its size
     size_t parked_bytes = 0;
     ggml_backend_buffer_type_t buft = nullptr;
     bool probed = false;
+
+    std::vector<ggml_backend_buffer_t> slabs;
+    size_t slab_bytes = 0;
+    bool   slab_failed = false;              // pinning a slab failed once: no more slabs
+    bool   slab_pinning = false;             // a slab is being pinned on a thread of its own (grow_async)
+    struct range { size_t size; int slab; };
+    std::map<uint8_t *, range> free_ranges;  // start -> size and slab. Two slabs can sit next to each other in the
+                                             // address space; a range never joins them, a copy may not span them
+
+    // a pinned buffer of this size, or null: the host buffer type hands out plain memory when pinning fails, which
+    // the device cannot copy into beside the decodes
+    ggml_backend_buffer_t pin(size_t size) {
+        ggml_backend_buffer_type_t bt = host_buft();
+        ggml_backend_buffer_t b = bt ? ggml_backend_buft_alloc_buffer(bt, size) : nullptr;
+        if (b != nullptr && ggml_backend_buffer_get_type(b) != bt) {
+            ggml_backend_buffer_free(b);
+            return nullptr;
+        }
+        return b;
+    }
 
     ggml_backend_buffer_type_t host_buft() {
         if (!probed) {
@@ -2282,108 +2329,283 @@ struct common_state_pool {
         }
         return buft;
     }
+
+    // Pinning a slab takes ~110 ms (a 1 GB page-locked allocation): done on a thread of its own when the slabs run low,
+    // so a save never waits for it (a request's end that needed a new slab stalled every slot for that long). The
+    // driver still holds every other CUDA call for that time (the decodes stop: 114-321 ms a slab, measured). The
+    // caller holds mu.
+    void grow_async() {
+        if (slab_pinning || slab_failed || slab_bytes + kStateSlabSize > kStateSlabsMax) {
+            return;
+        }
+        ggml_backend_buffer_type_t bt = host_buft();
+        if (bt == nullptr) {
+            return;
+        }
+        slab_pinning = true;
+        std::thread([this, bt]() {
+            ggml_backend_buffer_t slab = ggml_backend_buft_alloc_buffer(bt, kStateSlabSize);
+            if (slab != nullptr && ggml_backend_buffer_get_type(slab) != bt) {
+                ggml_backend_buffer_free(slab);
+                slab = nullptr;
+            }
+            std::lock_guard<std::mutex> lock(mu);
+            slab_pinning = false;
+            if (slab == nullptr) {
+                slab_failed = true;
+                return;
+            }
+            slabs.push_back(slab);
+            slab_bytes += kStateSlabSize;
+            free_ranges[(uint8_t *) ggml_backend_buffer_get_base(slab)] = { ggml_backend_buffer_get_size(slab), (int) slabs.size() - 1 };
+        }).detach();
+    }
+
+    // the free bytes of the slabs (the caller holds mu)
+    size_t free_bytes() const {
+        size_t f = 0;
+        for (const auto & r : free_ranges) {
+            f += r.second.size;
+        }
+        return f;
+    }
+
+    // a range of a slab holding n bytes, or null (the caller holds mu); the next slab is pinned ahead of need
+    uint8_t * carve(size_t n, size_t & cap) {
+        uint8_t * p = carve_now(n, cap);
+        if (p == nullptr || free_bytes() < kStateSlabSize/2) {
+            grow_async();
+        }
+        return p;
+    }
+
+    uint8_t * carve_now(size_t n, size_t & cap) {
+        const size_t need = (n + kStateAlign - 1) / kStateAlign * kStateAlign;
+        if (need > kStateSlabSize) {
+            return nullptr;
+        }
+        for (auto it = free_ranges.begin(); it != free_ranges.end(); ++it) {
+            if (it->second.size >= need) {
+                uint8_t * ptr = it->first;
+                const size_t rest = it->second.size - need;
+                const int    sl   = it->second.slab;
+                // a free range lies in its slab
+                GGML_ASSERT(sl >= 0 && sl < (int) slabs.size());
+                GGML_ASSERT(ptr >= (const uint8_t *) ggml_backend_buffer_get_base(slabs[sl]) &&
+                            ptr + need <= (const uint8_t *) ggml_backend_buffer_get_base(slabs[sl]) + ggml_backend_buffer_get_size(slabs[sl]));
+                free_ranges.erase(it);
+                if (rest > 0) {
+                    free_ranges[ptr + need] = { rest, sl };
+                }
+                cap = need;
+                return ptr;
+            }
+        }
+        // nothing fits: the next slab is pinned on its own thread (carve), never here. Pinning one held the pool's
+        // lock ~110 ms while the requests ending together at a wave's end saved their states, once a run
+        return nullptr;
+    }
+
+    int slab_of(const uint8_t * ptr) const {
+        for (size_t i = 0; i < slabs.size(); ++i) {
+            const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(slabs[i]);
+            if (ptr >= base && ptr < base + ggml_backend_buffer_get_size(slabs[i])) {
+                return (int) i;
+            }
+        }
+        return -1;
+    }
+
+    // a carved range comes back, joined with free neighbours of its slab (the caller holds mu)
+    void uncarve(uint8_t * ptr, size_t cap) {
+        const int sl = slab_of(ptr);
+        GGML_ASSERT(sl >= 0 && ptr + cap <= (uint8_t *) ggml_backend_buffer_get_base(slabs[sl]) + ggml_backend_buffer_get_size(slabs[sl]));
+        auto it = free_ranges.emplace(ptr, range{ cap, sl }).first;
+        auto next = std::next(it);
+        if (next != free_ranges.end() && next->second.slab == sl && it->first + it->second.size == next->first) {
+            it->second.size += next->second.size;
+            free_ranges.erase(next);
+        }
+        if (it != free_ranges.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second.slab == sl && prev->first + prev->second.size == it->first) {
+                prev->second.size += it->second.size;
+                free_ranges.erase(it);
+            }
+        }
+    }
 };
 
+// never destroyed: a slab pinned on a thread of its own may land after the process starts exiting
 common_state_pool & state_pool() {
-    static common_state_pool p;
-    return p;
+    static common_state_pool * p = new common_state_pool();
+    return *p;
 }
-
-constexpr size_t kStatePoolMax = 4ull << 30;  // parked pinned memory, at most
 
 } // namespace
 
-common_state_buf::~common_state_buf() {
+common_state_buf::impl::~impl() {
     release();
 }
 
-common_state_buf::common_state_buf(const common_state_buf & o) {
-    resize(o.n_);
-    if (n_ > 0) {
-        memcpy(ptr_, o.ptr_, n_);
-    }
-}
-
-common_state_buf & common_state_buf::operator=(const common_state_buf & o) {
-    if (this != &o) {
-        resize(o.n_);
-        if (n_ > 0) {
-            memcpy(ptr_, o.ptr_, n_);
+void common_state_buf::impl::wait() {
+    if (async_ctx != nullptr) {
+        if (ptr != nullptr) {
+            llama_state_async_wait(async_ctx, ptr);
         }
+        async_ctx = nullptr;
     }
-    return *this;
 }
 
-common_state_buf::common_state_buf(common_state_buf && o) noexcept
-    : ptr_(o.ptr_), n_(o.n_), cap_(o.cap_), buf_(o.buf_) {
-    o.ptr_ = nullptr, o.n_ = 0, o.cap_ = 0, o.buf_ = nullptr;
-}
-
-common_state_buf & common_state_buf::operator=(common_state_buf && o) noexcept {
-    if (this != &o) {
-        release();
-        ptr_ = o.ptr_, n_ = o.n_, cap_ = o.cap_, buf_ = o.buf_;
-        o.ptr_ = nullptr, o.n_ = 0, o.cap_ = 0, o.buf_ = nullptr;
-    }
-    return *this;
-}
-
-void common_state_buf::release() {
-    if (buf_ != nullptr) {
+void common_state_buf::impl::release() {
+    wait();
+    if (carved) {
         auto & pool = state_pool();
         std::lock_guard<std::mutex> lock(pool.mu);
-        if (pool.parked_bytes + cap_ <= kStatePoolMax) {
-            pool.parked.emplace_back((ggml_backend_buffer_t) buf_, cap_);
-            pool.parked_bytes += cap_;
+        pool.uncarve(ptr, cap);
+    } else if (buf != nullptr) {
+        auto & pool = state_pool();
+        std::lock_guard<std::mutex> lock(pool.mu);
+        if (pool.parked_bytes + cap <= kStatePoolMax) {
+            pool.parked.emplace_back((ggml_backend_buffer_t) buf, cap);
+            pool.parked_bytes += cap;
         } else {
-            ggml_backend_buffer_free((ggml_backend_buffer_t) buf_);
+            ggml_backend_buffer_free((ggml_backend_buffer_t) buf);
         }
-    } else if (ptr_ != nullptr) {
-        free(ptr_);
+    } else if (ptr != nullptr) {
+        free(ptr);
     }
-    ptr_ = nullptr, n_ = 0, cap_ = 0, buf_ = nullptr;
+    ptr = nullptr, n = 0, cap = 0, buf = nullptr, carved = false, pinned = false;
 }
 
-void common_state_buf::resize(size_t n) {
-    if (n <= cap_) {
-        n_ = n;
-        return;
-    }
+void common_state_buf::impl::alloc(size_t n_new) {
     release();
-    if (n == 0) {
+    if (n_new == 0) {
         return;
     }
     auto & pool = state_pool();
-    ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t b = nullptr;
     {
         std::lock_guard<std::mutex> lock(pool.mu);
+        size_t c = 0;
+        if (uint8_t * p = pool.carve(n_new, c)) {
+            ptr = p, cap = c, carved = true, pinned = true, n = n_new;
+            return;
+        }
         // the smallest parked buffer that holds it
         size_t best = SIZE_MAX, at = SIZE_MAX;
         for (size_t i = 0; i < pool.parked.size(); i++) {
-            if (pool.parked[i].second >= n && pool.parked[i].second < best) {
+            if (pool.parked[i].second >= n_new && pool.parked[i].second < best) {
                 best = pool.parked[i].second, at = i;
             }
         }
         if (at != SIZE_MAX) {
-            buf = pool.parked[at].first;
+            b = pool.parked[at].first;
             pool.parked_bytes -= pool.parked[at].second;
             pool.parked.erase(pool.parked.begin() + at);
-        } else if (ggml_backend_buffer_type_t buft = pool.host_buft()) {
-            buf = ggml_backend_buft_alloc_buffer(buft, n);
+        } else {
+            b = pool.pin(n_new);
         }
     }
-    if (buf != nullptr) {
-        buf_ = buf;
-        ptr_ = (uint8_t *) ggml_backend_buffer_get_base(buf);
-        cap_ = ggml_backend_buffer_get_size(buf);
+    if (b != nullptr) {
+        buf = b;
+        ptr = (uint8_t *) ggml_backend_buffer_get_base(b);
+        cap = ggml_backend_buffer_get_size(b);
+        pinned = true;
     } else {
-        ptr_ = (uint8_t *) malloc(n);
-        if (ptr_ == nullptr) {
+        ptr = (uint8_t *) malloc(n_new);
+        if (ptr == nullptr) {
             throw std::bad_alloc();
         }
-        cap_ = n;
+        cap = n_new;
     }
-    n_ = n;
+    n = n_new;
+}
+
+void common_state_buf::own() {
+    if (p_ && p_.use_count() > 1) {
+        auto q = std::make_shared<impl>();
+        p_->wait();
+        q->alloc(p_->n);
+        if (p_->n > 0) {
+            memcpy(q->ptr, p_->ptr, p_->n);
+        }
+        p_ = q;
+    }
+}
+
+void common_state_buf::resize(size_t n) {
+    if (p_ && p_.use_count() > 1) {
+        own();
+    }
+    if (!p_) {
+        p_ = std::make_shared<impl>();
+    }
+    if (n <= p_->cap) {
+        p_->wait();
+        p_->n = n;
+        return;
+    }
+    p_->alloc(n);
+}
+
+void common_state_buf::clear() {
+    if (!p_) {
+        return;
+    }
+    if (p_.use_count() > 1) {
+        p_.reset(); // the others keep the bytes
+    } else {
+        p_->n = 0;
+    }
+}
+
+void common_state_buf::shrink_to_fit() {
+    if (p_ && p_->n == 0 && p_.use_count() == 1) {
+        p_->release();
+    }
+}
+
+uint8_t * common_state_buf::data() {
+    own();
+    return p_ ? p_->ptr : nullptr;
+}
+
+const uint8_t * common_state_buf::data() const {
+    wait();
+    return p_ ? p_->ptr : nullptr;
+}
+
+void common_state_buf::set_async(llama_context * ctx) {
+    if (p_) {
+        p_->async_ctx = ctx;
+    }
+}
+
+void common_state_buf::wait() const {
+    if (p_) {
+        p_->wait();
+    }
+}
+
+size_t common_state_buf_warm(size_t bytes) {
+    auto & pool = state_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    ggml_backend_buffer_type_t bt = pool.host_buft();
+    if (bt == nullptr) {
+        return 0;
+    }
+    while (!pool.slab_failed && pool.slab_bytes < std::min(bytes, kStateSlabsMax)) {
+        ggml_backend_buffer_t slab = pool.pin(kStateSlabSize);
+        if (slab == nullptr) {
+            pool.slab_failed = true;
+            break;
+        }
+        pool.slabs.push_back(slab);
+        pool.slab_bytes += kStateSlabSize;
+        pool.free_ranges[(uint8_t *) ggml_backend_buffer_get_base(slab)] = { ggml_backend_buffer_get_size(slab), (int) pool.slabs.size() - 1 };
+    }
+    return pool.slab_bytes;
 }
 
 size_t common_prompt_checkpoint::size() const {
@@ -2426,9 +2648,15 @@ void common_prompt_checkpoint::update_tgt(
 
     data_tgt.resize(ckpt_size);
 
+    if (!data_tgt.pinned()) {
+        flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+    }
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+        data_tgt.set_async(ctx);
     }
 }
 
@@ -2444,9 +2672,15 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
+    if (!data_dft.pinned()) {
+        flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+    }
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+        data_dft.set_async(ctx);
     }
 }
 
@@ -2462,6 +2696,7 @@ void common_prompt_checkpoint::load_tgt(
         return;
     }
 
+    data_tgt.wait();
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     if (n != data_tgt.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
@@ -2480,6 +2715,7 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
+    data_dft.wait();
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     if (n != data_dft.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);

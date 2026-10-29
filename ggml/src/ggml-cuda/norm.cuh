@@ -15,10 +15,19 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 // rms_norm > scale(const) > mul(weight), the constant folded into the epilogue
 void ggml_cuda_op_rms_norm_fused_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor, ggml_tensor * mul_tensor);
 
+// rms_norm > mul > add [> mul(scalar)] > rms_norm > mul in one launch, see norm.cu. q8, q8_s: the FP8 GEMM reading the
+// second product takes its rows quantized here (ggml_cuda_fp8_act_claim)
+void ggml_cuda_op_rms_norm_pair(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add1,
+                                ggml_tensor * scale1, ggml_tensor * norm2, ggml_tensor * mul2,
+                                const float * x_tok = nullptr, const float * x_row = nullptr, const float * x_t = nullptr,
+                                uint8_t * q8 = nullptr, float * q8_s = nullptr);
+
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
-                                     ggml_tensor *               add_tensor);
+                                     ggml_tensor *               add_tensor,
+                                     ggml_tensor *               scale_tensor = nullptr,
+                                     nv_bfloat16 *               dst_bf16     = nullptr);
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

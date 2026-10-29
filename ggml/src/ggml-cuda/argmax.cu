@@ -4,6 +4,7 @@
 #include "argmax.cuh"
 #include "common.cuh"
 #include "sum.cuh"
+#include "unary.cuh"
 
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
@@ -69,8 +70,9 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
 // A vocabulary-sized row read by one block is latency bound: each thread
 // walks hundreds of elements. Blocks take a slice each and one warp settles
 // the slices, the lowest index winning a tie.
+template <bool softcap>
 static __global__ void argmax_f32_partial(const float * __restrict__ x, float * __restrict__ part_val, int32_t * __restrict__ part_idx,
-                                          const int64_t ncols, const int64_t chunk) {
+                                          const int64_t ncols, const int64_t chunk, const ggml_cuda_softcap_params sc) {
     const int64_t row   = blockIdx.y;
     const int64_t start = (int64_t) blockIdx.x * chunk;
     const int64_t end   = min(start + chunk, ncols);
@@ -81,7 +83,10 @@ static __global__ void argmax_f32_partial(const float * __restrict__ x, float * 
     int   argmax = -1;
 
     for (int64_t col = start + threadIdx.x; col < end; col += blockDim.x) {
-        const float val = rowx[col];
+        float val = rowx[col];
+        if constexpr (softcap) {
+            val = sc.b0 * op_tanh(sc.a0 * val + sc.a1) + sc.b1;
+        }
         if (val > maxval || (val == maxval && (int) col < argmax)) {
             maxval = val;
             argmax = (int) col;
@@ -132,7 +137,7 @@ static __global__ void argmax_f32_partial(const float * __restrict__ x, float * 
 }
 
 static __global__ void argmax_f32_final(const float * __restrict__ part_val, const int32_t * __restrict__ part_idx,
-                                        int32_t * __restrict__ dst, const int nparts) {
+                                        int32_t * __restrict__ dst, const int nparts, float * __restrict__ val_out) {
     const int row = blockIdx.x;
 
     float maxval = -FLT_MAX;
@@ -159,7 +164,30 @@ static __global__ void argmax_f32_final(const float * __restrict__ part_val, con
 
     if (threadIdx.x == 0) {
         dst[row] = argmax;
+        if (val_out) {
+            val_out[row] = maxval;
+        }
     }
+}
+
+void ggml_cuda_argmax_softcap(ggml_backend_cuda_context & ctx, const ggml_tensor * x, int32_t * ids, float * val_out,
+                              const ggml_cuda_softcap_params & sc) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] >= 16384);
+
+    const int64_t ne00  = x->ne[0];
+    const int64_t nrows = ggml_nrows(x);
+
+    const int64_t chunk  = 4096;
+    const int     nparts = (int) std::min<int64_t>(64, (ne00 + chunk - 1) / chunk);
+    const int64_t per    = (ne00 + nparts - 1) / nparts;
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<float>   part_val(ctx.pool(), nrows * nparts);
+    ggml_cuda_pool_alloc<int32_t> part_idx(ctx.pool(), nrows * nparts);
+
+    const dim3 grid(nparts, nrows, 1);
+    argmax_f32_partial<true><<<grid, 1024, 0, stream>>>((const float *) x->data, part_val.get(), part_idx.get(), ne00, per, sc);
+    argmax_f32_final<<<nrows, WARP_SIZE, 0, stream>>>(part_val.get(), part_idx.get(), ids, nparts, val_out);
 }
 
 void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -187,8 +215,8 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_cuda_pool_alloc<int32_t> part_idx(ctx.pool(), nrows * nparts);
 
         const dim3 grid(nparts, nrows, 1);
-        argmax_f32_partial<<<grid, 1024, 0, stream>>>(src0_d, part_val.get(), part_idx.get(), ne00, per);
-        argmax_f32_final<<<nrows, WARP_SIZE, 0, stream>>>(part_val.get(), part_idx.get(), dst_d, nparts);
+        argmax_f32_partial<false><<<grid, 1024, 0, stream>>>(src0_d, part_val.get(), part_idx.get(), ne00, per, {});
+        argmax_f32_final<<<nrows, WARP_SIZE, 0, stream>>>(part_val.get(), part_idx.get(), dst_d, nparts, nullptr);
         return;
     }
 

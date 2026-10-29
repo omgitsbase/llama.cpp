@@ -124,6 +124,18 @@ void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+// the window's cells first, the likelier to lack a position
+bool llama_kv_cache_iswa::seq_cp_prefix(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n, ggml_backend_t backend) {
+    if (!kv_swa->seq_cp_prefix(seq_id_src, seq_id_dst, n, backend)) {
+        return false;
+    }
+    if (!kv_base->seq_cp_prefix(seq_id_src, seq_id_dst, n, backend)) {
+        kv_swa->seq_rm(seq_id_dst, -1, -1);
+        return false;
+    }
+    return true;
+}
+
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
     kv_base->seq_keep(seq_id);
     kv_swa ->seq_keep(seq_id);
@@ -158,6 +170,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    // a verify's rows and prompt chunks of one step as groups of one forward (llama_set_next_decode_grouped)
+    if (!unified && balloc.groups_allowed) {
+        balloc.split_reset();
+        std::vector<llama_ubatch> ubatches = balloc.split_groups(n_ubatch);
+        bool ok = !ubatches.empty() && balloc.get_n_used() == balloc.get_n_tokens();
+        for (const auto & u : ubatches) {
+            ok = ok && u.embd == nullptr;
+        }
+        if (ok) {
+            auto sinfos_base = kv_base->prepare(ubatches);
+            if (!sinfos_base.empty()) {
+                auto sinfos_swa = kv_swa->prepare(ubatches);
+                if (!sinfos_swa.empty()) {
+                    return std::make_unique<llama_kv_cache_iswa_context>(
+                            this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches), true);
+                }
+            }
+        }
+    }
 
     // first try simple split
     do {
@@ -206,7 +238,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0, !unified && split_gaps);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -296,22 +328,114 @@ llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
 }
 
+// the groups' tokens one after the other: the rows of the one forward over them
+static llama_ubatch llama_ubatch_concat(const std::vector<llama_ubatch> & ubs) {
+    auto ud = std::make_shared<llama_ubatch::data_t>();
+
+    uint32_t n = 0;
+    for (const auto & u : ubs) {
+        n += u.n_tokens;
+    }
+    const uint32_t n_pos = ubs[0].n_pos;
+    const bool has_token = ubs[0].token != nullptr;
+
+    ud->token   .resize(has_token ? n : 0);
+    ud->pos     .resize((size_t) n*n_pos);
+    ud->n_seq_id.resize(n);
+    ud->seq_id  .resize(n);
+    ud->output  .resize(n);
+    ud->seq_idx .assign(LLAMA_MAX_SEQ, -1);
+    ud->seq_id_data.reserve(n);
+
+    std::vector<bool> seen(LLAMA_MAX_SEQ, false);
+    uint32_t off = 0;
+    for (const auto & u : ubs) {
+        for (uint32_t i = 0; i < u.n_tokens; ++i) {
+            if (has_token) {
+                ud->token[off + i] = u.token[i];
+            }
+            for (uint32_t j = 0; j < n_pos; ++j) {
+                ud->pos[(size_t) j*n + off + i] = u.pos[(size_t) j*u.n_tokens + i];
+            }
+            ud->n_seq_id[off + i] = u.n_seq_id[i];
+            ud->output[off + i]   = u.output[i];
+            for (int32_t k = 0; k < u.n_seq_id[i]; ++k) {
+                ud->seq_id_data.push_back(u.seq_id[i][k]);
+                seen[u.seq_id[i][k]] = true;
+            }
+        }
+        off += u.n_tokens;
+    }
+
+    llama_seq_id * p = ud->seq_id_data.data();
+    for (uint32_t i = 0; i < n; ++i) {
+        ud->seq_id[i] = p;
+        p += ud->n_seq_id[i];
+    }
+    for (int32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        if (seen[s]) {
+            ud->seq_idx[s] = (int32_t) ud->seq_id_unq.size();
+            ud->seq_id_unq.push_back(s);
+        }
+    }
+
+    llama_ubatch res {
+        /*.b_equal_seqs =*/ 0,
+        /*.n_tokens     =*/ n,
+        /*.n_seq_tokens =*/ 1,
+        /*.n_seqs       =*/ n,
+        /*.n_seqs_unq   =*/ (uint32_t) ud->seq_id_unq.size(),
+        /*.n_pos        =*/ n_pos,
+
+        /*.token        =*/ has_token ? ud->token.data() : nullptr,
+        /*.embd         =*/ nullptr,
+        /*.pos          =*/ ud->pos.data(),
+        /*.n_seq_id     =*/ ud->n_seq_id.data(),
+        /*.seq_id       =*/ ud->seq_id.data(),
+        /*.seq_id_unq   =*/ ud->seq_id_unq.data(),
+        /*.seq_idx      =*/ ud->seq_idx.data(),
+        /*.output       =*/ ud->output.data(),
+        /*.data         =*/ std::move(ud),
+    };
+    return res;
+}
+
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv,
         slot_info_vec_t sinfos_base,
         slot_info_vec_t sinfos_swa,
-        std::vector<llama_ubatch> ubatches) :
+        std::vector<llama_ubatch> ubatches,
+        bool grouped) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_base(new llama_kv_cache_context(kv->get_base(), std::move(sinfos_base), this->ubatches)),
     ctx_swa (new llama_kv_cache_context(kv->get_swa (), std::move(sinfos_swa),  this->ubatches)),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
+    this->grouped = grouped && this->ubatches.size() > 1;
+    if (this->grouped) {
+        composite = llama_ubatch_concat(this->ubatches);
+    }
+}
+
+llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
+        llama_memory_context_ptr base,
+        llama_memory_context_ptr swa,
+        llama_ubatch ubatch) :
+    ubatches({ std::move(ubatch) }),
+    ctx_base(std::move(base)),
+    ctx_swa (std::move(swa)),
+    status(LLAMA_MEMORY_STATUS_SUCCESS) {
 }
 
 llama_kv_cache_iswa_context:: ~llama_kv_cache_iswa_context() = default;
 
 bool llama_kv_cache_iswa_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    // a grouped batch is one forward
+    if (grouped) {
+        return false;
+    }
 
     ctx_base->next();
     ctx_swa ->next();
@@ -325,6 +449,21 @@ bool llama_kv_cache_iswa_context::next() {
 
 bool llama_kv_cache_iswa_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    // every group's cells first, then a view per group: its cache size counts the others' cells
+    if (grouped) {
+        auto * base = static_cast<llama_kv_cache_context *>(ctx_base.get());
+        auto * swa  = static_cast<llama_kv_cache_context *>(ctx_swa .get());
+        for (size_t g = 0; g < ubatches.size(); ++g) {
+            base->apply_at(g);
+            swa ->apply_at(g);
+        }
+        views.clear();
+        for (size_t g = 0; g < ubatches.size(); ++g) {
+            views.push_back(std::make_unique<llama_kv_cache_iswa_context>(base->make_view(g), swa->make_view(g), ubatches[g]));
+        }
+        return true;
+    }
 
     bool res = true;
 
@@ -340,6 +479,10 @@ llama_memory_status llama_kv_cache_iswa_context::get_status() const {
 
 const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    if (grouped) {
+        return composite;
+    }
 
     return ubatches[i_next];
 }

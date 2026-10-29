@@ -156,6 +156,10 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
+    parser.add_argument(
+        "--fp8", action="store_true",
+        help="Store FP8 E4M3 weights with a scale per row as they are (F8_E4M3, the scales as their own tensors).",
+    )
 
     parser.add_argument(
         "--fuse-qkv", action="store_true",
@@ -294,6 +298,7 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     fp8_native=args.fp8,
                                      fuse_qkv=args.fuse_qkv,
                                      )
 

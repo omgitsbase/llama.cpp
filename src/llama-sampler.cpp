@@ -4622,3 +4622,134 @@ bool llama_sampler_backend_chainable(const llama_sampler * smpl) {
     }
     return true;
 }
+
+// the batched backend form of a chain (llama_sampler_batch_params): every sampler is one this form runs, or one left
+// at its defaults (an empty sampler)
+bool llama_sampler_batch_params_get(const llama_sampler * smpl, llama_sampler_batch_params & out) {
+    out = llama_sampler_batch_params();
+    if (smpl == nullptr || smpl->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+    if (chain->samplers.empty()) {
+        return false;
+    }
+    bool has_dist = false;
+    for (const auto & entry : chain->samplers) {
+        const llama_sampler * s = entry.ptr;
+        if (!entry.is_backend || has_dist) {
+            return false;
+        }
+        if (s->iface == &llama_sampler_empty_i) {
+            continue;
+        }
+        if (s->iface == &llama_sampler_logit_bias_i) {
+            const auto * c = (const llama_sampler_logit_bias *) s->ctx;
+            for (const auto & b : c->logit_bias) {
+                if (b.bias > 0.0f || out.top_k > 0) {
+                    return false;
+                }
+                out.bias.push_back(b);
+            }
+        } else if (s->iface == &llama_sampler_penalties_i) {
+            const auto * c = (const llama_sampler_penalties *) s->ctx;
+            if (c->is_disabled()) {
+                continue;
+            }
+            // the candidate form needs penalties that only lower logits, applied before the top-k
+            if (out.top_k > 0 || c->penalty_repeat < 1.0f || c->penalty_freq < 0.0f || c->penalty_present < 0.0f) {
+                return false;
+            }
+            out.penalty_last_n  = c->penalty_last_n;
+            out.penalty_repeat  = c->penalty_repeat;
+            out.penalty_freq    = c->penalty_freq;
+            out.penalty_present = c->penalty_present;
+        } else if (s->iface == &llama_sampler_top_k_i) {
+            if (out.top_k > 0) {
+                return false;
+            }
+            out.top_k = ((const llama_sampler_top_k *) s->ctx)->k;
+        } else if (s->iface == &llama_sampler_top_p_i) {
+            if (out.top_k <= 0) {
+                return false;
+            }
+            out.top_p = ((const llama_sampler_top_p *) s->ctx)->p;
+        } else if (s->iface == &llama_sampler_min_p_i) {
+            if (out.top_k <= 0) {
+                return false;
+            }
+            out.min_p = ((const llama_sampler_min_p *) s->ctx)->p;
+        } else if (s->iface == &llama_sampler_temp_ext_i) {
+            const auto * c = (const llama_sampler_temp_ext *) s->ctx;
+            // temperature 0: the top candidate after the penalties (the draw takes it, see build_sampling)
+            if (c->delta > 0.0f || out.top_k <= 0) {
+                return false;
+            }
+            out.temp = std::max(c->temp, 0.0f);
+        } else if (s->iface == &llama_sampler_temp_i) {
+            const auto * c = (const llama_sampler_temp *) s->ctx;
+            if (out.top_k <= 0) {
+                return false;
+            }
+            out.temp = std::max(c->temp, 0.0f);
+        } else if (s->iface == &llama_sampler_dist_i) {
+            if (out.top_k <= 0) {
+                return false;
+            }
+            has_dist = true;
+        } else {
+            return false;
+        }
+    }
+    return has_dist && out.top_k > 0;
+}
+
+uint32_t llama_sampler_batch_seed(const llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_chain_i) {
+        return 0;
+    }
+    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+    for (const auto & entry : chain->samplers) {
+        if (entry.ptr->iface == &llama_sampler_dist_i) {
+            return ((const llama_sampler_dist *) entry.ptr->ctx)->seed_cur;
+        }
+    }
+    return 0;
+}
+
+float llama_sampler_batch_uniform(llama_sampler * smpl) {
+    GGML_ASSERT(smpl && smpl->iface == &llama_sampler_chain_i);
+    auto * chain = (llama_sampler_chain *) smpl->ctx;
+    for (auto & entry : chain->samplers) {
+        if (entry.ptr->iface != &llama_sampler_dist_i) {
+            continue;
+        }
+        // llama_sampler_dist_backend_set_input's draw: double precision, the transactional generator for several rows
+        auto * sctx = (llama_sampler_dist *) entry.ptr->ctx;
+        std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+        auto & rng = sctx->backend_transactional ? sctx->rng_backend : sctx->rng;
+        const float rnd = dist(rng);
+        if (sctx->backend_transactional) {
+            ++sctx->n_backend_draws_generated;
+        }
+        return rnd;
+    }
+    GGML_ABORT("llama_sampler_batch_uniform: the chain has no dist sampler");
+}
+
+void llama_sampler_batch_window(const llama_sampler * smpl, std::vector<llama_token> & out) {
+    out.clear();
+    if (smpl == nullptr || smpl->iface != &llama_sampler_chain_i) {
+        return;
+    }
+    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+    for (const auto & entry : chain->samplers) {
+        if (entry.ptr->iface == &llama_sampler_penalties_i) {
+            const auto * c = (const llama_sampler_penalties *) entry.ptr->ctx;
+            if (!c->is_disabled()) {
+                out = c->prev.to_vector();
+            }
+            return;
+        }
+    }
+}

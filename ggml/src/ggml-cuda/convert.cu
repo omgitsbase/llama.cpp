@@ -3,6 +3,11 @@
 
 #include <cstdint>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <cuda_fp8.h>
+#define GGML_CUDA_HAS_FP8_E4M3
+#endif
+
 #define CUDA_Q8_0_NE_ALIGN 2048
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -455,6 +460,25 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+#ifdef GGML_CUDA_HAS_FP8_E4M3
+// FP8 E4M3 values (GGML_TYPE_F8_E4M3), their scales being tensors of their own
+template <typename dst_t>
+static __global__ void convert_f8_e4m3(const uint8_t * __restrict__ x, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    __nv_fp8_e4m3 v;
+    v.__x = x[i];
+    y[i] = ggml_cuda_cast<dst_t>(float(v));
+}
+
+template <typename dst_t>
+static void convert_f8_e4m3_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    convert_f8_e4m3<<<(k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const uint8_t *) vx, y, k);
+}
+#endif // GGML_CUDA_HAS_FP8_E4M3
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -503,6 +527,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+#ifdef GGML_CUDA_HAS_FP8_E4M3
+        case GGML_TYPE_F8_E4M3:
+            return convert_f8_e4m3_cuda<nv_bfloat16>;
+#endif
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
@@ -563,6 +591,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+#ifdef GGML_CUDA_HAS_FP8_E4M3
+        case GGML_TYPE_F8_E4M3:
+            return convert_f8_e4m3_cuda<half>;
+#endif
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -620,6 +652,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+#ifdef GGML_CUDA_HAS_FP8_E4M3
+        case GGML_TYPE_F8_E4M3:
+            return convert_f8_e4m3_cuda<float>;
+#endif
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -649,6 +685,10 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
+#ifdef GGML_CUDA_HAS_FP8_E4M3
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<__nv_fp8_e4m3>;
+#endif // GGML_CUDA_HAS_FP8_E4M3
         default:
             return nullptr;
     }
@@ -674,6 +714,10 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
+#ifdef GGML_CUDA_HAS_FP8_E4M3
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<__nv_fp8_e4m3, nv_bfloat16>;
+#endif // GGML_CUDA_HAS_FP8_E4M3
         default:
             return nullptr;
     }
@@ -699,6 +743,10 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
+#ifdef GGML_CUDA_HAS_FP8_E4M3
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<__nv_fp8_e4m3, float>;
+#endif // GGML_CUDA_HAS_FP8_E4M3
         default:
             return nullptr;
     }

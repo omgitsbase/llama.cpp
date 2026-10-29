@@ -564,6 +564,50 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// E4M3 as FP8 checkpoints store it (OCP E4M3FN: sign, 4 exponent bits with bias 7, 3 mantissa bits, no infinities,
+// S.1111.111 is NaN)
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    float v;
+    if (exp == 0xF && man == 0x7) {
+        v = NAN;
+    } else if (exp == 0) {
+        v = ldexpf((float) man, -9);
+    } else {
+        v = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return (x & 0x80) ? -v : v;
+}
+
+// to the nearest E4M3 (ties to even), saturating at +-448 as torch's float8_e4m3fn conversion does
+static inline uint8_t ggml_fp32_to_e4m3(float x) {
+    const uint8_t sign = signbit(x) ? 0x80 : 0x00;
+    const float a = fabsf(x);
+    if (a != a) {
+        return sign | 0x7F;
+    }
+    if (a >= 464.0f) {
+        return sign | 0x7E;
+    }
+    if (a < 0.015625f) {
+        // subnormal steps of 2^-9; 8 of them is the smallest normal value, 0x08
+        return sign | (uint8_t) nearbyintf(a * 512.0f);
+    }
+    int e;
+    const float f = frexpf(a, &e); // a = f * 2^e, f in [0.5, 1)
+    int exp = e - 1 + 7;
+    int man = (int) nearbyintf((2.0f*f - 1.0f) * 8.0f);
+    if (man == 8) {
+        man = 0;
+        exp++;
+    }
+    if (exp > 15 || (exp == 15 && man == 7)) {
+        return sign | 0x7E;
+    }
+    return sign | (uint8_t) ((exp << 3) | man);
+}
+
 /**
  * Converts brain16 to float32.
  *

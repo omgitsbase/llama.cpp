@@ -64,15 +64,56 @@ struct llama_context {
     const llama_token * get_mtp_chain_ids(int32_t & n);
     // the chained draft's id tensors, while its ids have not been read back
     const std::vector<ggml_tensor *> & get_mtp_ids_pending() const { return mtp_ids_pending; }
+    // the same ids as one [K, S] tensor, when the graph made one
+    ggml_tensor * get_mtp_ids_all_pending() const { return mtp_ids_all_pending; }
+    // the last round's drafts' candidates and probabilities (llm_graph_result::t_mtp_q), nullptr when it took argmaxes
+    ggml_tensor * get_mtp_q_pending() const { return mtp_q_pending; }
+    // the backend sampler set for a sequence, or nullptr
+    llama_sampler * get_sampler(llama_seq_id seq_id) const;
     // sequences of the last chained draft: each id tensor holds one id per sequence
     int32_t get_mtp_chain_n_seq() const { return mtp_ids_n_seq; }
+    // the pending tensors that hold drafted ids: a round that replays appends one more, the accepted count
+    int32_t get_mtp_ids_n_draft() const { return mtp_ids_n_draft; }
 
     // the next decode takes the rows of seq at pos0 + 1 .. pos0 + n from element col of ctx_src's pending chained
     // ids, on the device; adds to any other sequence's rows armed for it
     bool set_tokens_device_seq(llama_context * ctx_src, llama_seq_id seq, llama_pos pos0, int32_t n, int32_t col);
+    // the device form of the token input for the small decodes from now on, as the first device draft turns it on
+    bool set_tokens_device_enable();
+
+    // the next decode may run its groups (a verify's rows and prompt chunks) as one forward (llama_set_next_decode_grouped)
+    bool next_decode_grouped = false;
+
+    // the arenas of graphs over several sequences: one per shape (rows, outputs, sequences, cache view sizes), the
+    // least recently used one taken for a new shape; gf_shape_nkv is the next lookup's view sizes (from its params)
+    struct grouped_arena { uint64_t key = 0; uint64_t used = 0; };
+    std::array<grouped_arena, 48> grouped_arenas = {};
+    uint64_t grouped_arena_clock = 0;
+    uint64_t gf_shape_nkv = 0;
+
+    // sequence state copies queued on the device (LLAMA_STATE_SEQ_FLAGS_ASYNC, llama-ext.h)
+    struct state_tensor_copy {
+        ggml_tensor * tensor;
+        uint8_t *     ptr;
+        size_t        size;
+        size_t        offset;
+    };
+    // queues the copies on a side stream of the tensors' backend; false when it has none (copy synchronously)
+    bool state_async_issue(const void * dst, llama_seq_id seq_id, const std::vector<state_tensor_copy> & copies);
+    void state_async_wait(const void * dst);
+    void state_async_wait_seq(llama_seq_id seq_id);
+    // backend's stream waits, on the device, for the copies still reading seq_id's cells
+    void state_async_order_seq(llama_seq_id seq_id, ggml_backend_t backend);
+    void state_async_wait_all();
+    bool state_async_pending_seq(llama_seq_id seq_id) const;
 
     // where the last ubatch holds n rows of seq at pos0 .. pos0 + n - 1, all of them outputs
     bool get_last_rows(llama_seq_id seq, llama_pos pos0, int32_t n, int32_t & row0, int32_t & out0) const;
+
+    int32_t set_embd_device_rows(llama_context * ctx_src, const llama_seq_id * seqs, const llama_pos * pos, int32_t n, bool * ok);
+    // the next decode reads its hidden rows back to the host (default), or leaves them on the device for a
+    // drafter that takes them there when the whole batch is one ubatch whose rows all sampled on the device
+    void set_embd_nextn_readback(bool value) { embd_nextn_readback = value; }
 
     void set_mtp_round_seqs(const llama_mtp_round_seq * seqs, int32_t n);
     void set_mtp_round_target(llama_context * ctx_tgt);
@@ -83,6 +124,7 @@ struct llama_context {
     bool set_tokens_sampled(const int32_t * rows, const int32_t * idxs, int32_t n);
     void outputs_wait();
     void outputs_advance();
+    void outputs_fence();
 
     // the graph result the last decode ran, or nullptr once it may no longer be read
     llm_graph_result * get_gf_res_last() const;
@@ -153,6 +195,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_chain(int32_t k);
+    void set_mtp_dev_anchors(bool value);
     void draft_note_tokens(llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens);
     void flush_outputs();
     void set_causal_attn(bool value);
@@ -295,7 +338,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -346,7 +389,10 @@ private:
     // ids drafted by a chained MTP graph, one per step, read back on demand
     std::vector<llama_token> mtp_ids;
     std::vector<ggml_tensor *> mtp_ids_pending;
+    ggml_tensor *              mtp_ids_all_pending = nullptr;
+    ggml_tensor *              mtp_q_pending       = nullptr;
     int32_t                    mtp_ids_n_seq = 1;
+    int32_t                    mtp_ids_n_draft = 0;
 
     // the last ubatch of the last decode, row by row: sequence, position and output row (-1: none)
     std::vector<llama_seq_id> last_rows_seq;
@@ -369,6 +415,13 @@ private:
     llama_mtp_round_state mtp_round;
     llama_tokens_dev_state tokens_dev;
 
+    // rows of the next decode's embedding input copied on the device from another context's last hidden rows
+    // (a drafter's anchors from the target's verify), see llama_set_embd_device_rows
+    llama_embd_dev_state embd_dev;
+
+    bool embd_nextn_readback = true;  // one decode's setting, see set_embd_nextn_readback
+    bool embd_nextn_skipped  = false; // the last decode left its hidden rows on the device
+
     llama_decode_chain_state chain;
     struct decode_chain_info {
         bool enabled = false;
@@ -385,6 +438,7 @@ private:
         // an armed decode is queued and the last one's outputs are the ones the accessors read
         bool                  inflight  = false;
         bool                  read_done = false;
+        bool                  fenced    = false; // inflight by outputs_fence: no decode queued, the host fills pending
         ggml_backend_event_t  ev        = nullptr;
         ggml_backend_t        ev_backend = nullptr;
         int32_t               n_inflight  = 0;
@@ -414,6 +468,8 @@ private:
     llm_graph_result_ptr      gf_res_loop;
     ggml_context_ptr        ctx_mtp_hpend; // holds the tensor's metadata
     ggml_backend_buffer_ptr buf_mtp_hpend;
+    ggml_context_ptr        ctx_embd_stage; // embd_dev.stage, see set_embd_device_rows
+    ggml_backend_buffer_ptr buf_embd_stage;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
@@ -429,6 +485,9 @@ private:
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
         buffer_view<llama_token> candidates = {nullptr, 0};
+        // a logit per output row (the greedy rows' chosen ones) comes back here in one copy and goes to its row of
+        // logits on the host after the synchronize (a copy a row was 128 copies of 4 bytes a verify)
+        buffer_view<float>       stage      = {nullptr, 0};
 
         std::vector<uint32_t> logits_count;
         std::vector<uint32_t> probs_count;
@@ -462,7 +521,7 @@ private:
     size_t sched_max_nodes = 0;     // what sched was built with, see sched_reserve
     bool   sched_pp        = false;
     // per sequence, the backend signature of the sampler the last reservation measured
-    std::map<llama_seq_id, std::string> sampler_sigs_reserved;
+    std::set<std::string> sampler_sigs_reserved; // backend sampler chains a reserve measured, see set_sampler
 
     bool sched_need_reserve = true;
 
@@ -485,8 +544,21 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // An arena each for batches without outputs (a prompt's middle), with some (its end) and with every row an
+    // output (a verify), so that the three alternate without building again; the last graph is the only one
+    // reused (LLAMA_GRAPH_REALLOC=1 reuses another arena's graph by allocating it again, not stable yet).
+    std::vector<llm_graph_result_ptr> gf_res_prev;
+    std::vector<int64_t>              gf_res_prev_used; // when each arena last ran
+    int64_t                           gf_res_prev_step = 0;
+    int                               gf_res_prev_idx_last = -1; // the arena of the last lookup, for the rebuild log
+
+    struct state_async_copy {
+        const void *         dst;
+        llama_seq_id         seq_id;
+        ggml_backend_t       backend;
+        ggml_backend_event_t event;
+    };
+    std::vector<state_async_copy> state_async_pending;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;

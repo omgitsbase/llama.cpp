@@ -128,6 +128,9 @@ struct llama_memory_i {
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
+    // positions [0, n) of one sequence into another that holds none of them, also across streams (false: cannot);
+    // a backend given queues the row copies on its stream, else they are blocking
+    virtual bool seq_cp_prefix(llama_seq_id /*seq_id_src*/, llama_seq_id /*seq_id_dst*/, llama_pos /*n*/, ggml_backend_t /*backend*/) { return false; }
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 

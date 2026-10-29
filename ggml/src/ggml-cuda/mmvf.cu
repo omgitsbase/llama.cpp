@@ -1088,6 +1088,10 @@ void ggml_cuda_op_mul_mat_vec_f(
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+    // FP8 weights have kernels of their own (fp4gemm.cu)
+    if (type == GGML_TYPE_F8_E4M3) {
+        return false;
+    }
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
