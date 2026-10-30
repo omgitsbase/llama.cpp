@@ -1568,6 +1568,7 @@ struct llm_graph_context {
     mutable llm_graph_input_strm * inp_strm_g[16] = {};
     mutable ggml_tensor * fa_kv_strm = nullptr; // the next flash attention's K/V stream input (src[5])
     mutable llm_graph_input_mtp_rows * mtp_rows = nullptr; // a round over one stream per sequence: its K/V cells
+    mutable ggml_tensor * shexp_ids = nullptr; // [1, n_tokens] of n_expert, the stacked shared expert's id (build_moe_ffn)
     llm_graph_input_strm * build_inp_strm(int64_t n_seqs, int64_t n_span) const;
 
     // a draft model's reduced head: logits for every token, -inf for those it leaves out
@@ -1677,8 +1678,11 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * shexp_gate = nullptr) const;
 
+    // shexp_gate: the sigmoid gate of a shared expert stacked as expert n_expert (llama_model_base::load_tensors);
+    // every token is routed to it as well, weighted by the gate
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
@@ -1703,7 +1707,12 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * shexp_gate = nullptr) const;
+
+    // whether a layer's shared expert runs as expert n_expert (see build_moe_ffn): stacked at load, and no adapter
+    // changes the expert tensors
+    bool shexp_stacked(const llama_layer & layer) const;
 
     //
     // inputs

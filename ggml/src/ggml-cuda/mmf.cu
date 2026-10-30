@@ -10,6 +10,82 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
+static __global__ void mmf_sum_k_slices(const float * __restrict__ partial, float * __restrict__ dst, const int nrows,
+        const int ncols, const int nsplit, const int64_t stride_col_dst) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    const int j = blockIdx.y;
+    if (i >= nrows) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int s = 0; s < nsplit; ++s) {
+        sum += partial[((int64_t) s*ncols + j)*nrows + i];
+    }
+    dst[j*stride_col_dst + i] = sum;
+}
+
+template <typename T>
+static void mmf_split_k_launch(ggml_backend_cuda_context & ctx, const T * x, const float * y, float * dst, const int64_t k,
+        const int64_t nrows, const int64_t ncols, const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
+        const int64_t nsplit, const int rows_per_block, const int vals_per_T) {
+    const int64_t klen = k / nsplit;
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), nsplit*ncols*nrows);
+
+    // slice s of K is sample s: x and y step along K by one slice, each slice writes its own partial product
+    mul_mat_f_switch_rows_per_block<T>(
+        rows_per_block, x, y, nullptr, partial.get(), klen, nrows, ncols, stride_row, stride_col_y, nrows,
+        0, 0, 1, 1, 1, 0, 0, 0,
+        nsplit, nsplit, klen, klen*vals_per_T, ncols*nrows, ctx.stream(), nullptr);
+
+    const dim3 block_nums((nrows + 255) / 256, ncols, 1);
+    mmf_sum_k_slices<<<block_nums, 256, 0, ctx.stream()>>>(partial.get(), dst, (int) nrows, (int) ncols, (int) nsplit, stride_col_dst);
+}
+
+// A weight with few row blocks leaves most SMs idle while each block walks all of K (a router, a gate projection):
+// K is split into slices computed as samples of the same kernel, summed in a fixed order afterwards (deterministic,
+// unlike atomics). Splits only while the row blocks fill under a quarter of the SMs, up to about one block per SM.
+static bool mmf_split_k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const int rows_per_block) {
+    const int device    = ggml_cuda_get_device();
+    const int nsm       = ggml_cuda_info().devices[device].nsm;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    const int vals_per_T = src0->type == GGML_TYPE_F32 ? 1 : 2;
+    const int64_t k            = src0->ne[0] / vals_per_T;
+    const int64_t nrows        = src0->ne[1];
+    const int64_t n_row_blocks = nrows / rows_per_block;
+    if (n_row_blocks * 4 > nsm) {
+        return false;
+    }
+    int64_t nsplit = 1;
+    while (n_row_blocks * nsplit * 2 <= nsm && k % (nsplit * 2 * warp_size) == 0) {
+        nsplit *= 2;
+    }
+    if (nsplit == 1) {
+        return false;
+    }
+
+    const int64_t s01 = src0->nb[1] / ggml_type_size(src0->type);
+    const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
+    const int64_t s1  =  dst->nb[1] / ggml_type_size(dst->type);
+    const float * y = (const float *) src1->data;
+    float       * d = (float *) dst->data;
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            mmf_split_k_launch<float>(ctx, (const float *) src0->data, y, d, k, nrows, src1->ne[1], s01, s11, s1, nsplit, rows_per_block, 1);
+            return true;
+        case GGML_TYPE_F16:
+            mmf_split_k_launch<half2>(ctx, (const half2 *) src0->data, y, d, k, nrows, src1->ne[1], s01/2, s11/2, s1, nsplit, rows_per_block, 2);
+            return true;
+        case GGML_TYPE_BF16:
+            mmf_split_k_launch<nv_bfloat162>(ctx, (const nv_bfloat162 *) src0->data, y, d, k, nrows, src1->ne[1], s01/2, s11/2, s1, nsplit, rows_per_block, 2);
+            return true;
+        default:
+            return false;
+    }
+}
+
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
@@ -99,6 +175,10 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
+
+    if (!ids && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && mmf_split_k(ctx, src0, src1, dst, rows_per_block)) {
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {

@@ -34,6 +34,9 @@ void ggml_cuda_op_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_BF16:
             fill_kernel<<<num_blocks, CUDA_FILL_BLOCK_SIZE, 0, stream>>>((nv_bfloat16 *)dst_d, k, ggml_cuda_cast<nv_bfloat16>(value));
             break;
+        case GGML_TYPE_I32:
+            fill_kernel<<<num_blocks, CUDA_FILL_BLOCK_SIZE, 0, stream>>>((int32_t *)dst_d, k, (int32_t) value);
+            break;
         default:
             GGML_ABORT("unsupported type");
     }

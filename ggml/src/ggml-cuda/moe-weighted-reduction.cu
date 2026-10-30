@@ -24,6 +24,53 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
     dst[token * n_embd + col] = sum;
 }
 
+static __global__ void moe_weighted_reduction_ids_f32(const float *   __restrict__ experts,
+                                                      const float *   __restrict__ scale,
+                                                      const int32_t * __restrict__ ids,
+                                                      const int64_t                ids_s1,
+                                                      const float *   __restrict__ weights,
+                                                      float *         __restrict__ dst,
+                                                      const int64_t                n_embd,
+                                                      const int                    n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= n_embd) {
+        return;
+    }
+
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    float sum = (experts[first_row * n_embd + col] * scale[ids[token * ids_s1]]) * weights[first_row];
+    for (int expert = 1; expert < n_expert_used; ++expert) {
+        const uint64_t row = first_row + expert;
+        sum += (experts[row * n_embd + col] * scale[ids[token * ids_s1 + expert]]) * weights[row];
+    }
+    dst[token * n_embd + col] = sum;
+}
+
+void ggml_cuda_op_moe_weighted_reduction_ids(ggml_backend_cuda_context & ctx,
+                                             const ggml_tensor *         experts,
+                                             const ggml_tensor *         scale,
+                                             const ggml_tensor *         ids,
+                                             const ggml_tensor *         weights,
+                                             ggml_tensor *               dst) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(experts) && ggml_is_contiguous(weights) && ggml_is_contiguous(dst) && ggml_is_contiguous(scale));
+
+    const int64_t n_embd        = experts->ne[0];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
+    GGML_ASSERT(ids->ne[0] == n_expert_used && ids->ne[1] == n_tokens);
+
+    constexpr int threads = 256;
+    const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
+    moe_weighted_reduction_ids_f32<<<blocks, threads, 0, ctx.stream()>>>((const float *) experts->data, (const float *) scale->data,
+        (const int32_t *) ids->data, (int64_t) (ids->nb[1] / sizeof(int32_t)), (const float *) weights->data, (float *) dst->data,
+        n_embd, (int) n_expert_used);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
                                           const float * weights,

@@ -1658,7 +1658,9 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-        size_t n_size = ggml_nbytes(cur);
+        // a tensor can be larger than its file data (an extra expert slot filled from another tensor)
+        const size_t n_size = ggml_nbytes(weight->tensor);
+        GGML_ASSERT(n_size <= ggml_nbytes(cur));
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

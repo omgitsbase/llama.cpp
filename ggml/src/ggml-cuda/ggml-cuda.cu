@@ -6440,6 +6440,182 @@ static int ggml_cuda_try_expert_scale_pass(ggml_backend_cuda_context & ctx, cons
     return 4;
 }
 
+void ggml_cuda_moe_mmq_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0s, int n, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * const * dsts, const int gate, const float * s_gate, const float * s_up, ggml_tensor * glu,
+        const ggml_tensor * w_down, ggml_tensor * down_dst);
+
+// An MoE FFN over more tokens than the matvec takes (MMQ): gate and up, each with or without its per-expert scale
+// chain, their SwiGLU, and when they follow, the down projection and the weighted sum over the slots. Gate and up run
+// as one grouped expert launch (the ids sorted and the activations quantized once), one pass takes both scales and
+// the GLU, down reuses the sorted ids, and the sum takes down's scales by id: where it was two launches, three helper
+// passes and up to five scale and GLU passes. GGML_CUDA_MOE_GATE_UP=0 off, =1 stops after the GLU.
+static int ggml_cuda_try_moe_gate_up(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const int mode = getenv("GGML_CUDA_MOE_GATE_UP") ? atoi(getenv("GGML_CUDA_MOE_GATE_UP")) : 2;
+    ggml_tensor * mm_a = cgraph->nodes[i];
+    if (mode == 0 || mm_a->op != GGML_OP_MUL_MAT_ID || mm_a->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+        return 0;
+    }
+    const ggml_tensor * w    = mm_a->src[0];
+    const ggml_tensor * src1 = mm_a->src[1];
+    const ggml_tensor * ids  = mm_a->src[2];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    auto weight_ok = [&](const ggml_tensor * t) {
+        return t->type == w->type && t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            t->nb[0] == ggml_type_size(t->type) && t->ne[2] == w->ne[2] && t->ne[3] == 1;
+    };
+    if (!ggml_is_quantized(w->type) || !weight_ok(w) || src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            ids->nb[0] != sizeof(int32_t) || !ggml_cuda_should_use_mmq(w->type, cc, src1->ne[2], w->ne[2]) || mm_a->ne[3] != 1 ||
+            mm_a->ne[2] > 65535) {
+        return 0;
+    }
+
+    // a product's last node: its scale chain's multiply, or itself without one
+    auto product = [&](int k, ggml_tensor *& out, const ggml_tensor *& scale) {
+        scale = ggml_cuda_expert_scale_chain(cgraph, k);
+        out   = cgraph->nodes[scale ? k + 4 : k];
+        return scale ? k + 4 : k;
+    };
+    auto next = [&](int k) {
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            k++;
+        }
+        return k;
+    };
+    auto plain = [&](const ggml_tensor * t) {
+        return ggml_is_contiguous(t) && t->type == GGML_TYPE_F32 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    // the product's nodes read only by the next step of the chain
+    auto single_use = [&](int k, const ggml_tensor * scale) {
+        return ggml_node_get_use_count(cgraph, k) == 1 && (!scale || ggml_node_get_use_count(cgraph, k + 4) == 1);
+    };
+
+    ggml_tensor * out_a; const ggml_tensor * s_a;
+    const int j = next(product(i, out_a, s_a) + 1);
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm_b = cgraph->nodes[j];
+    if (mm_b->op != GGML_OP_MUL_MAT_ID || mm_b->src[1] != src1 || mm_b->src[2] != ids || !weight_ok(mm_b->src[0]) ||
+            mm_b->src[0]->ne[0] != w->ne[0] || mm_b->src[0]->nb[2] != w->nb[2] || !ggml_are_same_shape(mm_a, mm_b)) {
+        return 0;
+    }
+    ggml_tensor * out_b; const ggml_tensor * s_b;
+    const int k = next(product(j, out_b, s_b) + 1);
+    if (k >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * glu = cgraph->nodes[k];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+            !plain(glu) || !ggml_are_same_shape(glu, mm_a) ||
+            !((glu->src[0] == out_a && glu->src[1] == out_b) || (glu->src[0] == out_b && glu->src[1] == out_a))) {
+        return 0;
+    }
+    if (!plain(mm_a) || !plain(mm_b) || !plain(out_a) || !plain(out_b) || !single_use(i, s_a) || !single_use(j, s_b)) {
+        return 0;
+    }
+    // both products are written before the GLU reads them: neither may sit in the other's memory, and the GLU in place
+    // of one of them reads and writes each element once
+    if (ggml_cuda_ranges_overlap(mm_a, mm_b) || (glu->data != mm_a->data && ggml_cuda_ranges_overlap(glu, mm_a)) ||
+            (glu->data != mm_b->data && ggml_cuda_ranges_overlap(glu, mm_b))) {
+        return 0;
+    }
+
+    // the down projection of the GLU and the router-weighted sum over the slots after it
+    ggml_tensor * mm_d = nullptr; const ggml_tensor * s_d = nullptr; ggml_tensor * out_d = nullptr;
+    ggml_cuda_moe_weighted_reduction_match red;
+    int last = k;
+    if (mode >= 2 && ggml_node_get_use_count(cgraph, k) == 1) {
+        const int l = next(k + 1);
+        if (l < cgraph->n_nodes && cgraph->nodes[l]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[l]->src[1] == glu &&
+                cgraph->nodes[l]->src[2] == ids && weight_ok(cgraph->nodes[l]->src[0]) && cgraph->nodes[l]->src[0]->ne[0] == glu->ne[0] &&
+                plain(cgraph->nodes[l])) {
+            const int last_d = product(l, out_d, s_d);
+            const int m      = next(last_d + 1);
+            if (single_use(l, s_d) && plain(out_d) && m < cgraph->n_nodes && ggml_cuda_match_moe_weighted_reduction(cgraph, m, red) &&
+                    red.experts == out_d && red.expert_scale == nullptr && plain(red.dst) && ggml_is_contiguous(red.weights) &&
+                    !ggml_cuda_ranges_overlap(red.dst, cgraph->nodes[l]) && !ggml_cuda_ranges_overlap(red.dst, red.weights) &&
+                    !ggml_cuda_ranges_overlap(red.dst, ids)) {
+                mm_d = cgraph->nodes[l];
+                last = m + red.node_count - 1;
+            }
+        }
+    }
+
+    ggml_cuda_norm_fold_materialize(ctx, src1);
+    const ggml_tensor * ws[2] = { mm_a->src[0], mm_b->src[0] };
+    ggml_tensor *       ds[2] = { mm_a, mm_b };
+    const int g = glu->src[0] == out_a ? 0 : 1;
+    const ggml_tensor * sg = g == 0 ? s_a : s_b;
+    const ggml_tensor * su = g == 0 ? s_b : s_a;
+    ggml_cuda_moe_mmq_ffn(ctx, ws, 2, src1, ids, ds, g, sg ? (const float *) sg->data : nullptr, su ? (const float *) su->data : nullptr,
+        glu, mm_d ? mm_d->src[0] : nullptr, mm_d);
+    if (mm_d) {
+        if (s_d) {
+            ggml_cuda_op_moe_weighted_reduction_ids(ctx, mm_d, s_d, ids, red.weights, red.dst);
+        } else {
+            ggml_cuda_op_moe_weighted_reduction(ctx, mm_d, nullptr, red.weights, red.dst);
+        }
+    }
+    return last - i;
+}
+
+// The slot of a shared expert stacked with the routed ones (build_moe_ffn), right after an MoE's routing: its gate's
+// matvec over the router's input, the sigmoid, the routed weights and ids each concatenated with it (the ids' first
+// use also fills them). The routing kernel writes the concatenations itself. Returns the nodes from `at` it covers.
+// GGML_CUDA_FUSE_OFF bit 61 keeps them apart.
+static constexpr uint64_t GGML_CUDA_FUSE_TOPK_SHEXP = 1ull << 61;
+
+static int ggml_cuda_topk_moe_shexp_match(const ggml_cgraph * cgraph, const int at, const int ids_idx, const int weights_idx,
+        const ggml_tensor * logits, ggml_tensor *& g_mm, ggml_tensor *& fill, ggml_tensor *& w9, ggml_tensor *& ids9, int & extra_id) {
+    if (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_TOPK_SHEXP) {
+        return 0;
+    }
+    auto node = [&](int j) -> ggml_tensor * { return j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr; };
+    const ggml_tensor * weights = cgraph->nodes[weights_idx];
+    const ggml_tensor * ids     = cgraph->nodes[ids_idx];
+
+    ggml_tensor * mm  = node(at);
+    ggml_tensor * sig = node(at + 1);
+    ggml_tensor * rs  = node(at + 2);
+    ggml_tensor * cw  = node(at + 3);
+    if (!mm || !sig || !rs || !cw || mm->op != GGML_OP_MUL_MAT || mm->src[1] != logits->src[1] || mm->type != GGML_TYPE_F32 ||
+            ggml_nelements(mm) != logits->ne[1] || !ggml_is_contiguous(mm) ||
+            sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != mm ||
+            rs->op != GGML_OP_RESHAPE || rs->src[0] != sig ||
+            cw->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cw, 0) != 1 || cw->src[0] != weights || cw->src[1] != rs ||
+            cw->type != GGML_TYPE_F32 || !ggml_is_contiguous(cw) || cw->ne[1] != weights->ne[1] + 1) {
+        return 0;
+    }
+    int j = at + 4;
+    ggml_tensor * f = nullptr;
+    if (node(j) && node(j)->op == GGML_OP_FILL) {
+        f = node(j++);
+    }
+    ggml_tensor * ci = node(j);
+    if (!ci || ci->op != GGML_OP_CONCAT || ggml_get_op_params_i32(ci, 0) != 0 || ci->src[0] != ids || ci->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(ci) || ci->ne[0] != cw->ne[1] || ci->src[1]->op != GGML_OP_FILL || (f && ci->src[1] != f)) {
+        return 0;
+    }
+    if (ggml_node_get_use_count(cgraph, weights_idx) != 1 || ggml_node_get_use_count(cgraph, ids_idx) != 1 ||
+            ggml_node_get_use_count(cgraph, at) != 1 || ggml_node_get_use_count(cgraph, at + 1) != 1 ||
+            ((mm->flags | sig->flags | cw->flags | ci->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    // the routing reads the logits and the gate logits while it writes: neither may share memory with the outputs
+    // (one block over the logits reads all of them first)
+    const bool logits_alias_ok = ggml_nrows(logits) <= TOPK_MOE_ROWS_PER_BLOCK;
+    if (ggml_cuda_ranges_overlap(cw, ci) || ggml_cuda_ranges_overlap(cw, mm) || ggml_cuda_ranges_overlap(ci, mm) ||
+            (!logits_alias_ok && (ggml_cuda_ranges_overlap(cw, logits) || ggml_cuda_ranges_overlap(ci, logits)))) {
+        return 0;
+    }
+    g_mm     = mm;
+    fill     = f;
+    w9       = cw;
+    ids9     = ci;
+    extra_id = (int) ggml_get_op_params_f32(ci->src[1], 0);
+    return j - at + 1;
+}
+
 static int ggml_cuda_try_moe_router_weights(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     if ((ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MOE_ROUTER_WEIGHTS) || i + 1 >= cgraph->n_nodes) {
         return 0;
@@ -7103,6 +7279,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
+        nodes_to_skip = ggml_cuda_try_moe_gate_up(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
         nodes_to_skip = ggml_cuda_try_expert_scale_pass(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
@@ -7268,6 +7448,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                    ggml_tensor * g_mm = nullptr, * fill = nullptr, * w9 = nullptr, * ids9 = nullptr;
+                    int extra_id = 0;
+                    const int n_extra = ggml_cuda_topk_moe_shexp_match(cgraph, i + (int) ops.size(), out_nodes[0], out_nodes[1], logits,
+                        g_mm, fill, w9, ids9, extra_id);
+                    if (n_extra > 0) {
+                        if (fill) {
+                            GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, fill));
+                        }
+                        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, g_mm));
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, w9, ids9, clamp, scale, bias, args, g_mm, extra_id);
+                        return (int) ops.size() + n_extra - 1;
+                    }
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }

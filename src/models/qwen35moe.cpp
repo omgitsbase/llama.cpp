@@ -507,6 +507,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // the shared expert in the expert kernels, as expert n_expert
+    const bool stacked = shexp_stacked(model.layers[il]);
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -521,11 +524,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            stacked ? model.layers[il].ffn_gate_inp_shexp : nullptr);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
-    if (model.layers[il].ffn_up_shexp != nullptr) {
+    if (model.layers[il].ffn_up_shexp != nullptr && !stacked) {
         ggml_tensor * ffn_shexp =
             build_ffn(cur,
                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
@@ -763,6 +768,7 @@ ggml_tensor * llama_model_qwen35moe::graph_mtp::build_step(
     cb(cur, "mtp_ffn_norm", il);
 
     // MoE FFN: routed experts plus gated shared expert (mirrors qwen35moe).
+    const bool stacked = shexp_stacked(layer);
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             layer.ffn_gate_inp,
@@ -777,10 +783,12 @@ ggml_tensor * llama_model_qwen35moe::graph_mtp::build_step(
             nullptr, layer.ffn_gate_up_exps,
             layer.ffn_up_exps_s,
             layer.ffn_gate_exps_s,
-            layer.ffn_down_exps_s);
+            layer.ffn_down_exps_s,
+            nullptr,
+            stacked ? layer.ffn_gate_inp_shexp : nullptr);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
-    if (layer.ffn_up_shexp != nullptr) {
+    if (layer.ffn_up_shexp != nullptr && !stacked) {
         ggml_tensor * ffn_shexp =
             build_ffn(cur,
                 layer.ffn_up_shexp,   nullptr, layer.ffn_up_shexp_s,

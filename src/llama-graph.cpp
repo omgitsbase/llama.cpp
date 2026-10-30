@@ -3191,7 +3191,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * shexp_gate) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -3212,8 +3213,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        shexp_gate
     );
+}
+
+bool llm_graph_context::shexp_stacked(const llama_layer & layer) const {
+    if (!layer.ffn_up_shexp || !layer.ffn_up_exps || layer.ffn_up_shexp->view_src != layer.ffn_up_exps) {
+        return false;
+    }
+    for (const auto & lora : *loras) {
+        for (const ggml_tensor * w : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+            if (lora.first->get_weight(const_cast<ggml_tensor *>(w)) != nullptr) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
@@ -3240,7 +3256,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * shexp_gate) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -3379,6 +3396,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    uint32_t n_shexp = 0;
+    if (shexp_gate) {
+        GGML_ASSERT(!weight_before_ffn);
+        ggml_tensor * g = ggml_sigmoid(ctx0, build_lora_mm(shexp_gate, cur)); // [1, n_tokens]
+        cb(g, "ffn_moe_shexp_gate", il);
+        weights = ggml_concat(ctx0, weights, ggml_reshape_3d(ctx0, g, 1, 1, n_tokens), 1);
+        cb(weights, "ffn_moe_weights_shexp", il);
+
+        if (shexp_ids == nullptr || shexp_ids->ne[1] != n_tokens) {
+            shexp_ids = ggml_fill_inplace(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens), (float) n_expert);
+            cb(shexp_ids, "ffn_moe_shexp_ids", -1);
+        }
+        selected_experts = ggml_concat(ctx0, selected_experts, shexp_ids, 0);
+        cb(selected_experts, "ffn_moe_topk_shexp", il);
+
+        // ahead of the expert matmuls, so the down projection runs straight into the weighted sum
+        ggml_build_forward_expand(gf, weights);
+        ggml_build_forward_expand(gf, selected_experts);
+
+        n_expert_used += 1;
+        n_shexp = 1;
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -3554,7 +3594,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Use per-layer n_expert_used to bound the graph even during warmup (avoids
     // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    const uint32_t n_expert_used_il = hparams.n_expert_used(il) + n_shexp;
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
@@ -4185,14 +4225,28 @@ const llm_graph_mtp_attn & attn,
         return ggml_add(ctx0, m, extra);
     };
 
+    // the reduced head as in build_mtp_round, unless an adapter changes the head it was taken from
+    bool reduced = draft_head != nullptr;
+    for (const auto & lora : *loras) {
+        reduced = reduced && lora.first->get_weight(draft_head->src) == nullptr;
+    }
+    const int64_t n_draft = reduced ? draft_head->w->ne[1] : 0;
+
     for (int j = 0; j < K; ++j) {
         ggml_tensor * h_next = mtp.mtp_step(tok, h, pos_chain(j), (int) (S*V + j*S), false, mask_chain(j));
         cb(h_next, "mtp_chain_h", j);
 
+        mm_subst = reduced ? draft_head->src : nullptr;
         ggml_tensor * logits_j = mtp.mtp_head(h_next);
+        mm_subst = nullptr;
         cb(logits_j, "mtp_chain_logits", j);
 
         ggml_tensor * next = ggml_argmax(ctx0, logits_j);
+        if (reduced && logits_j->ne[0] == n_draft) {
+            next = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, draft_head->ids, 1, n_draft), next), S);
+        } else if (reduced) {
+            res->draft_head_unused = true;
+        }
         cb(next, "mtp_chain_next", j);
         ggml_set_output(next);
         ggml_build_forward_expand(gf, next);
@@ -4202,6 +4256,19 @@ const llm_graph_mtp_attn & attn,
             tok = ggml_get_rows(ctx0, mtp.mtp_embd_weights(), next);
             h   = h_next;
         }
+    }
+    // every step's ids with a sequence's K together ([K, S]): the verify takes them as one strided copy, see
+    // llm_graph_input_embd::set_input (as gemma4-assistant does)
+    if (K > 1) {
+        ggml_tensor * all = res->t_mtp_ids[0];
+        for (int j = 1; j < K; ++j) {
+            all = ggml_concat(ctx0, all, res->t_mtp_ids[j], 0);
+        }
+        all = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, all, S, K)));
+        cb(all, "mtp_chain_ids_all", -1);
+        ggml_set_output(all);
+        ggml_build_forward_expand(gf, all);
+        res->t_mtp_ids_all = all;
     }
 
     ggml_build_forward_expand(gf, n_acc_i);

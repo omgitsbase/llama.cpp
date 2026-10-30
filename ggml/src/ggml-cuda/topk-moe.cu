@@ -11,6 +11,12 @@ struct topk_moe_config {
     bool use_sqrt_softplus;
     bool with_norm;
     bool delayed_softmax;
+    // a shared expert stacked as one more slot: its id and sigmoid(its gate logit) follow the routed ones in rows of
+    // n_expert_used + 1 (w_stride, ids_stride); without one the rows are n_expert_used weights and n_experts ids
+    const float * extra_logit;
+    int           extra_id;
+    int           w_stride;
+    int           ids_stride;
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -135,8 +141,8 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     const int  row     = active ? row_raw : 0;
 
     logits += n_experts * row;
-    weights += n_expert_used * row;
-    ids += n_experts * row;
+    weights += config.w_stride * row;
+    ids += config.ids_stride * row;
 
     constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
 
@@ -371,6 +377,10 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
             weights[idx] = output_weights[i] * scale_val;
         }
     }
+    if (config.extra_logit != nullptr && threadIdx.x == 0) {
+        weights[n_expert_used] = 1.0f / (1.0f + expf(-config.extra_logit[row]));
+        ids[n_expert_used]     = config.extra_id;
+    }
 }
 
 template<bool has_bias, bool redux>
@@ -455,7 +465,9 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args) {
+                           const ggml_cuda_topk_moe_args & args,
+                           const ggml_tensor *             extra_logit,
+                           const int                       extra_id) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
@@ -470,9 +482,14 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
 
-    GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts);
-
-    const int n_expert_used = weights->ne[1];
+    const int n_expert_used = extra_logit ? weights->ne[1] - 1 : weights->ne[1];
+    if (extra_logit) {
+        GGML_ASSERT(extra_logit->type == GGML_TYPE_F32 && ggml_nelements(extra_logit) == n_rows && ggml_is_contiguous(extra_logit));
+        GGML_ASSERT(ids->ne[0] == n_expert_used + 1 && ids->nb[1] / ggml_type_size(ids->type) == (size_t) (n_expert_used + 1));
+        GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(ids));
+    } else {
+        GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts);
+    }
 
     const bool with_norm = clamp != nullptr;
 
@@ -486,6 +503,10 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
+    config.extra_logit       = extra_logit ? (const float *) extra_logit->data : nullptr;
+    config.extra_id          = extra_id;
+    config.w_stride          = extra_logit ? n_expert_used + 1 : n_expert_used;
+    config.ids_stride        = extra_logit ? n_expert_used + 1 : n_experts;
 
     const int  cc    = ggml_cuda_info().devices[ctx.device].cc;
     const bool redux = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_TOPK_REDUX);

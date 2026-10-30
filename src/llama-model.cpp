@@ -1826,6 +1826,67 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // a shared expert shaped like the routed ones becomes expert n_expert: the expert tensors grow by one slot and the
+    // shared expert's weights are views of it, so memory is unchanged and the expert kernels run it with the routed
+    // experts instead of as a separate FFN (scales get their extra slot after loading)
+    if (arch == LLM_ARCH_QWEN35MOE) {
+        auto key_of = [&](const ggml_tensor * t) -> const llama_model_loader::ctx_key * {
+            for (const auto & [key, ctx] : ml.ctx_map) {
+                if (ggml_get_tensor(ctx.get(), t->name) == t) {
+                    return &key;
+                }
+            }
+            return nullptr;
+        };
+        auto grow = [](ggml_tensor * t, int d) {
+            t->ne[d] += 1;
+            for (int i = d + 1; i < GGML_MAX_DIMS; ++i) {
+                t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
+            }
+        };
+        const int64_t n_exp = hparams.n_expert;
+        int n_stacked = 0;
+        for (auto & l : layers) {
+            ggml_tensor * exps[3]   = { l.ffn_gate_exps,    l.ffn_up_exps,    l.ffn_down_exps    };
+            ggml_tensor * sh[3]     = { l.ffn_gate_shexp,   l.ffn_up_shexp,   l.ffn_down_shexp   };
+            ggml_tensor * exps_s[3] = { l.ffn_gate_exps_s,  l.ffn_up_exps_s,  l.ffn_down_exps_s  };
+            ggml_tensor * sh_s[3]   = { l.ffn_gate_shexp_s, l.ffn_up_shexp_s, l.ffn_down_shexp_s };
+
+            bool ok = l.ffn_gate_inp_shexp && !l.ffn_gate_up_exps && !l.ffn_gate_exps_b && !l.ffn_up_exps_b && !l.ffn_down_exps_b &&
+                      exps[0] && sh[0];
+            const llama_model_loader::ctx_key * key = ok ? key_of(exps[0]) : nullptr;
+            ok = key && !key->lazy && !ggml_backend_buft_is_host(key->buft);
+            for (int k = 0; ok && k < 3; ++k) {
+                ok = exps[k] && sh[k] && exps[k]->type == sh[k]->type && exps[k]->ne[0] == sh[k]->ne[0] &&
+                     exps[k]->ne[1] == sh[k]->ne[1] && exps[k]->ne[2] == n_exp && exps[k]->ne[3] == 1 &&
+                     ggml_nrows(sh[k]) == sh[k]->ne[1] && key_of(exps[k]) == key && key_of(sh[k]) == key &&
+                     (exps_s[k] == nullptr) == (sh_s[k] == nullptr);
+                if (ok && exps_s[k]) {
+                    const llama_model_loader::ctx_key * ks = key_of(exps_s[k]);
+                    ok = exps_s[k]->type == GGML_TYPE_F32 && ggml_nelements(exps_s[k]) == n_exp && exps_s[k]->ne[0] == n_exp &&
+                         sh_s[k]->type == GGML_TYPE_F32 && ggml_nelements(sh_s[k]) == 1 &&
+                         ks && !ks->lazy && !ggml_backend_buft_is_host(ks->buft);
+                }
+            }
+            if (!ok) {
+                continue;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const size_t offs = ggml_nbytes(exps[k]);
+                grow(exps[k], 2);
+                sh[k]->view_src  = exps[k];
+                sh[k]->view_offs = offs;
+                if (exps_s[k]) {
+                    grow(exps_s[k], 0);
+                }
+            }
+            n_stacked++;
+        }
+        if (n_stacked > 0) {
+            LLAMA_LOG_INFO("%s: the shared expert runs as expert %d in %d layers\n", __func__, (int) n_exp, n_stacked);
+        }
+    }
+
     ml.done_getting_tensors();
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
@@ -2082,6 +2143,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    // a stacked shared expert's scale in its expert slot
+    for (auto & l : layers) {
+        const std::pair<ggml_tensor *, ggml_tensor *> sp[] = {
+            { l.ffn_gate_exps_s, l.ffn_gate_shexp_s }, { l.ffn_up_exps_s, l.ffn_up_shexp_s }, { l.ffn_down_exps_s, l.ffn_down_shexp_s },
+        };
+        for (const auto & [e, s] : sp) {
+            if (e && s && l.ffn_up_shexp && l.ffn_up_shexp->view_src == l.ffn_up_exps && ggml_nelements(e) == hparams.n_expert + 1) {
+                float v = 0.0f;
+                ggml_backend_tensor_get(s, &v, 0, sizeof(v));
+                ggml_backend_tensor_set(e, &v, hparams.n_expert * sizeof(float), sizeof(v));
+            }
         }
     }
 
