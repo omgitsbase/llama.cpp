@@ -278,10 +278,11 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         return cur;
     };
 
-    // the checkpoint's sparse head, opt-in (LLAMA_DRAFT_CENTROIDS=1): score the centroids, keep the best few, and
-    // take logits only for the tokens of their blocks of the vocabulary. Returns those logits [n_sel, 1, n_out] and
-    // their token ids [n_sel, n_out].
-    static const bool use_centroids = getenv("LLAMA_DRAFT_CENTROIDS") != nullptr && atoi(getenv("LLAMA_DRAFT_CENTROIDS")) != 0;
+    // the checkpoint's sparse head, as vLLM runs this drafter: score the centroids, keep the best few, and take logits
+    // only for the tokens of their blocks of the vocabulary, where the whole head is a 262144-row matvec a step.
+    // Returns those logits [n_sel, 1, n_out] and their token ids [n_sel, n_out]. LLAMA_DRAFT_CENTROIDS=0 scores the
+    // whole vocabulary.
+    static const bool use_centroids = getenv("LLAMA_DRAFT_CENTROIDS") == nullptr || atoi(getenv("LLAMA_DRAFT_CENTROIDS")) != 0;
     const bool sparse = use_centroids && model.masked_embd_centroids && model.masked_embd_ordering && hparams.masked_embd_top_k > 0;
     auto sparse_head = [&](ggml_tensor * cur, ggml_tensor ** ids_out) -> ggml_tensor * {
         const int64_t n_vocab_d = model.output->ne[1];

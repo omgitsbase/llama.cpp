@@ -597,9 +597,11 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        // a padded draft keeps its full length to the end: the rows past the budget are verified and dropped, and
-        // the verify keeps one shape for every slot in it
-        if (n_remaining() > 0 && !pad_draft) {
+        // a draft keeps its full length to the end: the rows past the budget are verified and dropped (process_token
+        // stops at the limit), and the verify keeps its shape, where a shorter last draft built a graph of its own
+        // inside the reply (half a second on Gemma 4 E4B). LLAMA_SPEC_BUDGET_CUT=1 cuts the draft to the budget.
+        static const bool budget_cut = getenv("LLAMA_SPEC_BUDGET_CUT") != nullptr;
+        if (budget_cut && n_remaining() > 0 && !pad_draft) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 

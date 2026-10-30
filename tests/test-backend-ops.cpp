@@ -12457,6 +12457,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Gemma 4 E4B's feed-forward shapes over a verify of one sequence, sixteen matrices per call so the weights
+    // stream from DRAM as a model's layers do
+    for (int bs : {1, 2, 3, 4}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+            for (int64_t k : {2048, 2560, 3072, 4096, 5120}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, bs, k, {16, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, bs, 10240, {16, 1}, {1, 1}));
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
