@@ -1826,18 +1826,53 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    auto key_of = [&](const ggml_tensor * t) -> const llama_model_loader::ctx_key * {
+        for (const auto & [key, ctx] : ml.ctx_map) {
+            if (ggml_get_tensor(ctx.get(), t->name) == t) {
+                return &key;
+            }
+        }
+        return nullptr;
+    };
+
+    // a drafter-only block (nextn/MTP) kept in 16 bits beside a quantized trunk loads as Q8_0: only proposals read it
+    // (the trunk checks every drafted token), and half the bytes halves its weight reads in every draft step. The
+    // loader converts the file's rows on the way in. LLAMA_MTP_KEEP_TYPE=1 keeps the file's type.
+    {
+        const ggml_tensor * trunk = n_layer_all > 0 ? (layers[0].ffn_down_exps ? layers[0].ffn_down_exps : layers[0].ffn_down) : nullptr;
+        const bool quantized_trunk = trunk && trunk->type != GGML_TYPE_F32 && trunk->type != GGML_TYPE_F16 && trunk->type != GGML_TYPE_BF16;
+        int n_retyped = 0;
+        for (int il = (int) hparams.n_layer(); quantized_trunk && !getenv("LLAMA_MTP_KEEP_TYPE") && il < n_layer_all; ++il) {
+            auto & l = layers[il];
+            ggml_tensor * ws[] = { l.wq, l.wk, l.wv, l.wqkv, l.wo, l.ffn_gate, l.ffn_up, l.ffn_down,
+                                   l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps,
+                                   l.ffn_gate_shexp, l.ffn_up_shexp, l.ffn_down_shexp, l.nextn.eh_proj };
+            for (ggml_tensor * t : ws) {
+                if (!t || (t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_F16) || t->ne[0] % ggml_blck_size(GGML_TYPE_Q8_0) != 0 || t->view_src) {
+                    continue;
+                }
+                const llama_model_loader::ctx_key * key = key_of(t);
+                if (!key || key->lazy || ggml_backend_buft_is_host(key->buft)) {
+                    continue;
+                }
+                t->type  = GGML_TYPE_Q8_0;
+                t->nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
+                t->nb[1] = ggml_row_size(GGML_TYPE_Q8_0, t->ne[0]);
+                for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+                    t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
+                }
+                n_retyped++;
+            }
+        }
+        if (n_retyped > 0) {
+            LLAMA_LOG_INFO("%s: %d drafter-only weights load as Q8_0\n", __func__, n_retyped);
+        }
+    }
+
     // a shared expert shaped like the routed ones becomes expert n_expert: the expert tensors grow by one slot and the
     // shared expert's weights are views of it, so memory is unchanged and the expert kernels run it with the routed
     // experts instead of as a separate FFN (scales get their extra slot after loading)
     if (arch == LLM_ARCH_QWEN35MOE) {
-        auto key_of = [&](const ggml_tensor * t) -> const llama_model_loader::ctx_key * {
-            for (const auto & [key, ctx] : ml.ctx_map) {
-                if (ggml_get_tensor(ctx.get(), t->name) == t) {
-                    return &key;
-                }
-            }
-            return nullptr;
-        };
         auto grow = [](ggml_tensor * t, int d) {
             t->ne[d] += 1;
             for (int i = d + 1; i < GGML_MAX_DIMS; ++i) {

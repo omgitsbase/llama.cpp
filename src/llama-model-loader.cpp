@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <thread>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1656,6 +1657,44 @@ bool llama_model_loader::load_all_data(
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
+        }
+
+        // a tensor created in another type than the file's (a drafter-only block in Q8_0): the file's rows are
+        // converted on several threads, a slice of up to 64 MB at a time
+        if (cur->type != weight->tensor->type) {
+            const ggml_tensor * src = weight->tensor;
+            const auto *  tt    = ggml_get_type_traits(src->type);
+            const int64_t ne0   = src->ne[0];
+            const int64_t nrows = ggml_nrows(src);
+            const size_t  srow  = ggml_row_size(src->type, ne0);
+            const size_t  drow  = ggml_row_size(cur->type, ne0);
+            GGML_ASSERT(tt->to_float && ggml_is_contiguous(src) && drow*nrows <= ggml_nbytes(cur));
+            const int64_t chunk = std::max<int64_t>(1, (64 << 20) / (int64_t) srow);
+            std::vector<no_init<uint8_t>> sbuf(use_mmap ? 0 : chunk*srow);
+            std::vector<no_init<uint8_t>> dbuf(chunk*drow);
+            const int n_thr = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+            ggml_quantize_init(cur->type);
+            for (int64_t r0 = 0; r0 < nrows; r0 += chunk) {
+                const int64_t   nr = std::min(chunk, nrows - r0);
+                const uint8_t * s  = (const uint8_t *) load_data_range(*weight, r0*srow, nr*srow, sbuf.data());
+                uint8_t *       d  = (uint8_t *) dbuf.data();
+                std::vector<std::thread> workers;
+                for (int t = 0; t < n_thr; ++t) {
+                    workers.emplace_back([&, t]() {
+                        std::vector<float> f(ne0);
+                        for (int64_t r = nr*t/n_thr; r < nr*(t + 1)/n_thr; ++r) {
+                            tt->to_float(s + r*srow, f.data(), ne0);
+                            ggml_quantize_chunk(cur->type, f.data(), d + r*drow, 0, 1, ne0, nullptr);
+                        }
+                    });
+                }
+                for (auto & w : workers) {
+                    w.join();
+                }
+                ggml_backend_tensor_set(cur, d, r0*drow, nr*drow);
+            }
+            size_done += ggml_nbytes(src);
+            continue;
         }
 
         // a tensor can be larger than its file data (an extra expert slot filled from another tensor)

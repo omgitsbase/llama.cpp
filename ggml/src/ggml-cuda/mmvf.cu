@@ -727,11 +727,11 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
-// the rows of two F32 weights over one activation: grid rows [0, nrows_a) read wa, the rest wb. The row loop, the
-// folded-norm load and both reductions are mul_mat_vec_f's at the same block size, then each row's epilogue runs.
-template <int ncols_dst, int block_size>
+// the rows of two F32 or BF16 weights over one activation: grid rows [0, nrows_a) read wa, the rest wb. The row loop,
+// the folded-norm load and both reductions are mul_mat_vec_f's at the same block size, then each row's epilogue runs.
+template <typename T, int ncols_dst, int block_size>
 static __global__ void mul_mat_vec_f_pair_epi(
-        const float * wa, const float * wb, const int nrows_a, const int64_t stride_row_a, const int64_t stride_row_b,
+        const T * wa, const T * wb, const int nrows_a, const int64_t stride_row_a, const int64_t stride_row_b,
         const float * y_ptr, const float * norm_w, const float * norm_scale, const int ncols2, const int stride_col_y2,
         float * dst_a, float * dst_b, const int stride_col_dst_a, const int stride_col_dst_b,
         const ggml_cuda_mm_epilogue epi_a, const ggml_cuda_mm_epilogue epi_b) {
@@ -740,7 +740,7 @@ static __global__ void mul_mat_vec_f_pair_epi(
     const int  tid  = threadIdx.x;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    const float2 * x2  = (const float2 *) (is_b ? wb + row*stride_row_b : wa + row*stride_row_a);
+    const T *      xr  = is_b ? wb + row*stride_row_b : wa + row*stride_row_a;
     const float2 * y2  = (const float2 *) y_ptr;
     const float2 * w2  = (const float2 *) norm_w;
 
@@ -758,12 +758,23 @@ static __global__ void mul_mat_vec_f_pair_epi(
         __syncthreads();
     }
 
+    // past MMVF_MAX_BATCH_SIZE columns the unfused product is the BF16 tensor-core kernel, which rounds y to BF16
+    constexpr bool round_y = std::is_same_v<T, nv_bfloat16> && ncols_dst > MMVF_MAX_BATCH_SIZE;
+
     float sumf[ncols_dst] = {0.0f};
     for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-        const float2 tmpx = x2[col2];
+        float2 tmpx;
+        if constexpr (std::is_same_v<T, float>) {
+            tmpx = ((const float2 *) xr)[col2];
+        } else {
+            tmpx = __bfloat1622float2(((const nv_bfloat162 *) xr)[col2]);
+        }
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
-            const float2 tmpy = mmvf_load_y(y2, w2, norm_scale, j*stride_col_y2 + col2, col2, j);
+            float2 tmpy = mmvf_load_y(y2, w2, norm_scale, j*stride_col_y2 + col2, col2, j);
+            if constexpr (round_y) {
+                tmpy = __bfloat1622float2(__float22bfloat162_rn(tmpy));
+            }
             ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
             ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
         }
@@ -811,15 +822,15 @@ static __global__ void mul_mat_vec_f_pair_epi(
     }
 }
 
-template <int ncols_dst>
+template <typename T, int ncols_dst>
 static void mul_mat_vec_f_pair_epi_cuda(const int block_size, const dim3 & block_nums, const int nbytes_shared, cudaStream_t stream,
-        const float * wa, const float * wb, const int nrows_a, const int64_t stride_row_a, const int64_t stride_row_b,
+        const T * wa, const T * wb, const int nrows_a, const int64_t stride_row_a, const int64_t stride_row_b,
         const float * y, const float * norm_w, const float * norm_scale, const int ncols2, const int stride_col_y2,
         float * dst_a, float * dst_b, const int stride_col_dst_a, const int stride_col_dst_b,
         const ggml_cuda_mm_epilogue & epi_a, const ggml_cuda_mm_epilogue & epi_b) {
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, dim3(block_size, 1, 1), nbytes_shared, stream);
     const auto launch = [&](auto bs) {
-        ggml_cuda_kernel_launch(mul_mat_vec_f_pair_epi<ncols_dst, decltype(bs)::value>, lp,
+        ggml_cuda_kernel_launch(mul_mat_vec_f_pair_epi<T, ncols_dst, decltype(bs)::value>, lp,
             wa, wb, nrows_a, stride_row_a, stride_row_b, y, norm_w, norm_scale, ncols2, stride_col_y2,
             dst_a, dst_b, stride_col_dst_a, stride_col_dst_b, epi_a, epi_b);
     };
@@ -839,7 +850,7 @@ static void mul_mat_vec_f_pair_epi_cuda(const int block_size, const dim3 & block
 void ggml_cuda_mul_mat_vec_f_pair_epi(ggml_backend_cuda_context & ctx, const ggml_tensor * wa, const ggml_tensor * wb,
         const ggml_tensor * src1, const ggml_cuda_norm_fold * fold, float * dst_a, float * dst_b,
         const ggml_cuda_mm_epilogue & epi_a, const ggml_cuda_mm_epilogue & epi_b, const int ncols_dst) {
-    GGML_ASSERT(wa->type == GGML_TYPE_F32 && wb->type == GGML_TYPE_F32 && wa->ne[0] == wb->ne[0]);
+    GGML_ASSERT((wa->type == GGML_TYPE_F32 || wa->type == GGML_TYPE_BF16) && wb->type == wa->type && wa->ne[0] == wb->ne[0]);
     const int64_t ncols = wa->ne[0];
 
     // the block size launch_mul_mat_vec_f_cuda picks for this row length
@@ -867,17 +878,30 @@ void ggml_cuda_mul_mat_vec_f_pair_epi(ggml_backend_cuda_context & ctx, const ggm
     const int nrows_b = (int) wb->ne[1];
     const dim3 block_nums(nrows_a + nrows_b, 1, 1);
     const int nbytes_shared = ncols_dst*warp_size*sizeof(float);
-    const int64_t sra = wa->nb[1] / sizeof(float);
-    const int64_t srb = wb->nb[1] / sizeof(float);
+    const int64_t sra = wa->nb[1] / ggml_type_size(wa->type);
+    const int64_t srb = wb->nb[1] / ggml_type_size(wb->type);
 
-    switch (ncols_dst) {
-#define PAIR_CASE(n) case n: mul_mat_vec_f_pair_epi_cuda<n>((int) block_size_best, block_nums, nbytes_shared, ctx.stream(), \
-            (const float *) wa->data, (const float *) wb->data, nrows_a, sra, srb, y, nw, scale, (int) (ncols/2), stride_col_y2, \
-            dst_a, dst_b, nrows_a, nrows_b, epi_a, epi_b); break;
-        PAIR_CASE(1) PAIR_CASE(2) PAIR_CASE(3) PAIR_CASE(4) PAIR_CASE(5) PAIR_CASE(6) PAIR_CASE(7) PAIR_CASE(8)
+    auto run = [&](auto tag) {
+        using T = decltype(tag);
+        switch (ncols_dst) {
+#define PAIR_CASE(n) case n: mul_mat_vec_f_pair_epi_cuda<T, n>((int) block_size_best, block_nums, nbytes_shared, ctx.stream(), \
+                (const T *) wa->data, (const T *) wb->data, nrows_a, sra, srb, y, nw, scale, (int) (ncols/2), stride_col_y2, \
+                dst_a, dst_b, nrows_a, nrows_b, epi_a, epi_b); break;
+            PAIR_CASE(1) PAIR_CASE(2) PAIR_CASE(3) PAIR_CASE(4) PAIR_CASE(5) PAIR_CASE(6) PAIR_CASE(7) PAIR_CASE(8)
+            PAIR_CASE(12) PAIR_CASE(16) PAIR_CASE(24) PAIR_CASE(32)
 #undef PAIR_CASE
-        default: GGML_ABORT("fatal error");
+            default: GGML_ABORT("fatal error");
+        }
+    };
+    if (wa->type == GGML_TYPE_BF16) {
+        run(nv_bfloat16{});
+    } else {
+        run(float{});
     }
+}
+
+bool ggml_cuda_mul_mat_vec_f_pair_ncols_ok(const int ncols_dst) {
+    return (ncols_dst >= 1 && ncols_dst <= 8) || ncols_dst == 12 || ncols_dst == 16 || ncols_dst == 24 || ncols_dst == 32;
 }
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,

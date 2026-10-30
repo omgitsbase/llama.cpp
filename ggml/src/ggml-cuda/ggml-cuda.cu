@@ -6197,8 +6197,9 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
 }
 
 // two float matvecs over one activation, each with its elementwise tail, as one launch: the gating projections of a
-// delta-net layer (alpha with its bias, softplus and scale, beta with its sigmoid) are this at any token count. Each
-// row sums as mul_mat_vec_f sums it, so the values are the separate launches' bits.
+// delta-net layer (alpha with its bias, softplus and scale, beta with its sigmoid) are this at any token count. Up to
+// 8 columns each row sums as mul_mat_vec_f sums it, so the values are the separate launches' bits; past that the
+// activation is rounded to BF16 as the tensor-core kernel rounds it, and only the summation order differs.
 static constexpr uint64_t GGML_CUDA_FUSE_MMVF_PAIR = 1ull << 42;
 
 static bool ggml_cuda_mmvf_pair_member(const ggml_tensor * mm, const int cc) {
@@ -6207,12 +6208,15 @@ static bool ggml_cuda_mmvf_pair_member(const ggml_tensor * mm, const int cc) {
     }
     const ggml_tensor * w = mm->src[0];
     const ggml_tensor * y = mm->src[1];
-    return w->type == GGML_TYPE_F32 && y->type == GGML_TYPE_F32 && w->buffer != nullptr &&
+    // F32 weights where the matvec would run; also small BF16 weights up to a verify of several sequences (16 or
+    // 32 rows), where each would take a split GEMM and a sum of its own
+    const bool as_mmvf  = w->type == GGML_TYPE_F32 && ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, y->ne[1]) && mm->ne[1] <= 8;
+    const bool as_small = w->type == GGML_TYPE_BF16 && w->ne[1] <= 256 && ggml_cuda_mul_mat_vec_f_pair_ncols_ok((int) mm->ne[1]);
+    return (as_mmvf || as_small) && y->type == GGML_TYPE_F32 && w->buffer != nullptr &&
            ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-           ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, y->ne[1]) &&
            ggml_is_contiguous(mm) && ggml_is_contiguous(w) && y->nb[0] == sizeof(float) &&
            w->ne[2] == 1 && w->ne[3] == 1 && y->ne[2] == 1 && y->ne[3] == 1 &&
-           mm->ne[1] >= 1 && mm->ne[1] <= 8 && w->ne[0] % 2 == 0 && (y->nb[1] / sizeof(float)) % 2 == 0 &&
+           mm->ne[1] >= 1 && w->ne[0] % 2 == 0 && (y->nb[1] / sizeof(float)) % 2 == 0 &&
            ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD;
 }
 

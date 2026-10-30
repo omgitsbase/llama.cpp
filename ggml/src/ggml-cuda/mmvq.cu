@@ -396,6 +396,25 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             return false;
         }
     }
+    // NVIDIA from Ada on, weights streamed from DRAM (the 131072x5120 MUL_MAT perf cases): mul_mat_q's time stays
+    // flat over 5-8 columns while this kernel's grows with them, so past these counts mul_mat_q is the faster one
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ2_S:
+                return ne11 <= 5;
+            case GGML_TYPE_NVFP4:
+            case GGML_TYPE_IQ4_XS:
+                return ne11 <= 6;
+            case GGML_TYPE_Q4_0:
+                return ne11 <= 7;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
