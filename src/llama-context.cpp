@@ -690,6 +690,16 @@ void llama_context::sched_reserve() {
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
         sched_max_nodes = max_nodes;
         sched_pp        = cparams.pipeline_parallel;
+        // the kept graphs' inputs hold the scheduler they were built on: they are built again on this one
+        for (auto & r : gf_res_prev) {
+            if (r) {
+                r->reset();
+            }
+        }
+        if (gf_res_loop) {
+            gf_res_loop->reset();
+        }
+        gf_res_prev_active = nullptr;
     } else {
         ggml_backend_sched_reset(sched.get());
     }
@@ -1752,6 +1762,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const int64_t rt1 = rt.on ? ggml_time_us() : 0;
         ggml_backend_sched_wait_inputs(sched.get());
         if (rt.on) { rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}].wait_inputs += (ggml_time_us() - rt1) / 1000.0; }
+        // a reserve since the drafter's ids were armed may have made a new scheduler (a new sampler's graph)
+        tokens_dev.sched_dst = sched.get();
         res->set_inputs(&ubatch);
         if (rt.on) { rt.by_tokens[{(const void *) this, (int) ubatch.n_tokens}].inputs += (ggml_time_us() - rt1) / 1000.0; }
 

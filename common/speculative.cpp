@@ -256,8 +256,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
-                ggml_type_name(this->params.cache_type_k),
-                ggml_type_name(this->params.cache_type_v),
+                (this->params.cache_type_k == GGML_TYPE_COUNT ? "auto" : ggml_type_name(this->params.cache_type_k)),
+                (this->params.cache_type_v == GGML_TYPE_COUNT ? "auto" : ggml_type_name(this->params.cache_type_v)),
                 ctx_tgt ? "yes" : "no",
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
@@ -1789,8 +1789,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
-                ggml_type_name(this->params.cache_type_k),
-                ggml_type_name(this->params.cache_type_v),
+                (this->params.cache_type_k == GGML_TYPE_COUNT ? "auto" : ggml_type_name(this->params.cache_type_k)),
+                (this->params.cache_type_v == GGML_TYPE_COUNT ? "auto" : ggml_type_name(this->params.cache_type_v)),
                 ctx_tgt ? "yes" : "no",
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
@@ -1832,12 +1832,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        // several sequences chain only under LLAMA_MTP_CHAIN_SEQS=1 and a unified target KV: split_equal would reorder
-        // the rows the drafts read the target's hidden state from
+        // several sequences chain too: the server's batches hold each sequence's rows together in slot order, so a
+        // split leaves the rows the drafts read the target's hidden state from where they were (a wrong row would
+        // only lose acceptance, the verify keeps the output right). LLAMA_MTP_CHAIN_SEQS=0 drafts them on the host
         static const bool no_chain   = getenv("LLAMA_NO_MTP_CHAIN") != nullptr;
-        static const bool chain_seqs = getenv("LLAMA_MTP_CHAIN_SEQS") != nullptr && atoi(getenv("LLAMA_MTP_CHAIN_SEQS")) != 0;
+        static const bool chain_seqs = getenv("LLAMA_MTP_CHAIN_SEQS") == nullptr || atoi(getenv("LLAMA_MTP_CHAIN_SEQS")) != 0;
         const uint32_t n_round_rows = n_seq * (2*this->params.n_max + 1);
-        const bool seqs_ok = n_seq == 1 || (chain_seqs && llama_context_kv_unified(ctx_dft) && llama_context_kv_unified(ctx_tgt) &&
+        const bool seqs_ok = n_seq == 1 || (chain_seqs &&
                 n_round_rows <= llama_n_ubatch(ctx_dft) && n_round_rows <= llama_n_batch(ctx_dft));
         // over the target's cache every sequence's K rows go in one decode, sequence after sequence
         const uint32_t n_host_rows = n_seq * (uint32_t) this->params.n_max;
@@ -1993,6 +1994,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 prev[seq] = k;
             }
 
+            // as in process(): the drafter's cache ends where the target's batch begins
+            if (!is_mem_shared) {
+                for (llama_seq_id seq = 0; seq < (llama_seq_id) n_seq; ++seq) {
+                    if (i_batch_beg[seq] >= 0 && !is_deferred[seq] &&
+                            llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq) >= batch_in.pos[i_batch_beg[seq]]) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, batch_in.pos[i_batch_beg[seq]], -1);
+                    }
+                }
+            }
+
             const int32_t rc = llama_decode(ctx_dft, batch);
             if (rc != 0) {
                 SPC_ERR("llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
@@ -2137,14 +2148,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                // the drafter's cache ends where the target's batch begins: drafts of a round that ended with its
+                // request (or any row the target dropped) would otherwise sit at the positions this batch writes
+                // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
                     }
+                    const llama_pos p0 = batch_in.pos[i_batch_beg[seq_id]];
+                    if (chain_heads || llama_memory_seq_pos_max(mem_dft, seq_id) >= p0) {
+                        llama_memory_seq_rm(mem_dft, seq_id, p0, -1);
+                    }
+                }
+                if (chain_heads) {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
@@ -3418,9 +3434,12 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.n_outputs_max         = per_seq * (uint32_t) std::max(1, params.n_parallel);
         cparams.n_outputs_max_per_seq = per_seq;
         if (llama_model_has_mtp_chain(model_tgt)) {
-            // a chained round parks its unused replay rows in a second sequence
+            // a chained round parks its unused replay rows in a second sequence; over several slots each sequence
+            // keeps a stream of its own where the model's round reads one (the mask and the attention then cover
+            // its own cells, not every slot's). LLAMA_MTP_DRAFT_UNIFIED=1 keeps one stream for all
+            static const bool unified = getenv("LLAMA_MTP_DRAFT_UNIFIED") && atoi(getenv("LLAMA_MTP_DRAFT_UNIFIED")) != 0;
             cparams.n_seq_max  = std::max<uint32_t>(cparams.n_seq_max, 2);
-            cparams.kv_unified = true;
+            cparams.kv_unified = unified || params.n_parallel <= 1 || !llama_model_mtp_round_streams(model_tgt);
         }
     }
 

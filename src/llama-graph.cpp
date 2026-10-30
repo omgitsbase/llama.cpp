@@ -765,6 +765,15 @@ void llm_graph_input_mtp_sample::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(u,   uu.data(), 0, ggml_nbytes(u));
 }
 
+void llm_graph_input_mtp_rows::set_input(const llama_ubatch * ubatch) {
+    mctx->set_input_mtp_rows(k_idxs, v_idxs, hide, ubatch, n_replay);
+}
+
+bool llm_graph_input_mtp_rows::can_reuse(const llm_graph_params & params) {
+    mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    return k_idxs->ne[0] == params.ubatch.n_tokens && hide->ne[0] == n_replay*(int64_t) params.ubatch.n_seqs_unq;
+}
+
 void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
     const auto * st = state;
@@ -1282,8 +1291,13 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (device) {
         return;
     }
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    // a drafter's round over one stream per sequence writes through its own indices (llm_graph_input_mtp_rows)
+    if (self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -3758,14 +3772,17 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
         }
     }
 
-    // a drafter attending over another context's cache writes nothing
+    // a drafter attending over another context's cache writes nothing; over one stream per sequence the round's
+    // rows are numbered step after step (llm_graph_input_mtp_rows)
+    ggml_tensor * k_idxs = mtp_rows ? mtp_rows->k_idxs : attn.k_idxs;
+    ggml_tensor * v_idxs = mtp_rows ? mtp_rows->v_idxs : attn.v_idxs;
     if (k) {
-        ggml_tensor * k_idx = ggml_view_1d(ctx0, attn.k_idxs, n_rows, row*ggml_element_size(attn.k_idxs));
+        ggml_tensor * k_idx = ggml_view_1d(ctx0, k_idxs, n_rows, row*ggml_element_size(k_idxs));
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, k_idx, il));
     }
 
-    if (attn.v_idxs && v) {
-        ggml_tensor * v_idx = ggml_view_1d(ctx0, attn.v_idxs, n_rows, row*ggml_element_size(attn.v_idxs));
+    if (v_idxs && v) {
+        ggml_tensor * v_idx = ggml_view_1d(ctx0, v_idxs, n_rows, row*ggml_element_size(v_idxs));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v, v_idx, il));
     }
 
@@ -3881,8 +3898,26 @@ const llm_graph_mtp_attn & attn,
     ggml_tensor * off    = rinp->off;
     res->add_input(std::move(rinp));
 
+    // a cache of one stream per sequence: the batch holds each sequence's rows together and the K/V indices count
+    // from the stream's start (llm_graph_input_mtp_rows numbers them for the steps)
+    mtp_rows = nullptr;
+    if (!cparams.kv_unified && cparams.n_seq_max > 1) {
+        auto minp = std::make_unique<llm_graph_input_mtp_rows>(attn.mctx, V);
+        minp->k_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+        ggml_set_input(minp->k_idxs);
+        if (attn.v_idxs) {
+            minp->v_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+            ggml_set_input(minp->v_idxs);
+        }
+        minp->hide = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, V*n_seq);
+        ggml_set_input(minp->hide);
+        mtp_rows = minp.get();
+        res->add_input(std::move(minp));
+    }
+
     if (n_seq > 1) {
         build_mtp_round_seqs(mtp, attn, tok_embd, inp_tokens, inp_pos, n_chain, n_seq, c_ids, h_tgt, h_pend, off);
+        mtp_rows = nullptr;
         return;
     }
 
@@ -3968,7 +4003,8 @@ const llm_graph_mtp_attn & attn,
     ggml_tensor * thr   = ggml_scale_bias(ctx0, ggml_add(ctx0, n_acc, off), 1.0f, -0.5f);
     ggml_tensor * hide  = ggml_scale(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_arange(ctx0, 0.0f, (float) V, 1.0f), thr)), -30000.0f);
     ggml_tensor * extra = ggml_scale(ctx0, ggml_arange(ctx0, 0.0f, (float) n_kv, 1.0f), 0.0f);
-    extra = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, extra, 1, n_kv), ggml_reshape_2d(ctx0, hide, 1, V), ggml_view_1d(ctx0, k_idxs, V, 0));
+    extra = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, extra, 1, n_kv), ggml_reshape_2d(ctx0, hide, 1, V),
+            mtp_rows ? mtp_rows->hide : ggml_view_1d(ctx0, k_idxs, V, 0));
     extra = ggml_cast(ctx0, ggml_reshape_2d(ctx0, extra, n_kv, 1), GGML_TYPE_F16);
     cb(extra, "mtp_round_mask", -1);
     auto mask_chain = [&](int j) {
@@ -4015,6 +4051,7 @@ const llm_graph_mtp_attn & attn,
     ggml_build_forward_expand(gf, n_acc_i);
     ggml_build_forward_expand(gf, anchor_h);
     res->t_mtp_ids.push_back(n_acc_i);
+    mtp_rows = nullptr;
 }
 
 // the round over n_seq sequences: each one's replay rows in turn, then row n_seq*V + j*n_seq + s is chain step j
@@ -4046,15 +4083,33 @@ const llm_graph_mtp_attn & attn,
         return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n*n_pos);
     };
 
+    // over one stream per sequence the batch holds each sequence's tps rows together (the replay's, then the
+    // chain's); over one stream every sequence's replay rows come first
+    const bool    per_strm = mtp_rows != nullptr;
+    const int64_t tps      = per_strm ? n_tokens/S : V;
+
+    ggml_tensor * tok_replay = ggml_view_3d(ctx0, tok_embd, tok_embd->ne[0], V, S, tok_embd->nb[1], tps*tok_embd->nb[1], 0);
+    ggml_tensor * pos_replay = nullptr;
+    if (per_strm) {
+        tok_replay = ggml_cont(ctx0, tok_replay);
+        if (inp_pos) {
+            pos_replay = ggml_view_3d(ctx0, inp_pos, V, S, n_pos, tps*ps, n_tokens*ps, 0);
+            pos_replay = ggml_reshape_1d(ctx0, ggml_cont(ctx0, pos_replay), V*S*n_pos);
+        }
+    } else {
+        pos_replay = pos_rows(0, V*S);
+    }
+    tok_replay = ggml_reshape_2d(ctx0, tok_replay, tok_embd->ne[0], V*S);
+
     ggml_tensor * hp3 = ggml_reshape_3d(ctx0, h_pend, n_embd_h, 1, S);
     ggml_tensor * ht3 = ggml_view_3d(ctx0, h_tgt, n_embd_h, K, S, h_tgt->nb[1], V*h_tgt->nb[1], 0);
     ggml_tensor * h_replay = ggml_reshape_2d(ctx0, ggml_concat(ctx0, hp3, ht3, 1), n_embd_h, V*S);
     cb(h_replay, "mtp_replay_h", -1);
-    mtp.mtp_step(ggml_view_2d(ctx0, tok_embd, tok_embd->ne[0], V*S, tok_embd->nb[1], 0), h_replay, pos_rows(0, V*S), 0, true, nullptr);
+    mtp.mtp_step(tok_replay, h_replay, pos_replay, 0, true, nullptr);
 
     const size_t is = ggml_element_size(inp_tokens);
     ggml_tensor * c_f = ggml_cast(ctx0, ggml_view_2d(ctx0, c_ids,      K, S, V*ggml_element_size(c_ids), 0),  GGML_TYPE_F32);
-    ggml_tensor * x_f = ggml_cast(ctx0, ggml_view_2d(ctx0, inp_tokens, K, S, V*is,                       is), GGML_TYPE_F32);
+    ggml_tensor * x_f = ggml_cast(ctx0, ggml_view_2d(ctx0, inp_tokens, K, S, tps*is,                     is), GGML_TYPE_F32);
     ggml_tensor * eq  = ggml_scale_bias(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, c_f, x_f)), 0.0f, 1.0f), -1.0f, 1.0f);
     eq = ggml_cont(ctx0, ggml_transpose(ctx0, eq)); // [S, K]
     cb(eq, "mtp_round_eq", -1);
@@ -4083,7 +4138,7 @@ const llm_graph_mtp_attn & attn,
     // positions [S, K, n_pos]: the sequence's first replay position + n_acc + off, one further per draft
     ggml_tensor * pos_i = nullptr;
     if (inp_pos) {
-        ggml_tensor * base_f  = ggml_reshape_1d(ctx0, ggml_cast(ctx0, ggml_view_2d(ctx0, inp_pos, 1, S, V*ps, 0), GGML_TYPE_F32), S);
+        ggml_tensor * base_f  = ggml_reshape_1d(ctx0, ggml_cast(ctx0, ggml_view_2d(ctx0, inp_pos, 1, S, tps*ps, 0), GGML_TYPE_F32), S);
         ggml_tensor * start   = ggml_add(ctx0, ggml_add(ctx0, base_f, n_acc), off);
         ggml_tensor * steps   = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) K, 1.0f), 1, K), S, K, 1, 1);
         ggml_tensor * pos_f   = ggml_add(ctx0, steps, ggml_reshape_2d(ctx0, start, S, 1));
@@ -4105,17 +4160,28 @@ const llm_graph_mtp_attn & attn,
     ggml_tensor * kq_mask = attn.kq_mask;
     ggml_tensor * k_idxs  = attn.k_idxs;
     const int64_t n_kv    = kq_mask->ne[0];
-    GGML_ASSERT(kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 && "MTP round over several sequences: needs one KV stream");
+    GGML_ASSERT(kq_mask->ne[2] == 1 && (per_strm || kq_mask->ne[3] == 1) && "MTP round over several sequences: one KV stream, or one a sequence");
     ggml_tensor * thr   = ggml_reshape_2d(ctx0, ggml_scale_bias(ctx0, ggml_add(ctx0, n_acc, off), 1.0f, -0.5f), 1, S);
     ggml_tensor * ar    = ggml_repeat_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) V, 1.0f), V, S, 1, 1);
     ggml_tensor * hide  = ggml_scale(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ar, thr)), -30000.0f);
-    ggml_tensor * extra = ggml_reshape_3d(ctx0, ggml_scale(ctx0, ggml_arange(ctx0, 0.0f, (float) (n_kv*S), 1.0f), 0.0f), 1, n_kv, S);
-    const size_t kis = ggml_element_size(k_idxs);
-    extra = ggml_set_rows(ctx0, extra, ggml_reshape_3d(ctx0, hide, 1, V, S), ggml_view_2d(ctx0, k_idxs, V, S, V*kis, 0));
-    extra = ggml_cast(ctx0, ggml_reshape_2d(ctx0, extra, n_kv, S), GGML_TYPE_F16);
+    ggml_tensor * extra = nullptr;
+    if (per_strm) {
+        // a mask row a stream over the view's streams (an idle one between the batch's sequences keeps zeros)
+        const int64_t n_span = kq_mask->ne[3];
+        extra = ggml_reshape_2d(ctx0, ggml_scale(ctx0, ggml_arange(ctx0, 0.0f, (float) (n_kv*n_span), 1.0f), 0.0f), 1, n_kv*n_span);
+        extra = ggml_set_rows(ctx0, extra, ggml_reshape_2d(ctx0, hide, 1, V*S), mtp_rows->hide);
+        extra = ggml_cast(ctx0, ggml_reshape_4d(ctx0, extra, n_kv, 1, 1, n_span), GGML_TYPE_F16);
+    } else {
+        extra = ggml_reshape_3d(ctx0, ggml_scale(ctx0, ggml_arange(ctx0, 0.0f, (float) (n_kv*S), 1.0f), 0.0f), 1, n_kv, S);
+        const size_t kis = ggml_element_size(k_idxs);
+        extra = ggml_set_rows(ctx0, extra, ggml_reshape_3d(ctx0, hide, 1, V, S), ggml_view_2d(ctx0, k_idxs, V, S, V*kis, 0));
+        extra = ggml_cast(ctx0, ggml_reshape_2d(ctx0, extra, n_kv, S), GGML_TYPE_F16);
+    }
     cb(extra, "mtp_round_mask", -1);
     auto mask_chain = [&](int j) {
-        ggml_tensor * m = ggml_view_2d(ctx0, kq_mask, n_kv, S, kq_mask->nb[1], (size_t) (S*V + j*S)*kq_mask->nb[1]);
+        ggml_tensor * m = per_strm
+            ? ggml_view_4d(ctx0, kq_mask, n_kv, 1, 1, kq_mask->ne[3], kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], (size_t) (V + j)*kq_mask->nb[1])
+            : ggml_view_2d(ctx0, kq_mask, n_kv, S, kq_mask->nb[1], (size_t) (S*V + j*S)*kq_mask->nb[1]);
         return ggml_add(ctx0, m, extra);
     };
 
@@ -4501,7 +4567,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-        if (v_scale > 0.0f) {
+        if (v_scale > 0.0f && v_scale != 1.0f) {
             cur = ggml_scale(ctx0, cur, v_scale);
         }
     } else {
@@ -5564,7 +5630,7 @@ ggml_tensor * llm_graph_context::build_rs(
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    ggml_build_forward_expand(gf, states->type == GGML_TYPE_F32 ? ggml_scale_inplace(ctx0, state_zero, 0) : ggml_fill_inplace(ctx0, state_zero, 0.0f));
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs

@@ -133,6 +133,39 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+// 16-bit rows into f32, eight values a thread: one 16-byte read (a table in mapped host memory is read over the bus,
+// where a request a value is latency bound)
+template<typename src0_t>
+static __global__ void k_get_rows_h16_f32_vec(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, float * dst_ptr,
+        const int64_t ne00v,
+        const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
+
+        float4     * GGML_CUDA_RESTRICT dst_row  = (float4 *)    (dst_ptr + i10*s1 + i11*s2 + i12*s3);
+        const int4 * GGML_CUDA_RESTRICT src0_row = (const int4 *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+
+        for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00v; i += gridDim.y*blockDim.x) {
+            const int4 v = src0_row[i];
+            const src0_t * h = (const src0_t *) &v;
+            dst_row[2*i + 0] = make_float4(ggml_cuda_cast<float>(h[0]), ggml_cuda_cast<float>(h[1]), ggml_cuda_cast<float>(h[2]), ggml_cuda_cast<float>(h[3]));
+            dst_row[2*i + 1] = make_float4(ggml_cuda_cast<float>(h[4]), ggml_cuda_cast<float>(h[5]), ggml_cuda_cast<float>(h[6]), ggml_cuda_cast<float>(h[7]));
+        }
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -275,6 +308,26 @@ static void get_rows_cuda_float(
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
                 (const dst_t *) src0_d, src1_d, dst_d,
+                ne00v, ne11, ne12_fdv,
+                s1, s2, s3,
+                nb01, nb02, nb03,
+                s10, s11, s12);
+            return;
+        }
+    }
+
+    if constexpr ((std::is_same<src0_t, nv_bfloat16>::value || std::is_same<src0_t, half>::value) && std::is_same<dst_t, float>::value) {
+        const bool can_vec = ne00 % 8 == 0 &&
+            (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
+            (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
+            (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
+        if (can_vec) {
+            const int64_t ne00v = ne00 / 8;
+            const int block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+            const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_h16_f32_vec<src0_t>, launch_params,
+                src0_d, src1_d, dst_d,
                 ne00v, ne11, ne12_fdv,
                 s1, s2, s3,
                 nb01, nb02, nb03,

@@ -1558,7 +1558,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
     // an FP8 cache holds k/scale_k, the attention multiplies its scores by scale_k back
-    if (k->type == GGML_TYPE_F8_E4M3 && layers[ikv].scale_k > 0.0f) {
+    if (k->type == GGML_TYPE_F8_E4M3 && layers[ikv].scale_k > 0.0f && layers[ikv].scale_k != 1.0f) {
         k_cur = ggml_scale(ctx, k_cur, 1.0f/layers[ikv].scale_k);
     }
 
@@ -1601,7 +1601,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
 
         // an FP8 cache holds v/scale_v, the attention multiplies its output by scale_v back
-        if (v->type == GGML_TYPE_F8_E4M3 && layers[ikv].scale_v > 0.0f) {
+        if (v->type == GGML_TYPE_F8_E4M3 && layers[ikv].scale_v > 0.0f && layers[ikv].scale_v != 1.0f) {
             v_cur = ggml_scale(ctx, v_cur, 1.0f/layers[ikv].scale_v);
         }
 
@@ -1722,6 +1722,44 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     }
 }
 
+void llama_kv_cache::set_input_mtp_rows(ggml_tensor * k_dst, ggml_tensor * v_dst, ggml_tensor * hide_dst, const llama_ubatch * ubatch,
+        const slot_info & sinfo, uint32_t n_kv, int64_t n_hide) const {
+    const uint32_t n_seqs = sinfo.n_stream();
+    const int64_t  tps    = sinfo.size();
+    GGML_ASSERT((int64_t) ubatch->n_tokens == tps*n_seqs && n_hide <= tps);
+    GGML_ASSERT(!v_trans);
+
+    // the batch holds each sequence's rows together; the round's steps take the first n_hide rows of every
+    // sequence, then row n_hide + j of every sequence for step j
+    const auto cell = [&](uint32_t s, int64_t r) { return (int64_t) sinfo.strm[s]*get_size() + sinfo.idxs[s][r]; };
+    for (ggml_tensor * dst : { k_dst, v_dst }) {
+        if (!dst) {
+            continue;
+        }
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        int64_t * data = (int64_t *) dst->data;
+        int64_t o = 0;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            for (int64_t r = 0; r < n_hide; ++r) {
+                data[o++] = cell(s, r);
+            }
+        }
+        for (int64_t r = n_hide; r < tps; ++r) {
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                data[o++] = cell(s, r);
+            }
+        }
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(hide_dst->buffer));
+    int64_t * data = (int64_t *) hide_dst->data;
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        for (int64_t r = 0; r < n_hide; ++r) {
+            data[s*n_hide + r] = (int64_t) (sinfo.strm[s] - sinfo.s0)*n_kv + sinfo.idxs[s][r];
+        }
+    }
+}
+
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
@@ -1837,8 +1875,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const uint64_t idst = n_kv*i;
 
             // a stream one sequence filled in order: the kept cells are the span [lo, p1] (cell == position), and
-            // the row is two fills. LLAMA_MASK_CHECK=1 checks every cell of such a row against the cells
-            if (causal && !alibi && !is_2d && cells.is_ordered() && cells.get_seq_only() == seq_id) {
+            // the row is two fills. M-RoPE's 2D rule only splits cells of one position, and an ordered stream has one
+            // a position. LLAMA_MASK_CHECK=1 checks every cell of such a row against the cells
+            if (causal && !alibi && cells.is_ordered() && cells.get_seq_only() == seq_id) {
                 int64_t lo = 0;
                 if (swa) {
                     switch (swa_type) {
@@ -3310,6 +3349,10 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_mtp_rows(ggml_tensor * k_dst, ggml_tensor * v_dst, ggml_tensor * hide_dst, const llama_ubatch * ubatch, int64_t n_hide) const {
+    kv->set_input_mtp_rows(k_dst, v_dst, hide_dst, ubatch, sinfos[i_cur], n_kv, n_hide);
 }
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

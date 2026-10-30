@@ -241,6 +241,10 @@ LLAMA_API bool llama_decode_loop_on_device(const struct llama_context * ctx);
 // Whether the model's DECODER_MTP graph supports chained drafting.
 LLAMA_API bool llama_model_has_mtp_chain(const struct llama_model * model);
 
+// Whether its chained round runs over a drafter cache of one stream per sequence (else the drafter's cache is one
+// stream for every sequence).
+LLAMA_API bool llama_model_mtp_round_streams(const struct llama_model * model);
+
 // LLAMA_ROUND_TIMING=2: timeline marks over a round; the server flushes them (print: to stderr)
 LLAMA_API void llama_round_mark(const char * what, int32_t tag);
 LLAMA_API void llama_round_marks_flush(bool print);

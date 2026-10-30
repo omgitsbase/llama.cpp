@@ -44,24 +44,22 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
 static __global__ void cpy_run_4b(const ggml_cuda_cpy_run run) {
     ggml_cuda_pdl_lc();
     const ggml_cuda_cpy_run_item & it = run.item[blockIdx.y];
-    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= it.ne) {
         return;
     }
 
-    const int64_t i03 = i/(it.ne0[0]*it.ne0[1]*it.ne0[2]);
-    const int64_t i02 = (i - i03*it.ne0[0]*it.ne0[1]*it.ne0[2]) / (it.ne0[0]*it.ne0[1]);
-    const int64_t i01 = (i - i03*it.ne0[0]*it.ne0[1]*it.ne0[2] - i02*it.ne0[1]*it.ne0[0]) / it.ne0[0];
-    const int64_t i00 = i - i03*it.ne0[0]*it.ne0[1]*it.ne0[2] - i02*it.ne0[1]*it.ne0[0] - i01*it.ne0[0];
+    // a flat index through a shape: 32-bit divisions by multiplies (64-bit ones were most of the time)
+    const auto at = [i](const uint3 * fd, const int64_t * nb) {
+        const uint2 q3 = fast_div_modulo(i,    fd[2]);
+        const uint2 q2 = fast_div_modulo(q3.y, fd[1]);
+        const uint2 q1 = fast_div_modulo(q2.y, fd[0]);
+        return q1.y*nb[0] + q1.x*nb[1] + q2.x*nb[2] + q3.x*nb[3];
+    };
 
-    const int64_t i13 = i/(it.ne1[0]*it.ne1[1]*it.ne1[2]);
-    const int64_t i12 = (i - i13*it.ne1[0]*it.ne1[1]*it.ne1[2]) / (it.ne1[0]*it.ne1[1]);
-    const int64_t i11 = (i - i13*it.ne1[0]*it.ne1[1]*it.ne1[2] - i12*it.ne1[0]*it.ne1[1]) / it.ne1[0];
-    const int64_t i10 = i - i13*it.ne1[0]*it.ne1[1]*it.ne1[2] - i12*it.ne1[0]*it.ne1[1] - i11*it.ne1[0];
-
-    const char * x = it.src + i00*it.nb0[0] + i01*it.nb0[1] + i02*it.nb0[2] + i03*it.nb0[3];
-    char       * d = it.dst + i10*it.nb1[0] + i11*it.nb1[1] + i12*it.nb1[2] + i13*it.nb1[3];
+    const char * x = it.src + at(it.fd0, it.nb0);
+    char       * d = it.dst + (it.dst_contig ? (int64_t) i*4 : at(it.fd1, it.nb1));
 
     ggml_cuda_pdl_sync();
     *(uint32_t *) d = *(const uint32_t *) x;
@@ -77,6 +75,31 @@ void ggml_cuda_cpy_run_4b(const ggml_cuda_cpy_run & run, cudaStream_t stream) {
     GGML_ASSERT(num_blocks <= INT_MAX);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3((unsigned) num_blocks, (unsigned) run.n, 1), CUDA_CPY_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(cpy_run_4b, launch_params, run);
+}
+
+static __global__ void cpy_windows_4b(const ggml_cuda_cpy_windows w) {
+    ggml_cuda_pdl_lc();
+    const uint32_t r = blockDim.x*blockIdx.x + threadIdx.x;
+    if (r >= w.n_rows) {
+        return;
+    }
+    const uint2 q = fast_div_modulo(r, w.fd_ne1);
+    const uint32_t * src = (const uint32_t *) (w.base + q.y*w.nb1 + q.x*w.nb2);
+
+    ggml_cuda_pdl_sync();
+    for (int k = 0; k < w.n; ++k) {
+        uint32_t * dst = (uint32_t *) w.dst[k] + (int64_t) r*w.ne0;
+        for (int e = 0; e < w.ne0; ++e) {
+            dst[e] = src[w.off[k] + e];
+        }
+    }
+}
+
+void ggml_cuda_cpy_windows_4b(const ggml_cuda_cpy_windows & w, cudaStream_t stream) {
+    GGML_ASSERT(w.n >= 1 && w.n <= GGML_CUDA_CPY_RUN_MAX);
+    const uint32_t num_blocks = (w.n_rows + 127) / 128;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(num_blocks, 1, 1), 128, 0, stream);
+    ggml_cuda_kernel_launch(cpy_windows_4b, launch_params, w);
 }
 
 template <typename T>

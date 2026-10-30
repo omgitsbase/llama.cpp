@@ -4086,7 +4086,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_k)
+            params.speculative.draft.cache_type_k == GGML_TYPE_COUNT ? "auto" : ggml_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
@@ -4099,7 +4099,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_v)
+            params.speculative.draft.cache_type_v == GGML_TYPE_COUNT ? "auto" : ggml_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);

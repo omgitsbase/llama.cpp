@@ -1146,6 +1146,8 @@ private:
 
     // prompt chunks padded to a few lengths, see update_slots; off with LLAMA_PROMPT_NO_PAD
     bool        prompt_pad_on    = false;
+    // a round padded with idle slots' rows, see update_slots; off with LLAMA_NO_SLOT_PAD
+    bool        slot_pad_on      = false;
     // a verify's rows and the step's prompt chunks in one forward (llama_set_next_decode_grouped), as vLLM puts its
     // decodes and prefills in one batch; LLAMA_NO_GROUPED=1 gives each prompt a decode of its own
     bool        grouped_on       = false;
@@ -1549,6 +1551,21 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+        }
+
+        // Pad rows leave the target's cache right after their decode. A recurrent state cannot drop them (beyond its
+        // few rollback snapshots), and a drafter with a cache of its own keeps them and starts its next draft from a
+        // pad row: padding is then off.
+        {
+            const bool dft_own_mem = ctx_dft != nullptr && llama_get_ctx_other(ctx_dft) != ctx_tgt;
+            const int  n_ghost_rows = std::max(1, params_base.speculative.draft.n_max) + 1;
+            if (prompt_pad_on && (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART || dft_own_mem)) {
+                prompt_pad_on = false;
+                SRV_INF("%s", "prompt chunks are not padded: the target's memory or the drafter's cache cannot drop pad rows\n");
+            }
+            slot_pad_on = !dft_own_mem && !getenv("LLAMA_NO_SLOT_PAD") &&
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                 (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_ghost_rows <= (int) llama_n_rs_seq(ctx_tgt)));
         }
 
         if (spec) {
@@ -3772,7 +3789,7 @@ private:
         // the decode), so the draft and verify graphs keep their shape while requests end and start instead of
         // being rebuilt. LLAMA_NO_SLOT_PAD=1 turns this off.
         ghosts.clear();
-        if (spec && generating.size() > 1 && !getenv("LLAMA_NO_SLOT_PAD")) {
+        if (slot_pad_on && spec && generating.size() > 1) {
             const int n_gen    = (int) generating.size();
             const int n_bucket = std::min<int>((n_gen + 7) & ~7, (int) slots.size());
             int n_ghost = n_bucket - n_gen;

@@ -11650,9 +11650,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // an FP8 (E4M3) cache in Gemma 4's head shapes, which the MMA kernel reads directly through its stages
+    // an FP8 (E4M3) cache in Gemma 4's and Qwen 3.5's head shapes, which the MMA kernel reads directly through its stages
     for (int hs : { 256, 512 }) {
-        for (int nr2 : { 2, 4 }) {
+        for (int nr2 : { 2, 4, 8 }) {
+            if (nr2 == 8 && hs != 256) {
+                continue;
+            }
             for (int kv : { 256, 1024 }) {
                 for (int nb : { 1, 2, 4, 8, 16, 32, 64 }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));

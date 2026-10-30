@@ -491,10 +491,12 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_reads_q8_0(const i
 }
 
 // An FP8 (E4M3) cache, as vLLM stores a model with an FP8 cache scheme, read as it is in every tile of Gemma 4's heads
-// (256 and 512, 2 or 4 query heads a K/V head): a round, a draft or a prompt group reading its streams from an input
-// takes any of them, and an f16 copy holds one stream only; other heads convert the cache to f16 first
+// (256 and 512, 2 or 4 query heads a K/V head) and Qwen 3.5's (256, 8 a K/V head): a round, a draft or a prompt group
+// reading its streams from an input takes any of them, and an f16 copy holds one stream only; other heads convert the
+// cache to f16 first, the whole view on every call
 static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_reads_f8(const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    return DKQ == DV && (DKQ == 256 || DKQ == 512) && (ncols2 == 2 || ncols2 == 4) && ncols1*ncols2 <= 64;
+    return DKQ == DV && (DKQ == 256 || DKQ == 512) && (ncols2 == 2 || ncols2 == 4 || (ncols2 == 8 && DKQ == 256)) &&
+        ncols1*ncols2 <= 64;
 }
 
 // Fills the same tile as flash_attn_ext_f16_load_tile from q8_0 rows: k0 and D2 are in half2 of the row, stride_KV in

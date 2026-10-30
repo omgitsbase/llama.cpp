@@ -60,6 +60,8 @@ void ggml_cuda_fp4_gemm_graph_begin(ggml_backend_cuda_context & ctx);
 // FP8 E4M3 weights (GGML_TYPE_F8_E4M3): whether dst = src0 x src1 runs here, and the product with each weight row's
 // scale s_row (src0->ne[1] floats on the device, or nullptr) and a tensor scale s_t (one float, or nullptr)
 bool ggml_cuda_fp8_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+// also a contiguous activation of several dimensions, taken as one matrix of its rows
+bool ggml_cuda_fp8_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 bool ggml_cuda_fp8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const float * s_row, const float * s_t);
 // an FP8 gate and up pair over one activation whose only reader is a GEGLU: gelu(gate)*up into glu, each weight's

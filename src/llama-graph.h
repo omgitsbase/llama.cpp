@@ -363,6 +363,26 @@ public:
     const int64_t n_seq;
 };
 
+// a round over a cache of one stream per sequence: the batch holds each sequence's rows together, a step takes the
+// replay's rows (or one chain row) of every sequence. The K/V cells in step order, and the replay rows' places in a
+// mask over the view's streams
+class llm_graph_input_mtp_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_rows(const llama_kv_cache_context * mctx, int64_t n_replay) : mctx(mctx), n_replay(n_replay) {}
+    virtual ~llm_graph_input_mtp_rows() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * k_idxs = nullptr; // I64 [n_tokens]
+    ggml_tensor * v_idxs = nullptr; // I64 [n_tokens], null where the cache holds no separate V
+    ggml_tensor * hide   = nullptr; // I64 [n_replay*n_seq]
+
+    const llama_kv_cache_context * mctx;
+    const int64_t n_replay;
+};
+
 // a round that samples its drafts: every sequence's temperature and top-p from the target's sampler, a uniform a step
 class llm_graph_input_mtp_sample : public llm_graph_input_i {
 public:
@@ -1547,6 +1567,7 @@ struct llm_graph_context {
     mutable const llama_memory_context_i * strm_gmctx = nullptr;
     mutable llm_graph_input_strm * inp_strm_g[16] = {};
     mutable ggml_tensor * fa_kv_strm = nullptr; // the next flash attention's K/V stream input (src[5])
+    mutable llm_graph_input_mtp_rows * mtp_rows = nullptr; // a round over one stream per sequence: its K/V cells
     llm_graph_input_strm * build_inp_strm(int64_t n_seqs, int64_t n_span) const;
 
     // a draft model's reduced head: logits for every token, -inf for those it leaves out

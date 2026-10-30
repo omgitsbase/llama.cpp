@@ -1586,9 +1586,10 @@ struct ggml_cuda_norm_fold {
 
 // a single-row gather of a recurrent state cache, read in place by its only reader
 struct ggml_cuda_state_fold {
-    const float *   base = nullptr; // the cache
+    const void *    base = nullptr; // the cache
+    ggml_type       type = GGML_TYPE_F32; // its storage: F32, or BF16 for a gated delta net's state
     const int32_t * ids  = nullptr; // the row, one per sequence
-    int64_t         row  = 0;       // floats between rows
+    int64_t         row  = 0;       // elements between rows
     bool            pre  = false;   // no earlier node of the graph writes the cache, so the row may be read before the wait
 };
 

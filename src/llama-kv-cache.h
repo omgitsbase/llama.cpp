@@ -166,6 +166,7 @@ public:
     // with several streams, let a ubatch skip idle sequences; the model's attention must read the cache through
     // build_attn_mha and build_attn_inp_kq_mask, which cover the streams from its first sequence to its last
     void set_split_gaps(bool v) { split_gaps = v; }
+    bool get_split_gaps() const { return split_gaps; }
 
     bool get_has_shift() const;
 
@@ -241,6 +242,11 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
+    // a drafter's round over several streams (llm_graph_input_mtp_rows): the K/V cells step after step, and where
+    // each sequence's first n_hide rows sit in a mask over the view's n_kv cells per stream
+    void set_input_mtp_rows(ggml_tensor * k_dst, ggml_tensor * v_dst, ggml_tensor * hide_dst, const llama_ubatch * ubatch,
+            const slot_info & sinfo, uint32_t n_kv, int64_t n_hide) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -466,6 +472,7 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_mtp_rows(ggml_tensor * k_dst, ggml_tensor * v_dst, ggml_tensor * hide_dst, const llama_ubatch * ubatch, int64_t n_hide) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool strict = false) const;

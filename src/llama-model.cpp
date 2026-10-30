@@ -2576,6 +2576,31 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// The recurrent state's storage: BF16, as vLLM keeps it (half the bytes a step reads and writes), where the recurrent
+// ops take the state through a row gather that converts it (gated delta nets, lightning attention, RWKV); Mamba's scan
+// reads the cache in place and keeps F32. LLAMA_RS_F32=1 keeps F32 for every model
+static ggml_type llama_rs_state_type(llm_arch arch) {
+    static const bool f32 = getenv("LLAMA_RS_F32") != nullptr && atoi(getenv("LLAMA_RS_F32")) != 0;
+    switch (arch) {
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5_NEXT:
+        case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_MINIMAX_01:
+        case LLM_ARCH_RWKV6:
+        case LLM_ARCH_RWKV6QWEN2:
+        case LLM_ARCH_RWKV7:
+        case LLM_ARCH_ARWKV7:
+            return f32 ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+        default:
+            return GGML_TYPE_F32;
+    }
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2708,7 +2733,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* attn_n_swa        */ hparams.n_swa,
                     /* attn_swa_type     */ hparams.swa_type,
                     /* recurrent_type_r  */ GGML_TYPE_F32,
-                    /* recurrent_type_s  */ GGML_TYPE_F32,
+                    /* recurrent_type_s  */ llama_rs_state_type(arch),
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
@@ -2897,7 +2922,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,
-                            GGML_TYPE_F32,
+                            llama_rs_state_type(arch),
                             cparams.offload_kqv,
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
@@ -2959,7 +2984,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ llama_rs_state_type(arch),
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -2979,7 +3004,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ llama_rs_state_type(arch),
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -2989,7 +3014,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
                     } else {
-                        res = new llama_memory_hybrid(
+                        auto * hyb = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
@@ -2999,7 +3024,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ llama_rs_state_type(arch),
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3007,6 +3032,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+                        // as for a plain cache: a ubatch may skip idle slots, or the sequences of a step over slots
+                        // that are not consecutive go one ubatch each (the recurrent states take any slots)
+                        const char * gaps_env = getenv("LLAMA_KV_STREAM_GAPS");
+                        hyb->get_mem_attn()->set_split_gaps((gaps_env == nullptr || atoi(gaps_env) != 0) && !cparams.kv_unified &&
+                                arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_DFLASH && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
+                        res = hyb;
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -3018,7 +3049,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     const char * gaps_env = getenv("LLAMA_KV_STREAM_GAPS");
                     const bool gaps_ok = (gaps_env == nullptr || atoi(gaps_env) != 0) && !cparams.kv_unified &&
                             arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_DFLASH;
-                    const bool split_gaps = gaps_ok && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+                    // and a drafter's round over one stream per sequence (llama_model_mtp_round_streams)
+                    const bool split_gaps = gaps_ok && (params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ||
+                            (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_model_mtp_round_streams(this)));
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
@@ -3228,6 +3261,12 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
 
 bool llama_model_has_mtp_chain(const llama_model * model) {
     return model->has_mtp_round();
+}
+
+bool llama_model_mtp_round_streams(const llama_model * model) {
+    // drafters whose MTP block keeps a plain cache of its own
+    const llm_arch a = model->arch;
+    return model->has_mtp_round() && (a == LLM_ARCH_QWEN35 || a == LLM_ARCH_QWEN35MOE || a == LLM_ARCH_QWEN3NEXT);
 }
 
 bool llama_model_has_mtp_head(const llama_model * model) {

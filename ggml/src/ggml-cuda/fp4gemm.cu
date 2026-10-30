@@ -1226,7 +1226,9 @@ struct small_gemm_device {
 
 static small_gemm_device small_gemm_devices[GGML_CUDA_MAX_DEVICES];
 static constexpr size_t  small_gemm_ws_size   = 4ull << 20;
-static constexpr int64_t small_gemm_max_elems = 4ll << 20; // 16 MB of F32 a weight at most
+// under 4 MB of F32: past that the copy costs more memory than the quantized kernels' fixed overheads are worth (an MoE
+// shared expert of 2048x512 ran slower through it and held 480 MB of copies)
+static constexpr int64_t small_gemm_max_elems = (1ll << 20) - 1;
 
 bool ggml_cuda_small_gemm_applies(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     static const bool off = getenv("GGML_CUDA_SMALL_GEMM") && atoi(getenv("GGML_CUDA_SMALL_GEMM")) == 0;
@@ -1773,6 +1775,14 @@ static fp8_plan * fp8_get_plan(fp4_device & fd, const int device, const int64_t 
 // the quantized activations (E4M3 values, per-token scales) and the GEMM's workspace, per context. Two slots: slot 0
 // for the activations a GEMM quantizes itself, slot 1 for a producer's (ggml_cuda_fp8_act_claim), which may still read
 // slot 0's scales as it writes (the norm pair after the o projection applies that product's per-token scales)
+// the fewest activation rows an FP8 product takes the tensor-core GEMM for (activations quantized to E4M3 by token):
+// from a verify's rows on, where the matvec re-reads every activation row for every weight row and reaches a third of
+// the bandwidth; one row keeps the matvec. GGML_CUDA_FP8_GEMM_MIN overrides
+static int fp8_gemm_min_rows() {
+    static const int n = getenv("GGML_CUDA_FP8_GEMM_MIN") ? std::max(1, atoi(getenv("GGML_CUDA_FP8_GEMM_MIN"))) : 2;
+    return n;
+}
+
 struct fp8_ctx {
     uint8_t * buf      = nullptr;
     size_t    buf_size = 0;
@@ -1824,7 +1834,7 @@ static void fp8_ctx_slot(const fp8_ctx & fc, const int i, const int64_t m, const
 static bool fp8_act_claim_locked(ggml_backend_cuda_context & ctx, const ggml_tensor * act, uint8_t ** q, float ** s, const bool may_grow) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     static const bool gemm_off = getenv("GGML_CUDA_FP8_GEMM") && atoi(getenv("GGML_CUDA_FP8_GEMM")) == 0;
-    if (gemm_off || act->ne[1] <= 8 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE ||
+    if (gemm_off || act->ne[1] < fp8_gemm_min_rows() || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE ||
             act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || act->ne[0] % 16 != 0 || act->ne[2] != 1 || act->ne[3] != 1) {
         return false;
     }
@@ -2054,7 +2064,7 @@ static bool fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, 
 bool ggml_cuda_fp8_gemm_geglu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * src1,
         ggml_tensor * glu, const float * sg_row, const float * su_row, const float * sg_t, const float * su_t, const bool down_fp8) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE || src1->ne[1] <= 8 ||
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE || src1->ne[1] < fp8_gemm_min_rows() ||
             !ggml_cuda_fp8_supported(gate, src1, glu) || !ggml_cuda_fp8_supported(up, src1, glu) ||
             gate->ne[1] != up->ne[1] || gate->ne[0] != up->ne[0] || glu->ne[0] != gate->ne[1] || glu->ne[1] != src1->ne[1]) {
         return false;
@@ -2113,8 +2123,44 @@ bool ggml_cuda_fp8_gemm_geglu(ggml_backend_cuda_context & ctx, const ggml_tensor
     return true;
 }
 
+// an activation of several dimensions laid out row after row (a recurrent layer's tokens by sequence), with a product
+// laid out the same way: one matrix of all its rows
+static bool fp8_rows_flat(const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src1->ne[2]*src1->ne[3] > 1 && src1->nb[2] == src1->nb[1]*src1->ne[1] && src1->nb[3] == src1->nb[2]*src1->ne[2] &&
+        ggml_is_contiguous(dst) && ggml_nrows(dst) == ggml_nrows(src1);
+}
+
+static ggml_tensor fp8_as_2d(const ggml_tensor * t) {
+    ggml_tensor v = *t;
+    v.ne[1] = ggml_nrows(t);
+    v.ne[2] = v.ne[3] = 1;
+    v.nb[2] = v.nb[3] = v.nb[1]*v.ne[1];
+    return v;
+}
+
+bool ggml_cuda_fp8_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (ggml_cuda_fp8_supported(src0, src1, dst)) {
+        return true;
+    }
+    if (!fp8_rows_flat(src1, dst)) {
+        return false;
+    }
+    const ggml_tensor s2 = fp8_as_2d(src1);
+    const ggml_tensor d2 = fp8_as_2d(dst);
+    return ggml_cuda_fp8_supported(src0, &s2, &d2);
+}
+
 bool ggml_cuda_fp8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const float * s_row, const float * s_t) {
+    if (!ggml_cuda_fp8_supported(src0, src1, dst) && fp8_rows_flat(src1, dst)) {
+        ggml_tensor s2 = fp8_as_2d(src1);
+        ggml_tensor d2 = fp8_as_2d(dst);
+        const bool ok = ggml_cuda_fp8_mul_mat(ctx, src0, &s2, &d2, s_row, s_t);
+        // the GEMM keys its quantized activations by tensor: these views live on the stack, so no later call may match
+        std::lock_guard<std::mutex> lock(fp4_mtx);
+        fp8_ctxs[&ctx].act_t = nullptr;
+        return ok;
+    }
     if (!ggml_cuda_fp8_supported(src0, src1, dst)) {
         return false;
     }
@@ -2122,7 +2168,7 @@ bool ggml_cuda_fp8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     // FP8 tensor cores from Ada; GGML_CUDA_FP8_GEMM=0 keeps every product on the matvec
     static const bool gemm_off = getenv("GGML_CUDA_FP8_GEMM") && atoi(getenv("GGML_CUDA_FP8_GEMM")) == 0;
-    if (ncols > 8 && !gemm_off && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE &&
+    if (ncols >= fp8_gemm_min_rows() && !gemm_off && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE &&
             fp8_gemm(ctx, src0, src1, dst, s_row, s_t)) {
         return true;
     }
@@ -2136,7 +2182,7 @@ bool ggml_cuda_fp8_mul_mat_raw(ggml_backend_cuda_context & ctx, const ggml_tenso
         const float ** s_tok) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     static const bool gemm_off = getenv("GGML_CUDA_FP8_GEMM") && atoi(getenv("GGML_CUDA_FP8_GEMM")) == 0;
-    if (gemm_off || src1->ne[1] <= 8 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE ||
+    if (gemm_off || src1->ne[1] < fp8_gemm_min_rows() || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE ||
             src0->type != GGML_TYPE_F8_E4M3 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) ||
             src1->nb[0] != sizeof(float) || src1->nb[1] % (4*sizeof(float)) != 0 || src0->ne[0] % 16 != 0) {
         return false;
