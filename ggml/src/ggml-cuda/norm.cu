@@ -74,7 +74,10 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
+// the bounds cap the registers so a 1024-thread block fits on every card: without them Turing's build took 71 a thread
+// and could not launch
 template <int block_size, bool do_multiply = false, bool do_add = false>
+__launch_bounds__(block_size, 1)
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
