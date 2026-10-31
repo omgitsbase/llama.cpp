@@ -197,9 +197,10 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
             } else {
                 const llm_graph_mtp_attn attn = llm_graph_mtp_attn_of(inp_attn, is_swa);
                 ggml_tensor * mask_in = nullptr;
-                if (n_round_seq > 1) {
+                if (n_round_seq > 1 || dev_anc) {
                     // a row per sequence, each at its anchor's position: every sequence's first row of the mask, made
-                    // contiguous for flash attention once per round and mask
+                    // contiguous for flash attention once per round and mask (one sequence's too when the device
+                    // picks its anchor: the row is the counted outcome's)
                     ggml_tensor *& mr = round_mask[is_swa ? 1 : 0];
                     if (!mr && dev_anc) {
                         // each sequence's mask row of the outcome the device counted: a stream per sequence, or one
@@ -326,7 +327,6 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         if (dev_anc) {
             // the anchor of the outcome the target's samples give, its hidden row and position (vLLM's padded drafter
             // batch, its token_indices_to_sample worked out on the device)
-            GGML_ASSERT(S > 1 && "device anchors: a round over several sequences");
             anc = build_mtp_dev_anchors(inp_tokens, K, n_embd_backbone, tgt_table);
             tok = ggml_get_rows(ctx0, tgt_table, anc.id);
             h   = anc.h;
@@ -354,7 +354,8 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         ggml_tensor * smp_par = nullptr;
         ggml_tensor * smp_u   = nullptr;
         std::vector<ggml_tensor *> q_steps;
-        if (dev_anc && !spec_off) {
+        // one sequence's sparse head takes its argmax and reads no sampling inputs
+        if (dev_anc && !spec_off && !(sparse && S == 1)) {
             auto sinp = std::make_unique<llm_graph_input_mtp_sample>(mtp_round, K, (int) n_rows_seq);
             sinp->par = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2, S);
             sinp->u   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, S, K);
@@ -365,7 +366,7 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
             res->add_input(std::move(sinp));
         }
         for (int j = 0; j < K; ++j) {
-            ggml_tensor * pos_j  = S == 1 ? ggml_view_1d(ctx0, inp_pos, 1, (size_t) j*ps) : pos;
+            ggml_tensor * pos_j  = S == 1 && !dev_anc ? ggml_view_1d(ctx0, inp_pos, 1, (size_t) j*ps) : pos;
             ggml_tensor * h_next = nullptr;
             ggml_tensor * cur    = pass(tok, h, pos_j, j, &h_next);
 

@@ -2258,8 +2258,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             rs.push_back(q);
         }
         const int S = (int) seqs.size();
-        // the whole round in one ubatch
-        if (S < 2 || (uint32_t) (S*V) > llama_n_ubatch(ctx_dft) || (uint32_t) (S*V) > llama_n_batch(ctx_dft)) {
+        // the whole round in one ubatch, one sequence included
+        if (S < 1 || (uint32_t) (S*V) > llama_n_ubatch(ctx_dft) || (uint32_t) (S*V) > llama_n_batch(ctx_dft)) {
             return;
         }
 
