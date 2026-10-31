@@ -1621,6 +1621,10 @@ struct test_case {
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
+        // a fused graph is timed whole: repeating its last node alone would time that node
+        if (run_whole_graph()) {
+            n_runs = 1;
+        }
 
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
@@ -12465,6 +12469,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, bs, k, {16, 1}, {1, 1}));
             }
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, bs, 10240, {16, 1}, {1, 1}));
+        }
+        // Qwen3.8 27B's feed-forward, four matrices per call
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, bs, 5120, {4, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, bs, 17408, {4, 1}, {1, 1}));
+        }
+        // gate and up in one launch, as the model runs them
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q4_K}) {
+            for (int64_t k : {2560, 5120}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_GEGLU, bs, 10240, k,
+                    false, 1, 1, false, false, true, false, {16, 1}));
+            }
         }
     }
 

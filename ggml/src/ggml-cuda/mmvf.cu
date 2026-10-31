@@ -478,7 +478,16 @@ static void mul_mat_vec_f_switch_fusion(
             return;
        }
     } else if constexpr (!is_multi_token_id) {
-        // a few columns (a speculative verify batch) take the gate as well; the fusion site sends no bias or epilogue here
+        // a few columns (a speculative verify batch) take the gate as well, or a BF16 product its epilogue alone
+        if constexpr (std::is_same_v<T, nv_bfloat16>) {
+            if (epi != nullptr && fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr) {
+                ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, true>, launch_params,
+                    x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *epi);
+                return;
+            }
+        }
         if (has_fusion) {
             GGML_ASSERT(epi == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr);
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false>, launch_params,
@@ -933,7 +942,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
     const ggml_cuda_mm_epilogue * epi = fusion ? fusion->epi : nullptr;
-    GGML_ASSERT(!epi || (!ids && dst->ne[1] == 1));
+    GGML_ASSERT(!epi || (!ids && (dst->ne[1] == 1 || src0->type == GGML_TYPE_BF16)));
 
     // the fold: src1 was never written; read its norm input with the norm applied on the way in
     if (fold) {
@@ -969,9 +978,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        // a few columns carry the gate alone
+        // a few columns carry the gate alone, or a BF16 product its epilogue alone
         GGML_ASSERT(  ids || dst->ne[1] == 1 || (dst->ne[1] <= MMVF_MAX_BATCH_SIZE && fusion->x_bias == nullptr &&
-                                                 fusion->gate_bias == nullptr && epi == nullptr));
+                                                 fusion->gate_bias == nullptr &&
+                                                 (epi == nullptr || (src0->type == GGML_TYPE_BF16 && fusion->gate == nullptr))));
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);

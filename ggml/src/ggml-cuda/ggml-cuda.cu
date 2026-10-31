@@ -5237,14 +5237,16 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
     if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_mm_epi_enabled() || (ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_MM_EPILOGUE)) {
         return 0;
     }
-    if (mm->ne[1] > 1) {
+    // a BF16 product over a verify's few columns (Gemma's per-layer input gate) keeps the matvec and its epilogue
+    const bool bf16_verify = mm->src[0]->type == GGML_TYPE_BF16 && mm->ne[1] <= MMVF_MAX_BATCH_SIZE;
+    if (mm->ne[1] > 1 && !bf16_verify) {
         return ggml_cuda_try_mmq_epilogue(ctx, cgraph, i, dry_run);
     }
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
     // a verify of several columns already has each row's loads well covered, and the epilogue's own cost it
     if (src0->type == GGML_TYPE_NVFP4 || mm->type != GGML_TYPE_F32 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-        !ggml_is_contiguous(mm) || mm->ne[1] != 1 || src0->buffer == nullptr ||
+        !ggml_is_contiguous(mm) || (mm->ne[1] != 1 && !bf16_verify) || src0->buffer == nullptr ||
         ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return 0;
     }
@@ -5259,7 +5261,10 @@ static int ggml_cuda_try_mm_epilogue(ggml_backend_cuda_context & ctx, const ggml
     } else {
         const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
             ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-        if (mm->ne[1] != 1 || bad_padding_clear || src1->type != GGML_TYPE_F32 || !ggml_cuda_should_fuse_mul_mat_vec_f(mm)) {
+        const bool mmvf = mm->ne[1] == 1 ? ggml_cuda_should_fuse_mul_mat_vec_f(mm)
+                                         : ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]) &&
+                                               mm->ne[2] == 1 && mm->ne[3] == 1;
+        if (bad_padding_clear || src1->type != GGML_TYPE_F32 || !mmvf) {
             return 0;
         }
     }
@@ -6868,10 +6873,12 @@ static int ggml_cuda_try_fp4_scale(ggml_backend_cuda_context & ctx, const ggml_c
 }
 
 // rms_norm > mul > add [> mul(scalar)] > rms_norm > mul, the second product read by a GEMM over several sequences'
-// rows: the residual stream's norm and add and the next block's input norm in one launch (ggml_cuda_op_rms_norm_pair).
-// One sequence's rows keep their launches (their quantized matvecs fold the norm). Returns the nodes covered past i.
-// GGML_CUDA_FUSE_OFF bit 51 keeps them apart.
-static constexpr uint64_t GGML_CUDA_FUSE_NORM_PAIR = 1ull << 51;
+// rows, by an FP8 product, or by a quantized matvec over a verify's columns: the residual stream's norm and add and the
+// next block's input norm in one launch (ggml_cuda_op_rms_norm_pair). One token's quantized matvec keeps its launches
+// (its quantize folds the norm). Returns the nodes covered past i.
+// GGML_CUDA_FUSE_OFF bit 51 keeps them apart, bit 62 only those read by a verify's matvec.
+static constexpr uint64_t GGML_CUDA_FUSE_NORM_PAIR    = 1ull << 51;
+static constexpr uint64_t GGML_CUDA_FUSE_NORM_PAIR_MV = 1ull << 62;
 
 struct ggml_cuda_norm_pair_nodes {
     ggml_tensor * n0 = nullptr;
@@ -6919,8 +6926,14 @@ static bool ggml_cuda_match_rms_norm_pair(const ggml_cgraph * cgraph, int i, ggm
     if (n1->op != GGML_OP_RMS_NORM || n1->src[0] != out || m1->op != GGML_OP_MUL || !(m1->src[0] == n1 || m1->src[1] == n1)) {
         return false;
     }
-    // a GEMM over several sequences' rows reads the second product
-    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != m1 || !ggml_cuda_mmq_batched(mm)) {
+    // a GEMM over several sequences' rows reads the second product, an FP8 product, which does not fold the norm, or a
+    // verify's matvec, whose plain quantize then costs less than the norm and quantize folded together
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != m1) {
+        return false;
+    }
+    const bool verify_mv = ggml_is_quantized(mm->src[0]->type) && m1->ne[1] > 1 &&
+                           !(ggml_cuda_fuse_off_mask() & GGML_CUDA_FUSE_NORM_PAIR_MV);
+    if (!(ggml_cuda_mmq_batched(mm) || mm->src[0]->type == GGML_TYPE_F8_E4M3 || verify_mv)) {
         return false;
     }
     // the norms and the first product feed only the next node; the add does too when the scale follows it

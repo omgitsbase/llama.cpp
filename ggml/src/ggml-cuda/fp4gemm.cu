@@ -1660,6 +1660,7 @@ static __global__ void fp8_geglu_out(const float * __restrict__ dg, const float 
 // E4M3 quantization (fp8_quantize_act's) in the same launch: the row's |max| is the block's, so the down GEMM skips its
 // quantize pass (ggml_cuda_fp8_act_claim). out is written too, for any other reader of the GEGLU
 template <typename T>
+__launch_bounds__(1024)
 static __global__ void fp8_geglu_quant_out(const T * __restrict__ dg, const T * __restrict__ du, float * __restrict__ out,
         const float * __restrict__ s_tok, const float * __restrict__ sg_row, const float * __restrict__ su_row,
         const float * __restrict__ sg_t, const float * __restrict__ su_t, const int64_t n_rows, uint8_t * __restrict__ q8,
@@ -1713,6 +1714,12 @@ static __global__ void fp8_geglu_quant_out(const T * __restrict__ dg, const T * 
         const __nv_fp8x4_e4m3 p(make_float4(v.x*inv, v.y*inv, v.z*inv, v.w*inv));
         *(uint32_t *) (qr + r) = p.__x;
     }
+}
+
+// a block a token: a verify's few tokens take the widest block, since each walks its row alone (the row's |max| is
+// the same in any order, so the bits are too)
+static unsigned fp8_geglu_threads(const int64_t m) {
+    return m < 64 ? 1024 : 256;
 }
 
 struct fp8_plan {
@@ -2095,7 +2102,7 @@ bool ggml_cuda_fp8_gemm_geglu(ggml_backend_cuda_context & ctx, const ggml_tensor
             const float * dg = dgu.get() + (gate_first ? 0 : (size_t) n*m);
             const float * du = dgu.get() + (gate_first ? (size_t) n*m : 0);
             claim();
-            fp8_geglu_quant_out<float><<<(unsigned) m, 256, 0, ctx.stream()>>>(dg, du, (float *) glu->data, s_tok, sg_row, su_row, sg_t, su_t, n, q8, q8_s);
+            fp8_geglu_quant_out<float><<<(unsigned) m, fp8_geglu_threads(m), 0, ctx.stream()>>>(dg, du, (float *) glu->data, s_tok, sg_row, su_row, sg_t, su_t, n, q8, q8_s);
             CUDA_CHECK(cudaGetLastError());
             return true;
         }
@@ -2108,7 +2115,7 @@ bool ggml_cuda_fp8_gemm_geglu(ggml_backend_cuda_context & ctx, const ggml_tensor
             return false;
         }
         claim();
-        fp8_geglu_quant_out<float><<<(unsigned) m, 256, 0, ctx.stream()>>>(dg, du.get(), (float *) glu->data, s_tok, sg_row, su_row, sg_t, su_t, n, q8, q8_s);
+        fp8_geglu_quant_out<float><<<(unsigned) m, fp8_geglu_threads(m), 0, ctx.stream()>>>(dg, du.get(), (float *) glu->data, s_tok, sg_row, su_row, sg_t, su_t, n, q8, q8_s);
     } else {
         ggml_cuda_pool_alloc<nv_bfloat16> dgu(ctx.pool(), (size_t) 2*n*m);
         nv_bfloat16 * dg = dgu.get();
@@ -2117,7 +2124,7 @@ bool ggml_cuda_fp8_gemm_geglu(ggml_backend_cuda_context & ctx, const ggml_tensor
             return false;
         }
         claim();
-        fp8_geglu_quant_out<nv_bfloat16><<<(unsigned) m, 256, 0, ctx.stream()>>>(dg, du, (float *) glu->data, s_tok, sg_row, su_row, sg_t, su_t, n, q8, q8_s);
+        fp8_geglu_quant_out<nv_bfloat16><<<(unsigned) m, fp8_geglu_threads(m), 0, ctx.stream()>>>(dg, du, (float *) glu->data, s_tok, sg_row, su_row, sg_t, su_t, n, q8, q8_s);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
