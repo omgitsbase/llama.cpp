@@ -42,6 +42,10 @@ public:
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
 
+        // the first cell of the views: a ubatch of one sequence in a cache of one stream reads only its window
+        // (llama_kv_cache::get_n_kv), the same view a cache of its own would give it
+        uint32_t base = 0;
+
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
             GGML_ASSERT(!idxs[0].empty());
@@ -201,6 +205,14 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // the same, setting sinfo.base to the ubatch's window when it has one
+    uint32_t get_n_kv(slot_info & sinfo, const llama_ubatch & ubatch) const;
+
+    // keep the next cells of seq_id in one window: n_cells from its first cell (or, for an empty sequence, a free
+    // run of n_cells that it starts in), moving it or the one sequence in the way when that is cheaper. False when
+    // no room can be made
+    bool seq_reserve(llama_seq_id seq_id, uint32_t n_cells) override;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
@@ -250,8 +262,8 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool strict = false) const;
-    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool strict = false, uint32_t base = 0) const;
+    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t base = 0) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -293,6 +305,23 @@ private:
     const uint32_t n_stream  = 1;
 
     bool split_gaps = false;
+
+    // a ubatch of one sequence reads only that sequence's window, and a sequence's cells are kept in one run
+    // (one stream holding several sequences; LLAMA_KV_WINDOWS=0 off)
+    bool windows = false;
+
+    // the cells a sequence asked to keep in its window (seq_reserve), 0: no ask
+    uint32_t seq_need[LLAMA_MAX_SEQ] = {};
+
+    // where an empty sequence's first cells go, UINT32_MAX: nowhere they fit in one run
+    uint32_t window_start(const llama_kv_cells & cells, llama_seq_id seq_id, uint32_t n_tokens) const;
+
+    // the start of a free run of need cells (UINT32_MAX: none), the cells of skip counted as free and keep_out as
+    // taken: the smallest run that holds it, half of the spare room left to the sequence before it
+    uint32_t pick_run(const llama_kv_cells & cells, uint32_t need, llama_seq_id skip, std::pair<uint32_t, uint32_t> keep_out) const;
+
+    // the cells of seq_id, rows and all, to the run starting at dst (a device copy; false: not movable there)
+    bool seq_move(llama_seq_id seq_id, uint32_t dst);
 
     // required padding
     const uint32_t n_pad = 1;
@@ -438,6 +467,9 @@ public:
     ggml_tensor * get_v_varlen(ggml_context * ctx, int32_t il, uint32_t n_kv) const;
 
     uint32_t get_n_kv() const;
+
+    // the first cell of the views (see llama_kv_cache::slot_info::base)
+    uint32_t get_kv_base() const;
 
     // the streams the current ubatch's attention covers: from its first sequence's to its last's
     uint32_t get_n_stream_span() const;

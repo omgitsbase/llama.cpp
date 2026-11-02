@@ -3436,10 +3436,11 @@ common_speculative_init_result::common_speculative_init_result(
         if (llama_model_has_mtp_chain(model_tgt)) {
             // a chained round parks its unused replay rows in a second sequence; over several slots each sequence
             // keeps a stream of its own where the model's round reads one (the mask and the attention then cover
-            // its own cells, not every slot's). LLAMA_MTP_DRAFT_UNIFIED=1 keeps one stream for all
+            // its own cells, not every slot's). LLAMA_MTP_DRAFT_UNIFIED=1 keeps one stream for all, as does a unified
+            // target cache: a stream per slot would give each only its share of the context the target lets it fill
             static const bool unified = getenv("LLAMA_MTP_DRAFT_UNIFIED") && atoi(getenv("LLAMA_MTP_DRAFT_UNIFIED")) != 0;
             cparams.n_seq_max  = std::max<uint32_t>(cparams.n_seq_max, 2);
-            cparams.kv_unified = unified || params.n_parallel <= 1 || !llama_model_mtp_round_streams(model_tgt);
+            cparams.kv_unified = unified || params.kv_unified || params.n_parallel <= 1 || !llama_model_mtp_round_streams(model_tgt);
         }
     }
 

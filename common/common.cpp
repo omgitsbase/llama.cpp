@@ -2335,7 +2335,7 @@ struct common_state_pool {
     // driver still holds every other CUDA call for that time (the decodes stop: 114-321 ms a slab, measured). The
     // caller holds mu.
     void grow_async() {
-        if (slab_pinning || slab_failed || slab_bytes + kStateSlabSize > kStateSlabsMax) {
+        if (!common_state_pin_enabled() || slab_pinning || slab_failed || slab_bytes + kStateSlabSize > kStateSlabsMax) {
             return;
         }
         ggml_backend_buffer_type_t bt = host_buft();
@@ -2444,6 +2444,14 @@ common_state_pool & state_pool() {
 
 } // namespace
 
+// Prompt states in pinned slabs (LLAMA_STATE_PIN=1): faster saves beside the decodes, but the slabs are pinned
+// ahead of need and stay resident. Off, states live in plain memory that goes back to the system when freed.
+bool common_state_pin_enabled() {
+    static const bool on = getenv("LLAMA_STATE_PIN") != nullptr && atoi(getenv("LLAMA_STATE_PIN")) != 0;
+    return on;
+}
+
+
 common_state_buf::impl::~impl() {
     release();
 }
@@ -2503,9 +2511,11 @@ void common_state_buf::impl::alloc(size_t n_new) {
             b = pool.parked[at].first;
             pool.parked_bytes -= pool.parked[at].second;
             pool.parked.erase(pool.parked.begin() + at);
-        } else {
+        } else if (common_state_pin_enabled()) {
             b = pool.pin(n_new);
         }
+        // else plain memory: pinning a buffer this size here holds every CUDA call ~110 ms a GB and keeps the bytes
+        // resident; a plain buffer takes a copy without the decodes beside it and goes back to the system when freed
     }
     if (b != nullptr) {
         buf = b;
@@ -2592,7 +2602,7 @@ size_t common_state_buf_warm(size_t bytes) {
     auto & pool = state_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
     ggml_backend_buffer_type_t bt = pool.host_buft();
-    if (bt == nullptr) {
+    if (bt == nullptr || !common_state_pin_enabled()) {
         return 0;
     }
     while (!pool.slab_failed && pool.slab_bytes < std::min(bytes, kStateSlabsMax)) {

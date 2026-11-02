@@ -166,6 +166,8 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        // SERVER_TASK_TYPE_SLOT_ERASE: also drop every prompt cache entry (the end of the warm-up traffic)
+        bool clear_cache = false;
     };
     slot_action slot_action;
 

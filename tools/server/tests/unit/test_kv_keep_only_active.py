@@ -41,8 +41,8 @@ LONG_PROMPT = (
 )
 
 
-# idle slot cleared on launch should restore from cache-ram
-def test_clear_and_restore():
+# an idle slot stays in the cache while the launched one has room beside it, and a request for its prompt finds it there
+def test_idle_slot_kept():
     global server
     server.start()
     log = LogReader(server.log_path)
@@ -58,34 +58,23 @@ def test_clear_and_restore():
     assert res.status_code == 200
     original_prompt_n = res.body["timings"]["prompt_n"]
 
-    # Slot 0 is the only slot with KV — should NOT be cleared
-    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
-
-    # Launching slot 1 clears idle slot 0
+    # a short prompt on slot 1 fits beside slot 0, which stays
     res = server.make_request("POST", "/completion", data={
         "prompt": "The quick brown fox",
         "id_slot": 1,
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 
-    # Re-send same prompt — should restore from cache-ram
+    # the same prompt again reuses slot 0's cells
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "updating prompt cache" in log.drain()
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < original_prompt_n
-
-    # Follow-up — slot 0 kept its KV, no clearing needed
-    res = server.make_request("POST", "/completion", data={
-        "prompt": LONG_PROMPT + " The knight finally reached the castle gates.",
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 
 

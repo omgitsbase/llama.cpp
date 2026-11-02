@@ -5777,6 +5777,17 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_reserve(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+               int32_t n_cells) {
+    if (!mem || n_cells <= 0) {
+        return true;
+    }
+
+    return mem->seq_reserve(seq_id, (uint32_t) n_cells);
+}
+
 bool llama_memory_seq_cp_prefix(
         llama_memory_t mem,
           llama_seq_id seq_id_src,

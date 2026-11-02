@@ -1225,6 +1225,9 @@ private:
 // returns the bytes pinned in slabs (pinning stops at the first failure)
 size_t common_state_buf_warm(size_t bytes);
 
+// whether prompt states go to pinned slabs (LLAMA_STATE_PIN=1) rather than plain memory
+bool common_state_pin_enabled();
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 

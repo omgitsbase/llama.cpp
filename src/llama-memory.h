@@ -132,6 +132,8 @@ struct llama_memory_i {
     // a backend given queues the row copies on its stream, else they are blocking
     virtual bool seq_cp_prefix(llama_seq_id /*seq_id_src*/, llama_seq_id /*seq_id_dst*/, llama_pos /*n*/, ggml_backend_t /*backend*/) { return false; }
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
+    // keep the next n_cells cells of a sequence in one run of the cache (false: other sequences are in the way)
+    virtual bool seq_reserve(llama_seq_id /*seq_id*/, uint32_t /*n_cells*/) { return true; }
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;

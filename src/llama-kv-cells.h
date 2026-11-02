@@ -3,11 +3,13 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
 #include <limits>
 #include <set>
+#include <utility>
 #include <vector>
 
 struct llama_kv_cell_ext {
@@ -53,6 +55,9 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_lo[s]  = 0;
+            seq_hi[s]  = 0;
+            seq_ord[s] = false;
         }
     }
 
@@ -221,19 +226,24 @@ public:
     void set(const std::vector<uint32_t> & idxs, const snapshot & other) {
         assert(idxs.size() == other.pos.size());
 
-        for (uint32_t j = 0; j < other.pos.size(); ++j) {
+        // the cells leave from the last one, so a sequence a ubatch grew at its end and this undoes stays in order
+        // (seq_ordered)
+        for (uint32_t j = other.pos.size(); j-- > 0;) {
             const auto idx = idxs[j];
-
-            if (pos[idx] == -1 && other.pos[j] != -1) {
-                used.insert(idx);
-            }
-
-            if (pos[idx] != -1 && other.pos[j] == -1) {
-                used.erase(idx);
-            }
 
             if (pos[idx] != -1) {
                 seq_pos_rm(idx);
+                used.erase(idx);
+                pos[idx] = -1;
+                seq[idx].reset();
+            }
+        }
+
+        for (uint32_t j = 0; j < other.pos.size(); ++j) {
+            const auto idx = idxs[j];
+
+            if (other.pos[j] != -1) {
+                used.insert(idx);
             }
 
             pos[idx] = other.pos[j];
@@ -403,6 +413,14 @@ public:
 
         return -1;
     }
+
+    // every cell of sequence seq_id lies in [seq_cell_lo, seq_cell_hi); seq_cell_hi is 0 when it holds none
+    uint32_t seq_cell_lo(llama_seq_id seq_id) const { return seq_lo[seq_id]; }
+    uint32_t seq_cell_hi(llama_seq_id seq_id) const { return seq_hi[seq_id]; }
+
+    // the cells [seq_cell_lo, seq_cell_hi) are all sequence seq_id's, holding its positions one after another
+    // from seq_pos_min: it was only ever appended to or cut at its ends
+    bool seq_ordered(llama_seq_id seq_id) const { return seq_hi[seq_id] > 0 && seq_ord[seq_id]; }
 
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
@@ -604,16 +622,67 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
+    // the cell range of each sequence and whether it is filled in order, see seq_cell_lo and seq_ordered
+    uint32_t seq_lo [LLAMA_MAX_SEQ] = {};
+    uint32_t seq_hi [LLAMA_MAX_SEQ] = {};
+    bool     seq_ord[LLAMA_MAX_SEQ] = {};
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
-        const auto n = seq_pos[s].erase({ pos[i], i });
+        auto & sp = seq_pos[s];
+        const bool first = !sp.empty() && *sp.begin()  == std::make_pair(pos[i], i);
+        const bool last  = !sp.empty() && *sp.rbegin() == std::make_pair(pos[i], i);
+
+        const auto n = sp.erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
+
+        if (sp.empty()) {
+            seq_lo[s]  = 0;
+            seq_hi[s]  = 0;
+            seq_ord[s] = false;
+            return;
+        }
+        // an ordered sequence cut at an end stays ordered and its range moves by the one cell
+        if (seq_ord[s] && last && i + 1 == seq_hi[s]) {
+            seq_hi[s] = i;
+            return;
+        }
+        if (seq_ord[s] && first && i == seq_lo[s]) {
+            seq_lo[s] = i + 1;
+            return;
+        }
+        seq_ord[s] = false;
+        // the bits are the truth (cell i may still carry s while its pair goes): walk to the next cell of s
+        if (i + 1 == seq_hi[s]) {
+            uint32_t j = i;
+            while (j > seq_lo[s] && (j == i || !seq[j].test(s))) {
+                --j;
+            }
+            seq_hi[s] = j + 1;
+        }
+        if (i == seq_lo[s]) {
+            uint32_t j = i;
+            while (j + 1 < seq_hi[s] && (j == i || !seq[j].test(s))) {
+                ++j;
+            }
+            seq_lo[s] = j;
+        }
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
-        seq_pos[s].insert({ pos[i], i });
+        auto & sp = seq_pos[s];
+        if (sp.empty()) {
+            seq_lo[s]  = i;
+            seq_hi[s]  = i + 1;
+            seq_ord[s] = true;
+        } else {
+            seq_ord[s] = seq_ord[s] && i == seq_hi[s] && pos[i] == sp.rbegin()->first + 1;
+            seq_lo[s]  = std::min(seq_lo[s], i);
+            seq_hi[s]  = std::max(seq_hi[s], i + 1);
+        }
+        sp.insert({ pos[i], i });
     }
 
     // remove cell i

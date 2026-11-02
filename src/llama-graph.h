@@ -1236,6 +1236,9 @@ struct llm_graph_params {
     // graph's arena key (llama_context::get_gf_res_prev), so a round keeps one graph per size it has seen
     uint64_t n_kv_sig = 0;
 
+    // the first cells of the cache views (a window of one sequence in a shared stream), baked into the views
+    uint64_t kv_base_sig = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     // why the last allow_reuse said no (LLAMA_ROUND_TIMING)
@@ -1246,6 +1249,10 @@ struct llm_graph_params {
 
         if (groups_sig != other.groups_sig) {
             reuse_reason() = "groups";
+            return false;
+        }
+        if (kv_base_sig != other.kv_base_sig) {
+            reuse_reason() = "kv window";
             return false;
         }
         // first check the ubatch

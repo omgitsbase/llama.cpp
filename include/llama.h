@@ -766,6 +766,15 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Keep the next n_cells cells of a sequence (counted from its first cell, or a free run for an empty one) in
+    // one run of a cache shared by several sequences, so a ubatch of that sequence reads only its own window.
+    // May move this or another sequence's cells on the device to make the room (no work of theirs may be in flight).
+    // Returns false when the room cannot be made
+    LLAMA_API bool llama_memory_seq_reserve(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                   int32_t n_cells);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

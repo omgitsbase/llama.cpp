@@ -235,6 +235,14 @@ void llm_graph_params_fill(llm_graph_params & params) {
     } else if (kv) {
         mix(kv->get_n_kv());
     }
+
+    // the views a window reads start at its first cell, which the graph holds (llama_kv_cache::slot_info::base)
+    params.kv_base_sig = 0;
+    if (const auto * c = dynamic_cast<const llama_kv_cache_iswa_context *>(params.mctx)) {
+        params.kv_base_sig = ((uint64_t) c->get_base()->get_kv_base() << 32) | c->get_swa()->get_kv_base();
+    } else if (kv) {
+        params.kv_base_sig = kv->get_kv_base();
+    }
 }
 
 // per_seq: a mask per sequence rather than per stream of the span (a group whose attention reads its streams from an
@@ -771,7 +779,7 @@ void llm_graph_input_mtp_rows::set_input(const llama_ubatch * ubatch) {
 
 bool llm_graph_input_mtp_rows::can_reuse(const llm_graph_params & params) {
     mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
-    return k_idxs->ne[0] == params.ubatch.n_tokens && hide->ne[0] == n_replay*(int64_t) params.ubatch.n_seqs_unq;
+    return (!k_idxs || k_idxs->ne[0] == params.ubatch.n_tokens) && hide->ne[0] == n_replay*(int64_t) params.ubatch.n_seqs_unq;
 }
 
 void llm_graph_input_mtp_round::set_input(const llama_ubatch * ubatch) {
@@ -3814,8 +3822,8 @@ ggml_tensor * llm_graph_context::build_attn_mtp(
 
     // a drafter attending over another context's cache writes nothing; over one stream per sequence the round's
     // rows are numbered step after step (llm_graph_input_mtp_rows)
-    ggml_tensor * k_idxs = mtp_rows ? mtp_rows->k_idxs : attn.k_idxs;
-    ggml_tensor * v_idxs = mtp_rows ? mtp_rows->v_idxs : attn.v_idxs;
+    ggml_tensor * k_idxs = mtp_rows && mtp_rows->k_idxs ? mtp_rows->k_idxs : attn.k_idxs;
+    ggml_tensor * v_idxs = mtp_rows && mtp_rows->k_idxs ? mtp_rows->v_idxs : attn.v_idxs;
     if (k) {
         ggml_tensor * k_idx = ggml_view_1d(ctx0, k_idxs, n_rows, row*ggml_element_size(k_idxs));
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, k_idx, il));
@@ -3940,14 +3948,19 @@ const llm_graph_mtp_attn & attn,
 
     // a cache of one stream per sequence: the batch holds each sequence's rows together and the K/V indices count
     // from the stream's start (llm_graph_input_mtp_rows numbers them for the steps)
+    // One stream shared by several sequences: a round of one reads its window, which need not start at cell 0, so
+    // only the mask places of its rows come from that input
     mtp_rows = nullptr;
-    if (!cparams.kv_unified && cparams.n_seq_max > 1) {
+    const bool hide_only = cparams.kv_unified && cparams.n_seq_max > 1 && n_seq == 1;
+    if ((!cparams.kv_unified && cparams.n_seq_max > 1) || hide_only) {
         auto minp = std::make_unique<llm_graph_input_mtp_rows>(attn.mctx, V);
-        minp->k_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
-        ggml_set_input(minp->k_idxs);
-        if (attn.v_idxs) {
-            minp->v_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
-            ggml_set_input(minp->v_idxs);
+        if (!hide_only) {
+            minp->k_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+            ggml_set_input(minp->k_idxs);
+            if (attn.v_idxs) {
+                minp->v_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+                ggml_set_input(minp->v_idxs);
+            }
         }
         minp->hide = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, V*n_seq);
         ggml_set_input(minp->hide);

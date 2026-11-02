@@ -2982,21 +2982,63 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
+                    // An idle slot keeps its cells for its next turn: one of a cache with a stream per slot holds cells
+                    // no other slot can take, and one of a unified cache leaves only when the task just launched needs
+                    // the room, oldest first, saved to the prompt cache before it is cleared. Saving every idle slot
+                    // at every launch copied whole contexts to RAM, and clearing them lost the ones too big to save
+                    if (params_base.cache_idle_slots && params_base.kv_unified && slot->task) {
+                        const int64_t n_ctx     = llama_n_ctx(ctx_tgt);
+                        const int32_t n_predict = slot->task->params.n_predict;
+                        const int64_t need      = std::min<int64_t>(n_ctx, (int64_t) slot->task->tokens.size() + (n_predict > 0 ? n_predict : 4096));
+                        int64_t held = 0;
+                        std::vector<server_slot *> idle;
+                        for (auto & other : slots) {
+                            if (&other == slot) {
+                                continue;
                             }
+                            held += other.prompt.n_tokens();
+                            if (!other.is_processing() && other.prompt.n_tokens() > 0) {
+                                idle.push_back(&other);
+                            }
+                        }
+                        std::sort(idle.begin(), idle.end(), [](const server_slot * x, const server_slot * y) {
+                            return x->t_last_used < y->t_last_used;
+                        });
+                        // the task's cells go in one window of the cache (llama_memory_seq_reserve), so an idle slot
+                        // whose cells are in the way leaves too, even when the cache has the room elsewhere
+                        // making room can move another sequence's rows on the device: none of its work may be in flight
+                        // The drafter's own cache gets the same window: its drafts set the verify batches, and with
+                        // them the target's rounding
+                        llama_memory_t mem     = llama_get_memory(ctx_tgt);
+                        llama_memory_t mem_dft = ctx_dft && llama_get_ctx_other(ctx_dft) != ctx_tgt ? llama_get_memory(ctx_dft) : nullptr;
+                        for (const auto & other : slots) {
+                            if (&other != slot && other.is_processing()) {
+                                llama_synchronize(ctx_tgt);
+                                if (ctx_dft) {
+                                    llama_synchronize(ctx_dft);
+                                }
+                                break;
+                            }
+                        }
+                        const auto reserve = [&]() {
+                            const bool fits_tgt = llama_memory_seq_reserve(mem, slot->id, (int32_t) need);
+                            const bool fits_dft = !mem_dft || llama_memory_seq_reserve(mem_dft, slot->id, (int32_t) need);
+                            return fits_tgt && fits_dft;
+                        };
+                        bool fits = reserve();
+                        for (server_slot * other : idle) {
+                            if (fits && held + need <= n_ctx) {
+                                break;
+                            }
+                            SLT_TRC(*other, "%s", "saving idle slot to prompt cache to free its cells\n");
+                            if (other->prompt_save(*prompt_cache)) {
+                                SLT_DBG(*other, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                                prompt_cache->update();
+                            }
+                            held -= other->prompt.n_tokens();
+                            // [TAG_IDLE_SLOT_CLEAR]
+                            other->prompt_clear();
+                            fits = reserve();
                         }
                     }
                 } break;
@@ -3225,6 +3267,10 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+
+                    if (task.slot_action.clear_cache && prompt_cache) {
+                        prompt_cache->states.clear();
+                    }
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -5344,6 +5390,17 @@ private:
             for (auto & t : clients) {
                 t.join();
             }
+        }
+        // nothing of the warm-up stays: a first request finds every slot empty, as on a server of one slot, and
+        // reuses no prefix the warm-up computed in other batches
+        for (int c = 0; c < n_clients; ++c) {
+            auto rd = get_response_reader();
+            server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
+            task.id                  = rd.get_new_id();
+            task.slot_action.id_slot     = c;
+            task.slot_action.clear_cache = true;
+            rd.post_task(std::move(task));
+            rd.wait_for_all([]() { return false; });
         }
         SRV_INF("warm-up traffic: %d requests in %.1f s\n", n_done.load(), (ggml_time_us() - t0) / 1e6);
     }
