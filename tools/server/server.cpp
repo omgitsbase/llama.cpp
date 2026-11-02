@@ -489,8 +489,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.update_meta(ctx_server);
 
         // requests through the serving path build and capture the graphs first (LLAMA_NO_WARMUP_TRAFFIC=1 skips it);
-        // the server reports ready after them
-        if (params.n_parallel > 1 && !getenv("LLAMA_NO_WARMUP_TRAFFIC")) {
+        // the server reports ready after them. Not for slots that share one cache: they serve requests beside a
+        // conversation, and a warm-up would give each slot a history a server of one slot does not have
+        if (params.n_parallel > 1 && !params.kv_unified && !getenv("LLAMA_NO_WARMUP_TRAFFIC")) {
             warmup_thread = std::thread([&]() {
                 ctx_server.warmup_traffic();
                 ctx_http.is_ready.store(true);

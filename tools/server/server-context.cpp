@@ -5330,7 +5330,7 @@ private:
     // a shape's second sight captures its CUDA graph. The prompts are not cached.
     void warmup_traffic() {
         const int n_clients = params_base.n_parallel;
-        if (n_clients < 2 || getenv("LLAMA_NO_WARMUP_TRAFFIC")) {
+        if (n_clients < 2 || params_base.kv_unified || getenv("LLAMA_NO_WARMUP_TRAFFIC")) {
             return;
         }
         static const char * topics[] = {
