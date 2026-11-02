@@ -1225,7 +1225,11 @@ private:
 // returns the bytes pinned in slabs (pinning stops at the first failure)
 size_t common_state_buf_warm(size_t bytes);
 
-// whether prompt states go to pinned slabs (LLAMA_STATE_PIN=1) rather than plain memory
+// pin the next slab of the state pool on a thread of its own when less than half a slab is free: for a server with
+// nothing to decode, since pinning holds every CUDA call meanwhile
+void common_state_buf_grow_idle();
+
+// whether prompt states go to pinned slabs (LLAMA_STATE_PIN=0: plain memory)
 bool common_state_pin_enabled();
 
 struct common_prompt_checkpoint {

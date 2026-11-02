@@ -2370,13 +2370,10 @@ struct common_state_pool {
         return f;
     }
 
-    // a range of a slab holding n bytes, or null (the caller holds mu); the next slab is pinned ahead of need
+    // a range of a slab holding n bytes, or null (the caller holds mu). The next slab is pinned when the server is
+    // idle (common_state_buf_grow_idle): pinned beside the decodes it stopped them for its ~110 ms
     uint8_t * carve(size_t n, size_t & cap) {
-        uint8_t * p = carve_now(n, cap);
-        if (p == nullptr || free_bytes() < kStateSlabSize/2) {
-            grow_async();
-        }
-        return p;
+        return carve_now(n, cap);
     }
 
     uint8_t * carve_now(size_t n, size_t & cap) {
@@ -2444,10 +2441,10 @@ common_state_pool & state_pool() {
 
 } // namespace
 
-// Prompt states in pinned slabs (LLAMA_STATE_PIN=1): faster saves beside the decodes, but the slabs are pinned
-// ahead of need and stay resident. Off, states live in plain memory that goes back to the system when freed.
+// Prompt states in pinned slabs: a request's checkpoint copies out in a few ms where a fresh plain buffer took ~20 ms
+// more. LLAMA_STATE_PIN=0 keeps states in plain memory that goes back to the system when freed.
 bool common_state_pin_enabled() {
-    static const bool on = getenv("LLAMA_STATE_PIN") != nullptr && atoi(getenv("LLAMA_STATE_PIN")) != 0;
+    static const bool on = getenv("LLAMA_STATE_PIN") == nullptr || atoi(getenv("LLAMA_STATE_PIN")) != 0;
     return on;
 }
 
@@ -2595,6 +2592,14 @@ void common_state_buf::set_async(llama_context * ctx) {
 void common_state_buf::wait() const {
     if (p_) {
         p_->wait();
+    }
+}
+
+void common_state_buf_grow_idle() {
+    auto & pool = state_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    if (pool.free_bytes() < kStateSlabSize/2) {
+        pool.grow_async();
     }
 }
 

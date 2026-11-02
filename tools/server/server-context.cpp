@@ -1829,11 +1829,11 @@ private:
         // the prompt cache's states live in pinned memory: pinned now, for the cache's size
         if (params_base.cache_ram_mib != 0) {
             const int64_t t0 = ggml_time_us();
-            // the cache's size now, up to the pool's cap (common_state_buf_warm): a slab pinned while serving holds every
-            // CUDA call in the driver for its ~110 ms a GB (the decodes stop, once or twice a run as states pile up); the
-            // page-locked memory stays resident
+            // one slab now, which holds the checkpoints of a dozen requests: a slab pinned while serving holds every
+            // CUDA call in the driver for its ~110 ms a GB, and the page-locked memory stays resident, so the rest are
+            // pinned on a thread of their own as states pile up (pinning the whole cache's size held 4 GB from load)
             const size_t bytes  = params_base.cache_ram_mib < 0 ? (4ull << 30) : (size_t) params_base.cache_ram_mib << 20;
-            const size_t pinned = common_state_buf_warm(bytes);
+            const size_t pinned = common_state_buf_warm(std::min<size_t>(bytes, 1ull << 30));
             SRV_INF("state pool: %.1f of %.1f GB pinned in %.0f ms\n", pinned / 1e9, bytes / 1e9, (ggml_time_us() - t0) / 1000.0);
         }
 
@@ -3465,6 +3465,8 @@ private:
                 chain_pending = false;
 
                 metrics_flush_idle();
+
+                common_state_buf_grow_idle();
 
                 return; // skip further processing
 
