@@ -1130,7 +1130,10 @@ private:
             return;
         }
         const size_t K = slot.spec_draft.size();
-        GGML_ASSERT(slot.spec_i_batch.size() == K + 1 && slot.prompt.tokens.size() >= K);
+        // a ghost's rows are dropped after the decode and its prompt never held them: the ids go to the rows alone (an
+        // empty ghost asserted here, and one with a prompt had its last tokens overwritten with the draft)
+        const bool ghost = slot.ghost_busy;
+        GGML_ASSERT(slot.spec_i_batch.size() == K + 1 && (ghost || slot.prompt.tokens.size() >= K));
         for (size_t j = 0; j < K; ++j) {
             const int32_t ib = slot.spec_i_batch[j + 1];
             batch.tokens[ib].token = slot.spec_draft[j];
@@ -1138,8 +1141,10 @@ private:
                 batch.batch.token[ib] = slot.spec_draft[j];
             }
         }
-        slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - K);
-        slot.prompt.tokens.insert(slot.spec_draft);
+        if (!ghost) {
+            slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - K);
+            slot.prompt.tokens.insert(slot.spec_draft);
+        }
     }
 
     bool add_bos_token = true;
