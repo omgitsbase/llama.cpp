@@ -71,7 +71,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // the k-pool selection scatters whole-cache cell indices into a mask of n_kv rows: a window that starts past
+    // cell 0 would put them out of its rows (and out of the mask), so both caches read every cell
+    get_mem_attn()->set_no_windows();
+    if (mem_idx) {
+        mem_idx->set_no_windows();
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides

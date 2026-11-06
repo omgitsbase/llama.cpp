@@ -172,6 +172,9 @@ public:
     void set_split_gaps(bool v) { split_gaps = v; }
     bool get_split_gaps() const { return split_gaps; }
 
+    // no windows for a cache whose graph addresses cells by their index in the whole cache (the k-pool selection)
+    void set_no_windows() { windows = false; }
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

@@ -4,11 +4,15 @@
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+// DeviceTopK has a race condition before CCCL 3.4.3 (https://github.com/NVIDIA/cccl/pull/10627): a long row can come
+// back with indices it never wrote, which the k-pool indexers then read and write through
+#    if (CCCL_MAJOR_VERSION > 3 || \
+         (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION > 4) || \
+         (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION == 4 && CCCL_PATCH_VERSION >= 3))
 #        define CUB_TOP_K_AVAILABLE
 #        include <cuda/iterator>
 using namespace cub;
-#    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
+#    endif
 #endif      // GGML_CUDA_USE_CUB
 
 #ifdef CUB_TOP_K_AVAILABLE
@@ -461,7 +465,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // several long rows (a batch of sampled rows): one radix select over all of them. GGML_CUDA_TOPK_RADIX=0 keeps a
     // call per row
     static const bool radix_on = getenv("GGML_CUDA_TOPK_RADIX") == nullptr || atoi(getenv("GGML_CUDA_TOPK_RADIX")) != 0;
-    if (radix_on && nrows > 1 && ncols > 4096 && k <= 1024) {
+#ifdef CUB_TOP_K_AVAILABLE
+    const bool radix_rows = nrows > 1;
+#else
+    // without CUB's top-k a single long row (a decode step's indexer scores) takes the radix select too, not a sort
+    const bool radix_rows = true;
+#endif
+    if (radix_on && radix_rows && ncols > 4096 && k <= 1024) {
         // a small k: the logits read once (top_k_two_stage_cuda); GGML_CUDA_TOPK_TWO_STAGE=0 keeps the radix passes
         static const bool two_stage = getenv("GGML_CUDA_TOPK_TWO_STAGE") == nullptr || atoi(getenv("GGML_CUDA_TOPK_TWO_STAGE")) != 0;
         if (two_stage && k <= 128 && ((ncols + 4095) / 4096) * k <= 8192) {
