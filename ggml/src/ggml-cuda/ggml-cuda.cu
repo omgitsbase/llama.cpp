@@ -6045,6 +6045,16 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
     bool lead      = true;
     int  ik        = -1;
     std::vector<int> others;
+    // a snapshot may be copied out of its window through a contiguous copy of its own (qwen4exp): that copy is the
+    // window's alone and the launch takes it with the copy into the cache
+    std::vector<const ggml_tensor *> conts;
+    size_t n_cont_taken = 0;
+    auto snap_src = [&](const ggml_tensor * s) -> const ggml_tensor * {
+        if (s->op == GGML_OP_VIEW && s->view_src == cat) {
+            return s;
+        }
+        return std::find(conts.begin(), conts.end(), s) != conts.end() ? s->src[0] : nullptr;
+    };
     for (int k = ic + 1; k < cgraph->n_nodes; ++k) {
         const ggml_tensor * n = cgraph->nodes[k];
         if (n->op == GGML_OP_SSM_CONV) {
@@ -6065,8 +6075,16 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
             }
             continue;
         }
-        if (n->op == GGML_OP_CPY && n->src[0]->op == GGML_OP_VIEW && n->src[0]->view_src == cat) {
-            const ggml_tensor * v = n->src[0];
+        if (n->op == GGML_OP_CONT && n->src[0]->op == GGML_OP_VIEW && n->src[0]->view_src == cat && n->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(n) && ggml_node_get_use_count(cgraph, k) == 1 && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            conts.push_back(n);
+            if (lead) {
+                last_lead = k;
+            }
+            continue;
+        }
+        if (n->op == GGML_OP_CPY && snap_src(n->src[0]) != nullptr) {
+            const ggml_tensor * v = snap_src(n->src[0]);
             const ggml_tensor * d = n->src[1];
             int vk = -1;
             for (int s = 0; s < n_views; ++s) {
@@ -6081,6 +6099,7 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
             conv.snap[conv.n_snap]     = (float *) d->data;
             conv.snap_idx[conv.n_snap] = (int) (v->view_offs/sizeof(float));
             conv.n_snap++;
+            n_cont_taken += n->src[0] != v;
             if (lead) {
                 last_lead = k;
             }
@@ -6095,7 +6114,7 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
         lead = false;
         others.push_back(k);
     }
-    if (ik < 0 || ggml_node_get_use_count(cgraph, ic) != n_views + 1) {
+    if (ik < 0 || ggml_node_get_use_count(cgraph, ic) != n_views + 1 || n_cont_taken != conts.size()) {
         return ggml_cuda_conv_reject(__LINE__, i);
     }
     const ggml_tensor * sc = cgraph->nodes[ik];
@@ -6123,13 +6142,22 @@ static int ggml_cuda_try_conv_proj(ggml_backend_cuda_context & ctx, const ggml_c
         return ggml_cuda_conv_reject(__LINE__, i);
     }
 
-    // the nodes that still run between the copies and the convolution neither read nor write what the launch writes
+    // the nodes that still run between the copies and the convolution neither read nor write what the launch writes, nor
+    // read what it leaves unwritten: the product, the window and its copies, and a convolution only the SiLU reads
+    auto unwritten = [&](const ggml_tensor * t) {
+        const ggml_tensor * r = t->view_src ? t->view_src : t;
+        return r == mm || r == cat || (r == sc && out != sc) || (add != nullptr && r == add && out != add) ||
+               std::find(conts.begin(), conts.end(), r) != conts.end();
+    };
     for (const int k : others) {
         const ggml_tensor * n = cgraph->nodes[k];
         for (int s = -1; s < GGML_MAX_SRC; ++s) {
             const ggml_tensor * t = s < 0 ? n : n->src[s];
             if (t == nullptr) {
                 continue;
+            }
+            if (s >= 0 && unwritten(t)) {
+                return ggml_cuda_conv_reject(__LINE__, i);
             }
             if (ggml_cuda_tensors_overlap(t, out)) {
                 return ggml_cuda_conv_reject(__LINE__, i);
