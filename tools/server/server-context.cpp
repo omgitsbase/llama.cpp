@@ -2043,8 +2043,8 @@ private:
             int64_t t_last = -1;
 
             for (server_slot & slot : slots) {
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
+                // skip the slot if it is not available (a ghost's cache is in a round, see update_slots)
+                if (slot.is_processing() || slot.ghost_busy) {
                     continue;
                 }
 
@@ -2767,7 +2767,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && !slot.ghost_busy && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {
@@ -2962,7 +2962,7 @@ private:
                         break;
                     }
 
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->ghost_busy) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
@@ -3146,7 +3146,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->ghost_busy) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -3196,7 +3196,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->ghost_busy) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -3261,7 +3261,7 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->ghost_busy) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
@@ -3932,6 +3932,7 @@ private:
                     g->spec_draft.clear();
                     g->spec_i_batch.clear();
                     g->ghost_busy = false;
+                    queue_tasks.pop_deferred_task(g->id);
                 }
                 ghosts.clear();
             } else if (spec && !getenv("LLAMA_NO_SLOT_PAD")) {
@@ -5140,6 +5141,8 @@ private:
                 g->spec_draft.clear();
                 g->spec_i_batch.clear();
                 g->ghost_busy = false;
+                // a task deferred while the slot was a ghost takes it now
+                queue_tasks.pop_deferred_task(g->id);
             }
         }
 
